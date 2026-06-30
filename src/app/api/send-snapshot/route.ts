@@ -4,11 +4,30 @@ import { supabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
 
+function configuredSnapshotRecipients() {
+  return new Set(
+    (process.env.NOTIFICATION_EMAIL ?? "")
+      .split(",")
+      .map((recipient) => recipient.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
 export async function POST(request: Request) {
   const { email, chartImage } = await request.json();
+  const allowedRecipients = configuredSnapshotRecipients();
+
+  if (allowedRecipients.size === 0) {
+    return NextResponse.json({ error: "Snapshot recipients are not configured" }, { status: 500 });
+  }
 
   if (!email || typeof email !== "string" || !email.includes("@")) {
     return NextResponse.json({ error: "Invalid email" }, { status: 400 });
+  }
+
+  const requestedEmail = email.trim().toLowerCase();
+  if (!allowedRecipients.has(requestedEmail)) {
+    return NextResponse.json({ error: "Email recipient is not allowed" }, { status: 403 });
   }
 
   const apiKey = process.env.RESEND_API_KEY;
@@ -53,7 +72,7 @@ export async function POST(request: Request) {
   const resend = new Resend(apiKey);
   const { error } = await resend.emails.send({
     from: process.env.RESEND_FROM_EMAIL || "LQDT Tracker <notifications@resend.dev>",
-    to: [email],
+    to: [requestedEmail],
     subject: `LQDT Listings Snapshot — ${latest?.date ?? "Latest"}`,
     attachments,
     html: `

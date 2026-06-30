@@ -12,12 +12,18 @@ export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
+  const cronSecret = process.env.CRON_SECRET?.trim();
+  if (!cronSecret) {
+    return NextResponse.json({ error: "CRON_SECRET is not configured" }, { status: 500 });
+  }
+
   const authHeader = request.headers.get("authorization");
   const { searchParams } = new URL(request.url);
   const querySecret = searchParams.get("secret");
+  const authToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
   const valid =
-    authHeader === `Bearer ${process.env.CRON_SECRET}` ||
-    (querySecret !== null && querySecret === process.env.CRON_SECRET);
+    authToken === cronSecret ||
+    (querySecret !== null && querySecret === cronSecret);
   if (!valid) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }

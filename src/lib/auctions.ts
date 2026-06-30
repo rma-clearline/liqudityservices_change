@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { supabase } from "./supabase";
 
 const MAESTRO_URL = process.env.MAESTRO_API_URL || "https://maestro.lqdt1.com";
@@ -8,6 +10,16 @@ const MAESTRO_KEY =
 const PAGE_SIZE = Number(process.env.AUCTIONS_PAGE_SIZE) || 50;
 const MAX_PAGES_PER_PLATFORM = Number(process.env.AUCTIONS_MAX_PAGES) || 10;
 const PAGE_TIMEOUT_MS = Number(process.env.AUCTIONS_PAGE_TIMEOUT_MS) || 40000;
+const DEFAULT_CLOSE_RATE = Number(process.env.AUCTIONS_DEFAULT_CLOSE_RATE) || 0.35;
+const HISTORICAL_GMV_DIR = path.join(process.cwd(), "scripts");
+const HISTORICAL_DAILY_GMV_PATH = historicalCsvPath(
+  process.env.HISTORICAL_GMV_DAILY_PATH,
+  "historical-gmv-daily-2025-06-2026-06.csv",
+);
+const HISTORICAL_DAILY_MARKET_GMV_PATH = historicalCsvPath(
+  process.env.HISTORICAL_GMV_DAILY_MARKET_PATH,
+  "historical-gmv-daily-market-2025-06-2026-06.csv",
+);
 
 const CURRENCY_MAP: Record<string, string> = {
   USD: "USD", ZAR: "ZAR", EUR: "EUR", GBP: "GBP", CAD: "CAD",
@@ -16,6 +28,30 @@ const CURRENCY_MAP: Record<string, string> = {
 
 let cachedRates: Record<string, number> | null = null;
 let ratesFetchedAt = 0;
+let cachedHistoricalDailyGmv: HistoricalDailyGmvData | null = null;
+
+type HistoricalDailyGmv = {
+  all: number;
+  domestic: number;
+  international: number;
+  soldLots: number;
+};
+
+type HistoricalPlatformDailyGmv = {
+  gmv: number;
+  soldLots: number;
+};
+
+type HistoricalDailyGmvData = {
+  totals: Map<string, HistoricalDailyGmv>;
+  platforms: Map<"AD" | "GD", Map<string, HistoricalPlatformDailyGmv>>;
+};
+
+function historicalCsvPath(rawPath: string | undefined, fallbackFile: string) {
+  const normalized = (rawPath || fallbackFile).replace(/\\/g, "/");
+  const fileName = path.basename(normalized);
+  return path.join(HISTORICAL_GMV_DIR, fileName.endsWith(".csv") ? fileName : fallbackFile);
+}
 
 async function fetchUsdRates(): Promise<Record<string, number>> {
   if (cachedRates && Date.now() - ratesFetchedAt < 3600_000) return cachedRates;
@@ -53,6 +89,113 @@ function safeNumber(value: unknown, fallback = 0): number {
     if (!Number.isNaN(parsed)) return parsed;
   }
   return fallback;
+}
+
+function emptyHistoricalDailyGmv(): HistoricalDailyGmv {
+  return { all: 0, domestic: 0, international: 0, soldLots: 0 };
+}
+
+function emptyHistoricalDailyGmvData(): HistoricalDailyGmvData {
+  return {
+    totals: new Map(),
+    platforms: new Map([
+      ["AD", new Map()],
+      ["GD", new Map()],
+    ]),
+  };
+}
+
+function parseCsvLine(line: string): string[] {
+  const values: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    const next = line[i + 1];
+    if (char === "\"" && inQuotes && next === "\"") {
+      current += "\"";
+      i += 1;
+    } else if (char === "\"") {
+      inQuotes = !inQuotes;
+    } else if (char === "," && !inQuotes) {
+      values.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+
+  values.push(current);
+  return values;
+}
+
+function parseNativeUsd(raw: string | undefined) {
+  if (!raw) return 0;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return safeNumber(parsed.USD, 0);
+  } catch {
+    return 0;
+  }
+}
+
+async function loadHistoricalDailyGmv(): Promise<HistoricalDailyGmvData> {
+  if (cachedHistoricalDailyGmv) return cachedHistoricalDailyGmv;
+
+  const rows = emptyHistoricalDailyGmvData();
+  try {
+    const raw = await readFile(HISTORICAL_DAILY_GMV_PATH, "utf8");
+    for (const line of raw.trim().split(/\r?\n/).slice(1)) {
+      const [date, businessId, soldLotsRaw, gmvUsd, , nativeByCurrency] = parseCsvLine(line);
+      if (!date) continue;
+      const gmv = safeNumber(gmvUsd, Number.NaN);
+      if (!Number.isFinite(gmv)) continue;
+      const soldLots = safeNumber(soldLotsRaw, 0);
+
+      if (businessId === "AD" || businessId === "GD") {
+        rows.platforms.get(businessId)?.set(date, { gmv, soldLots });
+      }
+      if (businessId !== "ALL") continue;
+
+      const domestic = parseNativeUsd(nativeByCurrency);
+      rows.totals.set(date, {
+        all: gmv,
+        domestic,
+        international: Math.max(0, gmv - domestic),
+        soldLots,
+      });
+    }
+  } catch {
+    // The app can still run without the offline historical export.
+  }
+
+  try {
+    const raw = await readFile(HISTORICAL_DAILY_MARKET_GMV_PATH, "utf8");
+    for (const line of raw.trim().split(/\r?\n/).slice(1)) {
+      const [date, businessId, market, soldLotsRaw, gmvUsd] = parseCsvLine(line);
+      if (!date || businessId !== "ALL") continue;
+
+      const gmv = safeNumber(gmvUsd, Number.NaN);
+      if (!Number.isFinite(gmv)) continue;
+      const soldLots = safeNumber(soldLotsRaw, 0);
+
+      const hasDailyTotal = rows.totals.has(date);
+      const bucket = rows.totals.get(date) ?? emptyHistoricalDailyGmv();
+      if (market === "DOMESTIC") bucket.domestic = gmv;
+      else if (market === "INTERNATIONAL") bucket.international = gmv;
+      else if (market === "ALL" && !hasDailyTotal) {
+        bucket.all = gmv;
+        bucket.soldLots = soldLots;
+      }
+      rows.totals.set(date, bucket);
+    }
+  } catch {
+    // Domestic/international filters are unavailable for dates absent from the split export.
+  }
+
+  cachedHistoricalDailyGmv = rows;
+  return rows;
 }
 
 function buildPayload(businessId: "AD" | "GD", page: number) {
@@ -216,50 +359,22 @@ type ClosureResult = { sold: number; nosale: number; unknown: number };
 async function sweepClosures(nowIso: string): Promise<ClosureResult> {
   const { data, error } = await supabase
     .from("auctions")
-    .select("id, bid_count, current_bid_usd")
+    .select("id, bid_count")
     .eq("status", "open")
     .lt("close_time_utc", nowIso);
   if (error || !data) return { sold: 0, nosale: 0, unknown: 0 };
 
-  const soldIds: number[] = [];
   const nosaleIds: number[] = [];
   const unknownIds: number[] = [];
-  const finalPriceById = new Map<number, number>();
   for (const row of data) {
     const bids = row.bid_count ?? 0;
     if (bids > 0) {
-      // Sold, but we need a USD price to record. If current_bid_usd is null
-      // the bid was in a foreign currency we couldn't convert — mark unknown
-      // so it doesn't pollute realized GMV with a bogus 0.
-      if (row.current_bid_usd != null) {
-        soldIds.push(row.id);
-        finalPriceById.set(row.id, row.current_bid_usd);
-      } else {
-        unknownIds.push(row.id);
-      }
+      // A bid does not prove the reserve was met or that the auction closed
+      // as sold.
+      // Keep it out of realized GMV unless a sold feed verifies it.
+      unknownIds.push(row.id);
     } else {
       nosaleIds.push(row.id);
-    }
-  }
-
-  if (soldIds.length > 0) {
-    // Update each sold auction individually to capture its final_price.
-    // Batched in chunks to avoid N round-trips on small sets but keep payload bounded.
-    const CHUNK = 200;
-    for (let i = 0; i < soldIds.length; i += CHUNK) {
-      const chunk = soldIds.slice(i, i + CHUNK);
-      await Promise.all(
-        chunk.map((id) =>
-          supabase
-            .from("auctions")
-            .update({
-              status: "closed_sold",
-              final_price_usd: finalPriceById.get(id) ?? 0,
-              closed_at: nowIso,
-            })
-            .eq("id", id),
-        ),
-      );
     }
   }
 
@@ -285,7 +400,7 @@ async function sweepClosures(nowIso: string): Promise<ClosureResult> {
     }
   }
 
-  return { sold: soldIds.length, nosale: nosaleIds.length, unknown: unknownIds.length };
+  return { sold: 0, nosale: nosaleIds.length, unknown: unknownIds.length };
 }
 
 export type AuctionsIngestResult = {
@@ -333,6 +448,8 @@ export type RevenueForecast = {
     auctions_sold: number;
     close_rate: number;
     avg_hammer_usd: number;
+    realized_source: "historical_export" | "tracked_auctions";
+    projection_model: string;
     scheduled_open_auctions: number;
     scheduled_open_bid_usd: number;
     projected_remaining_gmv_usd: number;
@@ -343,8 +460,12 @@ export type RevenueForecast = {
   daily: {
     date: string;
     realized_gmv_usd: number;
+    domestic_realized_gmv_usd: number;
+    international_realized_gmv_usd: number;
     projected_gmv_usd: number;
     realized_revenue_usd: number;
+    domestic_realized_revenue_usd: number;
+    international_realized_revenue_usd: number;
     projected_revenue_usd: number;
   }[];
   projected_total_gmv_usd: number;
@@ -391,10 +512,183 @@ function enumerateQuarterDays(start: Date, end: Date): string[] {
   const days: string[] = [];
   const cursor = new Date(start);
   while (cursor < end) {
-    days.push(etDateKey(cursor.toISOString()));
+    days.push(cursor.toISOString().slice(0, 10));
     cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
   return days;
+}
+
+function dateKeyToUtcDate(dateKey: string) {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  if (!year || !month || !day) return null;
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+function earliestHistoricalDate(data: HistoricalDailyGmvData) {
+  let earliest: string | null = null;
+  for (const date of data.totals.keys()) {
+    if (earliest === null || date < earliest) earliest = date;
+  }
+  return earliest;
+}
+
+type ClosedAuctionForProjection = {
+  status: string | null;
+  final_price_usd: number | null;
+  current_bid_usd: number | null;
+  close_time_utc: string | null;
+  category: string | null;
+  bid_count: number | null;
+};
+
+type OpenAuctionForProjection = {
+  current_bid_usd: number | null;
+  close_time_utc: string | null;
+  category: string | null;
+  bid_count: number | null;
+};
+
+type ProjectedOpenAuction = OpenAuctionForProjection & {
+  projected_gmv_usd: number;
+};
+
+type ProjectionStatsAccumulator = {
+  closed: number;
+  sold: number;
+  realizedGmv: number;
+};
+
+type ProjectionStats = ProjectionStatsAccumulator & {
+  closeRate: number;
+  avgHammer: number;
+};
+
+type ProjectionModel = {
+  platform: ProjectionStats;
+  categories: Map<string, ProjectionStats>;
+  segments: Map<string, ProjectionStats>;
+};
+
+const MIN_SEGMENT_CLOSED = 3;
+const MIN_CATEGORY_CLOSED = 5;
+
+function emptyProjectionAccumulator(): ProjectionStatsAccumulator {
+  return { closed: 0, sold: 0, realizedGmv: 0 };
+}
+
+function addClosedAuction(stats: ProjectionStatsAccumulator, row: ClosedAuctionForProjection) {
+  stats.closed += 1;
+  if (row.status !== "closed_sold") return;
+
+  const finalPrice = row.final_price_usd ?? 0;
+  if (finalPrice <= 0) return;
+  stats.sold += 1;
+  stats.realizedGmv += finalPrice;
+}
+
+function finalizeProjectionStats(
+  stats: ProjectionStatsAccumulator,
+  fallbackAvgHammer: number,
+  fallbackCloseRate = DEFAULT_CLOSE_RATE,
+): ProjectionStats {
+  return {
+    ...stats,
+    closeRate: stats.closed > 0 ? stats.sold / stats.closed : fallbackCloseRate,
+    avgHammer: stats.sold > 0 ? stats.realizedGmv / stats.sold : fallbackAvgHammer,
+  };
+}
+
+function categoryKey(category: string | null | undefined) {
+  return category?.trim().toLowerCase() || "uncategorized";
+}
+
+function priceBand(amount: number) {
+  if (amount <= 0) return "0";
+  if (amount < 1_000) return "lt_1k";
+  if (amount < 10_000) return "1k_10k";
+  if (amount < 100_000) return "10k_100k";
+  return "100k_plus";
+}
+
+function bidBand(bidCount: number) {
+  if (bidCount <= 0) return "0";
+  if (bidCount < 5) return "1_4";
+  if (bidCount < 15) return "5_14";
+  return "15_plus";
+}
+
+function segmentKey(row: { category: string | null; current_bid_usd: number | null; final_price_usd?: number | null; bid_count: number | null }) {
+  const amount = Math.max(0, row.current_bid_usd ?? row.final_price_usd ?? 0);
+  return `${categoryKey(row.category)}|${priceBand(amount)}|${bidBand(row.bid_count ?? 0)}`;
+}
+
+function buildProjectionModel(closed: ClosedAuctionForProjection[], fallbackAvgHammer: number): ProjectionModel {
+  const platformAccumulator = emptyProjectionAccumulator();
+  const categoryAccumulators = new Map<string, ProjectionStatsAccumulator>();
+  const segmentAccumulators = new Map<string, ProjectionStatsAccumulator>();
+
+  for (const row of closed) {
+    addClosedAuction(platformAccumulator, row);
+
+    const category = categoryKey(row.category);
+    const categoryStats = categoryAccumulators.get(category) ?? emptyProjectionAccumulator();
+    addClosedAuction(categoryStats, row);
+    categoryAccumulators.set(category, categoryStats);
+
+    const segment = segmentKey(row);
+    const segmentStats = segmentAccumulators.get(segment) ?? emptyProjectionAccumulator();
+    addClosedAuction(segmentStats, row);
+    segmentAccumulators.set(segment, segmentStats);
+  }
+
+  const platform = finalizeProjectionStats(platformAccumulator, fallbackAvgHammer);
+  const categories = new Map<string, ProjectionStats>();
+  for (const [category, stats] of categoryAccumulators) {
+    categories.set(category, finalizeProjectionStats(stats, platform.avgHammer, platform.closeRate));
+  }
+
+  const segments = new Map<string, ProjectionStats>();
+  for (const [segment, stats] of segmentAccumulators) {
+    const category = segment.split("|", 1)[0] || "uncategorized";
+    const fallback = categories.get(category) ?? platform;
+    segments.set(segment, finalizeProjectionStats(stats, fallback.avgHammer, fallback.closeRate));
+  }
+
+  return { platform, categories, segments };
+}
+
+function chooseProjectionStats(row: OpenAuctionForProjection, model: ProjectionModel) {
+  const segment = model.segments.get(segmentKey(row));
+  if (segment && segment.closed >= MIN_SEGMENT_CLOSED) return segment;
+
+  const category = model.categories.get(categoryKey(row.category));
+  if (category && category.closed >= MIN_CATEGORY_CLOSED) return category;
+
+  return model.platform;
+}
+
+function estimateOpenAuctionGmv(row: OpenAuctionForProjection, model: ProjectionModel) {
+  const stats = chooseProjectionStats(row, model);
+  const currentBid = Math.max(0, row.current_bid_usd ?? 0);
+  return stats.closeRate * Math.max(currentBid, stats.avgHammer);
+}
+
+function sumHistoricalPlatform(
+  data: HistoricalDailyGmvData,
+  platform: "AD" | "GD",
+  quarterDaySet: Set<string>,
+) {
+  let gmv = 0;
+  let soldLots = 0;
+  const rows = data.platforms.get(platform);
+  if (!rows) return { gmv, soldLots };
+
+  for (const [date, row] of rows) {
+    if (!quarterDaySet.has(date)) continue;
+    gmv += row.gmv;
+    soldLots += row.soldLots;
+  }
+  return { gmv, soldLots };
 }
 
 async function collectDebug(nowIso: string, startIso: string, endIso: string) {
@@ -453,87 +747,130 @@ export async function computeRevenueForecast(takeRate = 0.2): Promise<RevenueFor
   const { start, end, label } = quarterBounds(now);
   const startIso = start.toISOString();
   const endIso = end.toISOString();
+  const historicalDailyGmv = await loadHistoricalDailyGmv();
+  const quarterDays = enumerateQuarterDays(start, end);
+  const quarterDaySet = new Set(quarterDays);
+  const historicalStartKey = earliestHistoricalDate(historicalDailyGmv);
+  const historicalStart = historicalStartKey ? dateKeyToUtcDate(historicalStartKey) : null;
+  const chartStart = historicalStart && historicalStart < start ? historicalStart : start;
+  const chartDays = enumerateQuarterDays(chartStart, end);
+  const chartDaySet = new Set(chartDays);
 
   const platforms: ("AD" | "GD")[] = ["AD", "GD"];
   const perPlatform = await Promise.all(
     platforms.map(async (platform) => {
+      const historical = sumHistoricalPlatform(historicalDailyGmv, platform, quarterDaySet);
       const [closedRes, openRes] = await Promise.all([
         supabase
           .from("auctions")
-          .select("status, final_price_usd, close_time_utc")
+          .select("status, final_price_usd, current_bid_usd, close_time_utc, category, bid_count")
           .eq("platform", platform)
           .gte("close_time_utc", startIso)
           .lt("close_time_utc", endIso)
           .in("status", ["closed_sold", "closed_nosale"]),
         supabase
           .from("auctions")
-          .select("current_bid_usd, close_time_utc")
+          .select("current_bid_usd, close_time_utc, category, bid_count")
           .eq("platform", platform)
           .eq("status", "open")
           .gte("close_time_utc", nowIso)
           .lt("close_time_utc", endIso),
       ]);
 
-      const closed = closedRes.data ?? [];
-      const open = openRes.data ?? [];
+      const closed = (closedRes.data ?? []) as ClosedAuctionForProjection[];
+      const open = (openRes.data ?? []) as OpenAuctionForProjection[];
       const sold = closed.filter((r) => r.status === "closed_sold");
-      const realizedGmv = sold.reduce((s, r) => s + (r.final_price_usd ?? 0), 0);
-      const closeRate = closed.length > 0 ? sold.length / closed.length : 0;
-      const avgHammer = sold.length > 0 ? realizedGmv / sold.length : 0;
+      const trackedRealizedGmv = sold.reduce((s, r) => s + (r.final_price_usd ?? 0), 0);
+      const realizedSource: "historical_export" | "tracked_auctions" =
+        historical.gmv > 0 ? "historical_export" : "tracked_auctions";
+      const realizedGmv = realizedSource === "historical_export" ? historical.gmv : trackedRealizedGmv;
+      const auctionsSold = realizedSource === "historical_export" ? historical.soldLots : sold.length;
+      const fallbackAvgHammer =
+        historical.soldLots > 0
+          ? historical.gmv / historical.soldLots
+          : sold.length > 0
+            ? trackedRealizedGmv / sold.length
+            : 0;
+      const model = buildProjectionModel(closed, fallbackAvgHammer);
       const openBid = open.reduce((s, r) => s + (r.current_bid_usd ?? 0), 0);
-
-      const projectedOpenGmv = open.reduce((s, r) => {
-        const cur = r.current_bid_usd ?? 0;
-        const hammer = Math.max(cur, avgHammer);
-        return s + closeRate * hammer;
-      }, 0);
+      const openProjections: ProjectedOpenAuction[] = open.map((row) => ({
+        ...row,
+        projected_gmv_usd: estimateOpenAuctionGmv(row, model),
+      }));
+      const projectedOpenGmv = openProjections.reduce((s, r) => s + r.projected_gmv_usd, 0);
+      const projectionModel =
+        model.segments.size > 0
+          ? "segment/category/platform blend"
+          : model.categories.size > 0
+            ? "category/platform blend"
+            : "platform fallback";
 
       return {
         platform,
         closed,
         open,
+        openProjections,
         sold,
         realizedGmv,
-        closeRate,
-        avgHammer,
+        auctionsSold,
+        realizedSource,
+        closeRate: model.platform.closeRate,
+        avgHammer: model.platform.avgHammer,
         openBid,
         projectedOpenGmv,
+        projectionModel,
       };
     }),
   );
 
-  // Aggregate per-day totals across platforms.
-  const dailyMap = new Map<string, { realized: number; projected: number }>();
-  for (const day of enumerateQuarterDays(start, end)) {
-    dailyMap.set(day, { realized: 0, projected: 0 });
+  const dailyMap = new Map<string, { realized: HistoricalDailyGmv; projected: number; hasHistoricalRealized: boolean }>();
+  for (const day of chartDays) {
+    const realized = historicalDailyGmv.totals.get(day);
+    dailyMap.set(day, {
+      realized: realized ? { ...realized } : emptyHistoricalDailyGmv(),
+      projected: 0,
+      hasHistoricalRealized: Boolean(realized),
+    });
   }
   for (const p of perPlatform) {
     for (const row of p.sold) {
       if (!row.close_time_utc) continue;
       const key = etDateKey(row.close_time_utc);
-      const bucket = dailyMap.get(key);
-      if (bucket) bucket.realized += row.final_price_usd ?? 0;
-    }
-    for (const row of p.open) {
-      if (!row.close_time_utc) continue;
-      const key = etDateKey(row.close_time_utc);
+      if (!chartDaySet.has(key)) continue;
       const bucket = dailyMap.get(key);
       if (!bucket) continue;
-      const cur = row.current_bid_usd ?? 0;
-      const hammer = Math.max(cur, p.avgHammer);
-      bucket.projected += p.closeRate * hammer;
+      if (!bucket.hasHistoricalRealized) {
+        const amount = row.final_price_usd ?? 0;
+        bucket.realized.all += amount;
+        bucket.realized.domestic += amount;
+        if (amount > 0) bucket.realized.soldLots += 1;
+      }
+    }
+    for (const row of p.openProjections) {
+      if (!row.close_time_utc) continue;
+      const key = etDateKey(row.close_time_utc);
+      if (!chartDaySet.has(key)) continue;
+      const bucket = dailyMap.get(key);
+      if (!bucket) continue;
+      bucket.projected += row.projected_gmv_usd;
     }
   }
 
-  const daily = Array.from(dailyMap.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([date, v]) => ({
-      date,
-      realized_gmv_usd: Math.round(v.realized),
-      projected_gmv_usd: Math.round(v.projected),
-      realized_revenue_usd: Math.round(v.realized * takeRate),
-      projected_revenue_usd: Math.round(v.projected * takeRate),
-    }));
+  const daily = chartDays
+    .map((date) => {
+      const v = dailyMap.get(date) ?? { realized: emptyHistoricalDailyGmv(), projected: 0 };
+      return {
+        date,
+        realized_gmv_usd: Math.round(v.realized.all),
+        domestic_realized_gmv_usd: Math.round(v.realized.domestic),
+        international_realized_gmv_usd: Math.round(v.realized.international),
+        projected_gmv_usd: Math.round(v.projected),
+        realized_revenue_usd: Math.round(v.realized.all * takeRate),
+        domestic_realized_revenue_usd: Math.round(v.realized.domestic * takeRate),
+        international_realized_revenue_usd: Math.round(v.realized.international * takeRate),
+        projected_revenue_usd: Math.round(v.projected * takeRate),
+      };
+    });
 
   const rows = perPlatform.map((p) => {
     const totalGmv = p.realizedGmv + p.projectedOpenGmv;
@@ -542,9 +879,11 @@ export async function computeRevenueForecast(takeRate = 0.2): Promise<RevenueFor
       realized_gmv_usd: Math.round(p.realizedGmv),
       realized_revenue_usd: Math.round(p.realizedGmv * takeRate),
       auctions_closed: p.closed.length,
-      auctions_sold: p.sold.length,
+      auctions_sold: p.auctionsSold,
       close_rate: Math.round(p.closeRate * 10000) / 10000,
       avg_hammer_usd: Math.round(p.avgHammer),
+      realized_source: p.realizedSource,
+      projection_model: p.projectionModel,
       scheduled_open_auctions: p.open.length,
       scheduled_open_bid_usd: Math.round(p.openBid),
       projected_remaining_gmv_usd: Math.round(p.projectedOpenGmv),
@@ -554,8 +893,9 @@ export async function computeRevenueForecast(takeRate = 0.2): Promise<RevenueFor
     };
   });
 
-  const projected_total_gmv_usd = rows.reduce((s, r) => s + r.projected_total_gmv_usd, 0);
-  const projected_total_revenue_usd = rows.reduce((s, r) => s + r.projected_total_revenue_usd, 0);
+  const quarterDaily = daily.filter((row) => quarterDaySet.has(row.date));
+  const projected_total_gmv_usd = quarterDaily.reduce((s, r) => s + r.realized_gmv_usd + r.projected_gmv_usd, 0);
+  const projected_total_revenue_usd = quarterDaily.reduce((s, r) => s + r.realized_revenue_usd + r.projected_revenue_usd, 0);
 
   const debug = await collectDebug(nowIso, startIso, endIso);
 

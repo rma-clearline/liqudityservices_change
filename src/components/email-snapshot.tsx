@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 
 export function EmailSnapshot({ chartRef }: { chartRef: React.RefObject<HTMLDivElement | null> }) {
   const [email, setEmail] = useState("");

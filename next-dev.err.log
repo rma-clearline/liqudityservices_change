@@ -1,0 +1,54 @@
+[browser] Uncaught ReferenceError: DEFAULT_SALES_CONTROLS is not defined
+    at SalesDetailsModal (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/src_components_0kn-jlc._.js?id=%255Bproject%255D%252Fsrc%252Fcomponents%252Frevenue-forecast.tsx+%255Bapp-client%255D+%2528ecmascript%2529:269:323)
+    at Object.react_stack_bottom_frame (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:15037:24)
+    at renderWithHooks (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:4620:24)
+    at updateFunctionComponent (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:6081:21)
+    at beginWork (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:6691:24)
+    at runWithFiberInDEV (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:965:74)
+    at performUnitOfWork (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:9555:97)
+    at workLoopSync (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:9449:40)
+    at renderRootSync (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:9433:13)
+    at performWorkOnRoot (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:9061:186)
+    at performSyncWorkOnRoot (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:10263:9)
+    at flushSyncWorkAcrossRoots_impl (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:10179:316)
+    at processRootScheduleInMicrotask (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:10200:106)
+    at <unknown> (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:10274:158)
+    at RevenueForecast (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/src_components_0kn-jlc._.js:2057:347)
+    at Dashboard (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/src_components_0kn-jlc._.js:3722:334)
+    at Home (src\app\page.tsx:73:7)
+  71 |         Daily active listing counts for AllSurplus and GovDeals
+  72 |       </p>
+> 73 |       <Dashboard
+     |       ^
+  74 |         listings={listings}
+  75 |         metricsAllsurplus={latestAllsurplus}
+  76 |         metricsGovdeals={latestGovdeals}
+⚠ Fast Refresh had to perform a full reload due to a runtime error.
+[browser] Uncaught ReferenceError: BarChart is not defined
+    at DailyForecastChart (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/src_components_0kn-jlc._.js?id=%255Bproject%255D%252Fsrc%252Fcomponents%252Frevenue-forecast.tsx+%255Bapp-client%255D+%2528ecmascript%2529:1016:337)
+    at Object.react_stack_bottom_frame (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:15037:24)
+    at renderWithHooks (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:4620:24)
+    at updateFunctionComponent (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:6081:21)
+    at beginWork (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:6691:24)
+    at runWithFiberInDEV (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:965:74)
+    at performUnitOfWork (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:9555:97)
+    at workLoopSync (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:9449:40)
+    at renderRootSync (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:9433:13)
+    at performWorkOnRoot (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:9061:186)
+    at performSyncWorkOnRoot (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:10263:9)
+    at flushSyncWorkAcrossRoots_impl (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:10179:316)
+    at processRootScheduleInMicrotask (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:10200:106)
+    at <unknown> (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/0sp7_next_dist_compiled_react-dom_0~c8qs9._.js:10274:158)
+    at RevenueForecast (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/src_components_0kn-jlc._.js:2108:334)
+    at Dashboard (file://C:/Users/RyanMa/OneDrive - Clearline Capital/Documents/liqudityservices/.next/dev/static/chunks/src_components_0kn-jlc._.js:3819:334)
+    at Home (src\app\page.tsx:73:7)
+  71 |         Daily active listing counts for AllSurplus and GovDeals
+  72 |       </p>
+> 73 |       <Dashboard
+     |       ^
+  74 |         listings={listings}
+  75 |         metricsAllsurplus={latestAllsurplus}
+  76 |         metricsGovdeals={latestGovdeals}
+⚠ Fast Refresh had to perform a full reload due to a runtime error.
+⚠ Fast Refresh had to perform a full reload due to a runtime error.
+⚠ Found a change in next.config.ts. Restarting the server to apply the changes...

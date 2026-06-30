@@ -67,8 +67,10 @@ export type PlatformMetrics = {
 const MAESTRO_URL = process.env.MAESTRO_API_URL || "https://maestro.lqdt1.com";
 const MAESTRO_KEY =
   process.env.MAESTRO_API_KEY || "af93060f-337e-428c-87b8-c74b5837d6cd";
+const METRICS_PAGE_SIZE = Number(process.env.MARKETPLACE_METRICS_PAGE_SIZE) || 1000;
+const MAX_METRICS_PAGES = Number(process.env.MARKETPLACE_METRICS_MAX_PAGES) || 25;
 
-function buildPayload(businessId: "AD" | "GD") {
+function buildPayload(businessId: "AD" | "GD", page: number) {
   return {
     category: "",
     groupIds: [],
@@ -81,8 +83,8 @@ function buildPayload(businessId: "AD" | "GD") {
     accountIds: [],
     eventId: null,
     auctionTypeId: null,
-    page: 1,
-    displayRows: 50,
+    page,
+    displayRows: METRICS_PAGE_SIZE,
     sortField: "bestfit",
     sortOrder: "asc",
     requestType: "search",
@@ -101,6 +103,15 @@ function safeNumber(value: unknown, fallback = 0): number {
     if (!Number.isNaN(parsed)) return parsed;
   }
   return fallback;
+}
+
+function listingKey(raw: Record<string, unknown>) {
+  return [
+    typeof raw.businessId === "string" ? raw.businessId : "",
+    raw.accountId ?? "",
+    raw.assetId ?? "",
+    raw.auctionId ?? "",
+  ].join(":");
 }
 
 function emptyMetrics(platform: "AD" | "GD", debug: string): PlatformMetrics {
@@ -164,9 +175,9 @@ function computeMetrics(
         existing.listing_count += 1;
         existing.total_current_bid += currentBidUsd;
         existing.total_bids += bids;
-        if (bids > existing.top_bid_amount && assetId) {
+        if (currentBidUsd > existing.top_bid_amount && assetId) {
           existing.top_bid_asset_id = assetId;
-          existing.top_bid_amount = bids;
+          existing.top_bid_amount = currentBidUsd;
           existing.sub_business_id = subBiz;
         }
       } else {
@@ -178,8 +189,8 @@ function computeMetrics(
           listing_count: 1,
           total_current_bid: currentBidUsd,
           total_bids: bids,
-          top_bid_asset_id: bids > 0 ? assetId : null,
-          top_bid_amount: bids,
+          top_bid_asset_id: currentBidUsd > 0 ? assetId : null,
+          top_bid_amount: currentBidUsd,
           sub_business_id: subBiz,
         });
       }
@@ -227,6 +238,63 @@ function computeMetrics(
   };
 }
 
+type PageFetchResult = {
+  listings: Record<string, unknown>[];
+  totalListings: number;
+  status: number;
+  debug: string | null;
+};
+
+async function fetchMetricsPage(businessId: "AD" | "GD", page: number, signal: AbortSignal): Promise<PageFetchResult> {
+  const correlationId = randomUUID();
+  const res = await fetch(`${MAESTRO_URL}/search/list`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": MAESTRO_KEY,
+      "x-user-id": "-1",
+      "x-api-correlation-id": correlationId,
+    },
+    body: JSON.stringify(buildPayload(businessId, page)),
+    signal,
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    return {
+      listings: [],
+      totalListings: 0,
+      status: res.status,
+      debug: `http ${res.status}: ${errText.slice(0, 100)}`,
+    };
+  }
+
+  const data = await res.json();
+  const headerCount = res.headers.get("x-total-count");
+  const totalListings = headerCount ? parseInt(headerCount, 10) || 0 : 0;
+
+  let listings: Record<string, unknown>[] = [];
+  if (Array.isArray(data?.assetSearchResults)) {
+    listings = data.assetSearchResults;
+  } else if (Array.isArray(data?.searchResults)) {
+    listings = data.searchResults;
+  } else if (Array.isArray(data)) {
+    listings = data;
+  }
+
+  if (listings.length === 0) {
+    const keys = data ? Object.keys(data).join(", ") : "null response";
+    return {
+      listings: [],
+      totalListings,
+      status: res.status,
+      debug: `no listings array. keys: ${keys}`,
+    };
+  }
+
+  return { listings, totalListings, status: res.status, debug: null };
+}
+
 async function fetchPlatformMetrics(
   businessId: "AD" | "GD",
   rates: Record<string, number>,
@@ -235,49 +303,45 @@ async function fetchPlatformMetrics(
   const timeout = setTimeout(() => controller.abort(), 30000);
 
   try {
-    const correlationId = randomUUID();
-    const res = await fetch(`${MAESTRO_URL}/search/list`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": MAESTRO_KEY,
-        "x-user-id": "-1",
-        "x-api-correlation-id": correlationId,
-      },
-      body: JSON.stringify(buildPayload(businessId)),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      console.error(`[marketplace-metrics] ${businessId} HTTP ${res.status}: ${errText.slice(0, 200)}`);
-      return emptyMetrics(businessId, `http ${res.status}: ${errText.slice(0, 100)}`);
-    }
-
-    const data = await res.json();
-
-    const headerCount = res.headers.get("x-total-count");
+    const listings: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
     let totalListings = 0;
-    if (headerCount) {
-      totalListings = parseInt(headerCount, 10) || 0;
-    }
+    let page = 1;
+    let lastDebug: string | null = null;
 
-    let listings: Record<string, unknown>[] = [];
-    if (Array.isArray(data?.assetSearchResults)) {
-      listings = data.assetSearchResults;
-    } else if (Array.isArray(data?.searchResults)) {
-      listings = data.searchResults;
-    } else if (Array.isArray(data)) {
-      listings = data;
+    while (page <= MAX_METRICS_PAGES) {
+      const result = await fetchMetricsPage(businessId, page, controller.signal);
+      if (result.debug) lastDebug = result.debug;
+      if (result.status !== 200 && listings.length === 0) {
+        console.error(`[marketplace-metrics] ${businessId} ${result.debug}`);
+        return emptyMetrics(businessId, result.debug ?? `http ${result.status}`);
+      }
+
+      if (page === 1) totalListings = result.totalListings;
+      if (result.listings.length === 0) break;
+
+      for (const listing of result.listings) {
+        const key = listingKey(listing);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        listings.push(listing);
+      }
+
+      if (result.listings.length < METRICS_PAGE_SIZE) break;
+      if (totalListings > 0 && page * METRICS_PAGE_SIZE >= totalListings) break;
+      page += 1;
     }
 
     if (listings.length === 0) {
-      const keys = data ? Object.keys(data).join(", ") : "null response";
-      console.error(`[marketplace-metrics] ${businessId} no listings found. Response keys: ${keys}`);
-      return emptyMetrics(businessId, `no listings array. keys: ${keys}`);
+      console.error(`[marketplace-metrics] ${businessId} no listings found. ${lastDebug ?? ""}`);
+      return emptyMetrics(businessId, lastDebug ?? "0 listings in response");
     }
 
-    return computeMetrics(businessId, totalListings, listings, rates);
+    const metrics = computeMetrics(businessId, totalListings, listings, rates);
+    metrics.debug = totalListings > listings.length
+      ? `sampled ${listings.length}/${totalListings} listings across ${page} pages`
+      : `ok, full coverage ${listings.length}/${totalListings || listings.length} listings`;
+    return metrics;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[marketplace-metrics] ${businessId} error: ${msg}`);

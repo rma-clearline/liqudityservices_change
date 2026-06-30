@@ -1,6 +1,7 @@
 import { Resend } from "resend";
 import { supabase } from "./supabase";
 import type { ListingRow } from "./supabase";
+import { downsample, MAX_CHART_LABELS } from "./chart-utils";
 
 function getResend() {
   return new Resend(process.env.RESEND_API_KEY);
@@ -55,14 +56,7 @@ async function generateChartImage(rows: ListingRow[]): Promise<{ image: string |
   if (displayed.length === 0) return { image: null, debug: "no rows in display window" };
 
   // QuickChart free tier allows max 250 labels — downsample if needed
-  const MAX_LABELS = 250;
-  let sampled = displayed;
-  if (displayed.length > MAX_LABELS) {
-    const step = displayed.length / MAX_LABELS;
-    const indices = Array.from({ length: MAX_LABELS }, (_, i) => Math.round(i * step));
-    indices[indices.length - 1] = displayed.length - 1;
-    sampled = indices.map((i) => displayed[i]);
-  }
+  const sampled = downsample(displayed, MAX_CHART_LABELS);
 
   const labels = sampled.map((r) => r.date);
   const asData = sampled.map((r) => (r.allsurplus != null ? r.allsurplus : null));
