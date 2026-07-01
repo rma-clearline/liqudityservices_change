@@ -1,6 +1,7 @@
 "use client";
 
 import type { StateContractRow } from "@/lib/supabase";
+import { ExportButton } from "./export-button";
 
 function fmtDollar(n: number | null | undefined) {
   if (n == null || n === 0) return "—";
@@ -82,6 +83,28 @@ export function StateContracts({ contracts }: { contracts: StateContractRow[] })
 
   return (
     <div className="space-y-5">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <p className="text-xs text-gray-400">{contracts.length} records across {Object.keys(byState).length} sources</p>
+        <ExportButton
+          rows={contracts}
+          filename="lqdt-state-contracts.csv"
+          columns={[
+            { key: "state_code", label: "State" },
+            { key: "source_portal", label: "Portal" },
+            { key: "contract_id", label: "Contract ID" },
+            { key: "vendor_name", label: "Vendor" },
+            { key: "vendor_normalized", label: "Vendor (normalized)" },
+            { key: "record_type", label: "Record Type" },
+            { key: "customer_agency", label: "Customer" },
+            { key: "contract_title", label: "Title" },
+            { key: "amount", label: "Amount" },
+            { key: "year", label: "Year" },
+            { key: "quarter", label: "Quarter" },
+            { key: "period_start", label: "Period Start" },
+            { key: "period_end", label: "Period End" },
+          ]}
+        />
+      </div>
       <div className="flex flex-wrap gap-2">
         {Object.entries(byVendor)
           .sort(([, a], [, b]) => b.total - a.total)

@@ -4,6 +4,33 @@ import { supabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
 
+// Guardrails for a public POST endpoint that sends email + accepts an image.
+const MAX_BODY_BYTES = 8_000_000; // ~8MB request cap
+const MAX_CHART_BASE64 = 6_000_000; // ~4.5MB decoded PNG
+const RATE_LIMIT_MAX = 5; // requests
+const RATE_LIMIT_WINDOW_MS = 10 * 60_000; // per 10 minutes, per client
+
+// Best-effort in-memory limiter. Per serverless instance, but enough to blunt
+// abuse of an unauthenticated endpoint; a shared store can replace it later.
+const rateBuckets = new Map<string, number[]>();
+
+function rateLimited(key: string): boolean {
+  const now = Date.now();
+  const hits = (rateBuckets.get(key) ?? []).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  if (hits.length >= RATE_LIMIT_MAX) {
+    rateBuckets.set(key, hits);
+    return true;
+  }
+  hits.push(now);
+  rateBuckets.set(key, hits);
+  return false;
+}
+
+function clientKey(request: Request): string {
+  const fwd = request.headers.get("x-forwarded-for");
+  return (fwd?.split(",")[0].trim() || request.headers.get("x-real-ip") || "unknown").slice(0, 64);
+}
+
 function configuredSnapshotRecipients() {
   return new Set(
     (process.env.NOTIFICATION_EMAIL ?? "")
@@ -14,7 +41,21 @@ function configuredSnapshotRecipients() {
 }
 
 export async function POST(request: Request) {
+  if (rateLimited(clientKey(request))) {
+    return NextResponse.json({ error: "Too many requests. Try again later." }, { status: 429 });
+  }
+
+  const contentLength = Number(request.headers.get("content-length") ?? 0);
+  if (contentLength > MAX_BODY_BYTES) {
+    return NextResponse.json({ error: "Payload too large" }, { status: 413 });
+  }
+
   const { email, chartImage } = await request.json();
+
+  if (typeof chartImage === "string" && chartImage.length > MAX_CHART_BASE64) {
+    return NextResponse.json({ error: "Chart image too large" }, { status: 413 });
+  }
+
   const allowedRecipients = configuredSnapshotRecipients();
 
   if (allowedRecipients.size === 0) {

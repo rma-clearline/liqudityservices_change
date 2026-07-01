@@ -1,46 +1,87 @@
 # future_improvements
 
-## Next
+## Applying the new migrations
 
-- Replace current FX historical GMV conversion with sale-date FX. Store native sale amount, native currency, sale-date USD rate, converted USD amount, and rate source so historical GMV can be reproduced and audited.
+This change adds migrations **013–015 and 017–022** (016 is intentionally unused).
+They are additive and safe to apply in filename order via the Supabase SQL editor. Until they are applied, the app degrades
+gracefully (new columns/tables read as null/empty; ingestion of new columns will
+error and be logged in `cron_runs` once that table exists). New optional env var:
+`NEXT_PUBLIC_SUPABASE_ANON_KEY` (least-privilege reader; falls back to the secret
+key if unset).
 
-## Forecasting and Auction Data
+## Done in this change
 
-- Add a verified sold-results feed or settlement source so closed auctions with bids can be classified as sold only when reserve/settlement status is known.
-- Backtest the projection model against historical quarters and report error by platform, category, price band, bid band, and days-to-close.
-- Add forecast confidence intervals using historical model error rather than showing only a single-point estimate.
-- Add seasonality features for quarter-end, weekday/weekend close dates, holidays, and known large-event auction days.
-- Persist forecast snapshots and the feature mix behind each projection so quarter-over-quarter changes can be explained.
-- Enrich auction rows with reserve status when available, auction type, event ID, seller segment, geography, equipment/asset condition, watch count, listing duration, and normalized title keywords.
-- Separate current-bid GMV proxy from realized GMV in reporting and database naming.
+- **Shared libraries** (`src/lib/maestro.ts`, `fx.ts`, `time.ts`, `http.ts`) —
+  removed the duplicated Maestro client / FX / ET-date / fetch logic that had
+  drifted across five files. Maestro + HTTP calls now have retry/backoff + timeouts.
+- **Sale-date FX provenance** — `fx_rates` table (015) + per-row `sale_amount_native`,
+  `fx_rate_used`, `fx_source` on `auctions` (013). USD figures are now reproducible.
+- **Richer auction data** (013) — title, geography (country/state/city), make/model/
+  year, `reserve_status`, `event_id`, `auction_type_id`, `keywords`, `url`,
+  `lot_number`, and `row_business_id` (true marketplace) captured at ingest.
+- **Marketplace coverage + reserve** (017) — `pages_fetched`, `is_full_coverage`,
+  `listings_with_reserve`, `reserve_rate`; the fake hardcoded `avg_watch_count` now
+  writes null (no such field exists in Maestro) and the UI shows reserve rate.
+- **Seller movers** (019) — `marketplace_seller_deltas` view + dashboard widget for
+  new/disappeared sellers and biggest listing/GMV movers.
+- **Cron run log** (014) — `cron_runs` table + per-source status/rows/errors/duration
+  written each run; `GET /api/data-status` powers dashboard freshness + alerting.
+- **UX** — top-of-page reconciliation summary, per-section freshness badges, an
+  alerts banner (failed runs / stale data / 0-row pulls), sticky section nav, CSV
+  export on the sales modal + seller/contract/opportunity tables, and a title/scope
+  rename.
+- **Security** — writes moved to a server-only service-role client (`supabaseAdmin`);
+  anon key is read-only; dropped the over-permissive anon write policies (018);
+  rate + size limits on the manual snapshot endpoint.
+- **Breadth** — USAspending pagination + humanized award types; SAM set-aside +
+  place-of-performance enrichment + broader NAICS; state/local `record_type` (021),
+  Socrata `$offset` pagination, stronger vendor normalization; wired the previously
+  orphaned Riverside adapter.
+- **Query indexes** (022) for the dashboard's order/filter patterns.
 
-## Data Quality and Operations
+## Discovered correctness issues (documented; not fully fixed here)
 
-- Move cron writes to a server-only Supabase service role while keeping browser reads on anon keys with least-privilege RLS policies.
-- Add a cron run log table with start/end time, source-level status, row counts, errors, and duration for each scraper.
-- Split expensive cron work into smaller jobs so a slow external source does not block all daily updates.
-- Add retry/backoff and source-specific timeouts for Maestro, USAspending, SAM.gov, state portals, FX, and email.
-- Add validation checks for historical CSV schema, date coverage, duplicate rows, and GMV totals before using exports in production forecasts.
-- Add alerting for stale data, failed cron runs, unexpectedly low row counts, and large day-over-day GMV swings.
-- Add rate limiting and chart image size limits to the manual snapshot endpoint.
+- **Auction platform mislabel + double-count.** Maestro `businessId` is the *site*
+  (AD/GD); each site returns cross-listed rows whose true marketplace is
+  `row.businessId` (AD/GD/GI). `ingestPlatform`/`ingestSoldPlatform` label `platform`
+  by the query site, so per-platform realized GMV is mislabeled, and a cross-listed
+  asset returned by both the AD- and GD-site sold runs is upserted under two
+  `platform` values → **double-counted realized GMV**. Migration 013 adds the truthful
+  `row_business_id` column; the dedup/attribution fix belongs with the forecasting
+  workstream (change the sold ingest to dedup by asset across sites and attribute by
+  `row_business_id`).
 
-## Marketplace Metrics
+## Remaining / deferred
 
-- Store metrics coverage metadata, including fetched pages, sample size, total listings, and whether the snapshot is full coverage or sampled.
-- Consider a background full-crawl mode for seller and category metrics when API limits allow it.
-- Track seller-level changes over time, including new sellers, disappearing sellers, listing count deltas, and top asset deltas.
+### Forecasting rigor (deferred by request)
+- Persist `forecast_snapshots` (per-run per-platform totals, model label, take rate)
+  for QoQ explainability; add confidence intervals from historical residuals; a
+  `scripts/backtest-forecast.mjs` harness reporting error by platform/category/price
+  band/bid band/days-to-close (reuse `buildProjectionModel`/`segmentKey`).
+- Seasonality features (quarter-end, weekday/weekend, holidays, known events).
+- Per-platform take rate (AD vs GD) instead of a single flat rate.
+- Fix the platform double-count (above) so realized GMV is attributed correctly.
 
-## Contracts and Opportunities
+### Data quality & operations
+- Split the cron into per-source endpoints with independent Vercel schedules
+  (`/api/cron` already isolates + logs + retries each source; this is the deployment
+  step: add `?only=<source>` gating + separate `vercel.json` crons so a slow source
+  can't consume the shared 60s budget).
+- Active alerting (email/webhook) on failed runs / large day-over-day GMV swings, on
+  top of the dashboard alerts banner now in place.
+- Validate the historical CSV (schema, date coverage, duplicates, GMV totals) before
+  use in forecasts.
+- Convert `text` date columns to `date`/`timestamptz` (kept as ISO text for now since
+  code compares them as strings; needs a coordinated code + data migration).
 
-- Paginate USAspending contract pulls beyond the current request window and persist source query metadata.
-- Normalize federal award types and separate active contract value, new obligation, and ceiling value where available.
-- Add SAM.gov opportunity detail enrichment for NAICS, PSC, place of performance, set-aside, awardee, attachments, and response deadlines.
-- Separate state/local contract records by record type and source semantics so awards, solicitations, purchase orders, and amendments are not blended.
-- Add Socrata pagination and per-source cursoring for state/local portals.
-- Improve vendor normalization with aliases, punctuation handling, common suffix stripping, and manual overrides for known strategic accounts.
+### Contracts & opportunities
+- USAspending **ceiling value** (base-and-all-options): not exposed by
+  `spending_by_award`; requires the award-detail endpoint per award.
+- SAM.gov attachments + full opportunity-detail fetch (current enrichment reads
+  set-aside/place-of-performance from the search response without an extra call).
+- Persist source-query metadata (pages fetched, windows) beyond the `cron_runs` detail.
 
-## Reporting
-
-- Add a reconciliation view that compares daily historical GMV, tracked sold auctions, projected remaining GMV, and total forecast in one place.
-- Add source freshness indicators to dashboard sections so stale data is obvious.
-- Add exportable forecast and sales-detail tables for downstream analysis.
+### Marketplace
+- Background full-crawl mode for seller/category metrics when API limits allow.
+- Watch/view counts are unavailable from the Maestro search feed (confirmed via live
+  probing); revisit if a listing-detail endpoint exposes them.

@@ -1,6 +1,7 @@
 "use client";
 
 import type { MarketplaceSellerRow } from "@/lib/supabase";
+import { ExportButton } from "./export-button";
 
 function fmtDollar(n: number | null | undefined) {
   if (n == null) return "—";
@@ -118,6 +119,23 @@ export function TopSellers({
 
   return (
     <div className="space-y-6">
+      <div className="flex justify-end">
+        <ExportButton
+          rows={[...allsurplus, ...govdeals]}
+          filename="lqdt-top-sellers.csv"
+          columns={[
+            { key: "date", label: "Snapshot" },
+            { key: "platform", label: "Platform" },
+            { key: "account_id", label: "Account ID" },
+            { key: "company_name", label: "Seller" },
+            { key: "country", label: "Country" },
+            { key: "state", label: "State" },
+            { key: "listing_count", label: "Listings" },
+            { key: "total_bids", label: "Bids" },
+            { key: "total_current_bid", label: "GMV Proxy USD" },
+          ]}
+        />
+      </div>
       <SellerTable title="AllSurplus" color="text-blue-600" sellers={allsurplus} platform="AD" />
       <SellerTable title="GovDeals" color="text-green-600" sellers={govdeals} platform="GD" />
     </div>

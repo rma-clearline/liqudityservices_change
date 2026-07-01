@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
+import { downloadCsv, toCsv } from "@/lib/format";
 import {
   ComposedChart,
   Bar,
@@ -339,6 +340,27 @@ function SalesDetailsModal({
     setControls(defaultSalesControls(market));
   }
 
+  function exportCsv() {
+    const csv = toCsv(state.rows, [
+      { key: "platform", label: "Platform" },
+      { key: "asset_id", label: "Asset ID" },
+      { key: "auction_id", label: "Auction ID" },
+      { key: "account_id", label: "Account ID" },
+      { key: "title", label: "Title" },
+      { key: "seller", label: "Seller" },
+      { key: "category", label: "Category" },
+      { key: "country", label: "Country" },
+      { key: "state", label: "State" },
+      { key: "close_time_utc", label: "Close (UTC)" },
+      { key: "currency_code", label: "Currency" },
+      { key: "sale_amount_native", label: "Native Amount" },
+      { key: "sale_amount_usd", label: "USD Amount" },
+      { key: "bid_count", label: "Bids" },
+      { key: "url", label: "URL" },
+    ]);
+    downloadCsv(`lqdt-sales-${date}.csv`, csv);
+  }
+
   return (
     <div className="fixed inset-0 z-50 bg-black/40 p-4" onClick={onClose}>
       <div
@@ -359,13 +381,23 @@ function SalesDetailsModal({
               {loaded > 0 ? `, loaded GMV ${fmtDollar(loadedGmv)}` : ""}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded border border-gray-300 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50"
-          >
-            Close
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={exportCsv}
+              disabled={loaded === 0}
+              className="rounded border border-gray-300 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Export CSV
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded border border-gray-300 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50"
+            >
+              Close
+            </button>
+          </div>
         </div>
 
         <div className="border-b px-5 py-3">

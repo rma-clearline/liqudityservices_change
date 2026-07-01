@@ -15,6 +15,9 @@ export type SamOpportunity = {
   awardee_uei: string | null;
   award_amount: number | null;
   award_date: string | null;
+  set_aside: string | null;
+  pop_state: string | null;
+  pop_city: string | null;
 };
 
 type SamRaw = {
@@ -30,6 +33,12 @@ type SamRaw = {
   classificationCode?: string;
   description?: string;
   uiLink?: string;
+  typeOfSetAside?: string;
+  typeOfSetAsideDescription?: string;
+  placeOfPerformance?: {
+    city?: { name?: string };
+    state?: { code?: string; name?: string };
+  };
   award?: {
     date?: string;
     amount?: string | number;
@@ -75,6 +84,9 @@ function mapOpportunity(raw: SamRaw): SamOpportunity | null {
     awardee_uei: award?.awardee?.ueiSAM ?? null,
     award_amount: amount != null && Number.isFinite(amount) ? amount : null,
     award_date: award?.date ?? null,
+    set_aside: raw.typeOfSetAsideDescription ?? raw.typeOfSetAside ?? null,
+    pop_state: raw.placeOfPerformance?.state?.code ?? raw.placeOfPerformance?.state?.name ?? null,
+    pop_city: raw.placeOfPerformance?.city?.name ?? null,
   };
 }
 
@@ -170,6 +182,19 @@ const LQDT_NAME_PATTERNS = [
   "network international",
 ];
 
+// Brand-name title searches (awardee often unset on solicitations).
+const TITLE_TERMS = [
+  "liquidity services",
+  "govdeals",
+  "allsurplus",
+  "bid4assets",
+  "government liquidation",
+];
+
+// NAICS codes where LQDT commonly appears as an awardee; results are still
+// filtered to LQDT by UEI/name, so extra codes only widen the candidate net.
+const NAICS_CODES = ["561499", "423930", "454110", "561990"];
+
 function matchesLqdt(opp: SamOpportunity): boolean {
   if (opp.awardee_uei && opp.awardee_uei.toUpperCase() === LQDT_UEI) return true;
   const name = (opp.awardee_name ?? "").toLowerCase();
@@ -212,18 +237,19 @@ export async function fetchSamOpportunities(daysBack = 90): Promise<{
   //      explicitly (works for solicitations where awardee is unset)
   //  (b) award-type searches (ptype=a) in LQDT's NAICS codes, where we can
   //      cross-check awardee UEI/name
-  const searches = await Promise.all([
-    samFetch(apiKey, { postedFrom, postedTo, title: "liquidity services", limit: "200" }),
-    samFetch(apiKey, { postedFrom, postedTo, title: "govdeals", limit: "200" }),
-    samFetch(apiKey, { postedFrom, postedTo, title: "allsurplus", limit: "200" }),
-    samFetch(apiKey, { postedFrom, postedTo, title: "bid4assets", limit: "200" }),
-    samFetch(apiKey, { postedFrom, postedTo, title: "government liquidation", limit: "200" }),
-    samFetch(apiKey, { postedFrom, postedTo, ncode: "561499", ptype: "a", limit: "1000" }),
-    samFetch(apiKey, { postedFrom, postedTo, ncode: "423930", ptype: "a", limit: "1000" }),
+  const titleSearches = TITLE_TERMS.map((title) =>
+    samFetch(apiKey, { postedFrom, postedTo, title, limit: "200" }),
+  );
+  const awardSearches = NAICS_CODES.map((ncode) =>
+    samFetch(apiKey, { postedFrom, postedTo, ncode, ptype: "a", limit: "1000" }),
+  );
+  const [titleResults, awardResults] = await Promise.all([
+    Promise.all(titleSearches),
+    Promise.all(awardSearches),
   ]);
 
-  const titleHits = searches.slice(0, 5).flat();
-  const awardCandidates = searches.slice(5).flat();
+  const titleHits = titleResults.flat();
+  const awardCandidates = awardResults.flat();
   const candidateCount = titleHits.length + awardCandidates.length;
 
   // Title-keyword hits already match an LQDT brand in the title; keep them all.
@@ -238,9 +264,10 @@ export async function fetchSamOpportunities(daysBack = 90): Promise<{
     opportunities.push(opp);
   }
 
-  const c = searches.map((r) => r.length);
+  const titleCounts = titleResults.map((r) => r.length).join("/");
+  const awardCounts = awardResults.map((r) => r.length).join("/");
   return {
     opportunities,
-    debug: `endpoint:${workingConfig?.endpoint} auth:${workingConfig?.authMode} titles[ls/gd/as/b4a/gl]:${c[0]}/${c[1]}/${c[2]}/${c[3]}/${c[4]} awards[561499/423930]:${c[5]}/${c[6]} candidates:${candidateCount} lqdt_matched:${opportunities.length}`,
+    debug: `endpoint:${workingConfig?.endpoint} auth:${workingConfig?.authMode} titles[${TITLE_TERMS.join("/")}]:${titleCounts} awards[${NAICS_CODES.join("/")}]:${awardCounts} candidates:${candidateCount} lqdt_matched:${opportunities.length}`,
   };
 }

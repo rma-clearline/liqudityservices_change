@@ -1,6 +1,10 @@
+import { fetchWithRetry } from "./http";
+
 const USA_SPENDING_BASE = "https://api.usaspending.gov/api/v2";
 const SEARCH_ENDPOINT = `${USA_SPENDING_BASE}/search/spending_by_award/`;
 const REQUEST_TIMEOUT_MS = 15_000;
+const PAGE_LIMIT = 100; // USAspending max per page
+const MAX_PAGES = Number(process.env.USASPENDING_MAX_PAGES) || 10;
 
 const NAME_VARIANTS = [
   "Liquidity Services",
@@ -84,43 +88,53 @@ function mapRow(row: Record<string, any>): ContractAward {
   };
 }
 
+// Paginates through all result pages (bounded by MAX_PAGES) rather than only
+// the first 100 rows. future_improvements.md "Paginate USAspending contract
+// pulls beyond the current request window".
 async function searchAwards(
   recipientName: string,
   startDate: string,
   endDate: string,
   awardTypeCodes: string[],
 ): Promise<ContractAward[]> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const awards: ContractAward[] = [];
 
-  try {
-    const res = await fetch(SEARCH_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filters: {
-          recipient_search_text: [recipientName],
-          time_period: [{ start_date: startDate, end_date: endDate }],
-          award_type_codes: awardTypeCodes,
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    let data: { results?: Record<string, unknown>[]; page_metadata?: { hasNext?: boolean } };
+    try {
+      const res = await fetchWithRetry(
+        SEARCH_ENDPOINT,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filters: {
+              recipient_search_text: [recipientName],
+              time_period: [{ start_date: startDate, end_date: endDate }],
+              award_type_codes: awardTypeCodes,
+            },
+            fields: [...AWARD_FIELDS],
+            page,
+            limit: PAGE_LIMIT,
+            sort: "Start Date",
+            order: "desc",
+          }),
         },
-        fields: [...AWARD_FIELDS],
-        page: 1,
-        limit: 100,
-        sort: "Start Date",
-        order: "desc",
-      }),
-      signal: controller.signal,
-    });
+        { timeoutMs: REQUEST_TIMEOUT_MS },
+      );
+      if (!res.ok) break;
+      data = await res.json();
+    } catch {
+      break;
+    }
 
-    if (!res.ok) return [];
+    const results = data.results ?? [];
+    for (const row of results) awards.push(mapRow(row));
 
-    const data = (await res.json()) as { results?: Record<string, unknown>[] };
-    return (data.results ?? []).map(mapRow);
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timeout);
+    if (results.length < PAGE_LIMIT || data.page_metadata?.hasNext === false) break;
   }
+
+  return awards;
 }
 
 function dedup(awards: ContractAward[]): ContractAward[] {

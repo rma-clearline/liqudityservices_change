@@ -1,18 +1,9 @@
 import "server-only";
 
 import { randomUUID } from "node:crypto";
-
-const MAESTRO_URL = process.env.MAESTRO_API_URL || "https://maestro.lqdt1.com";
-const MAESTRO_KEY = process.env.MAESTRO_API_KEY;
-
-const CURRENCY_MAP: Record<string, string> = {
-  USD: "USD", ZAR: "ZAR", EUR: "EUR", GBP: "GBP", CAD: "CAD",
-  AUD: "AUD", INR: "INR", BRL: "BRL", MXN: "MXN", JPY: "JPY",
-  CNY: "CNY",
-};
-
-let cachedRates: Record<string, number> | null = null;
-let ratesFetchedAt = 0;
+import { convertToUsd, loadFxRates } from "./fx";
+import { buildSoldPayload, extractListings, MAESTRO_KEY, MAESTRO_URL, safeNumber, safeString, SOLD_SEARCH_PATH } from "./maestro";
+import { dateRangeForEtDay, etDateKey } from "./time";
 
 const FULL_FETCH_PAGE_SIZE = 1000;
 const MAX_FULL_FETCH_PAGES = Number(process.env.HISTORICAL_SALES_MAX_PAGES) || 25;
@@ -87,23 +78,6 @@ type CachedSalesDay = {
 
 const cachedSalesByDate = new Map<string, CachedSalesDay>();
 
-function safeNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return fallback;
-}
-
-function safeString(raw: Record<string, unknown>, keys: string[]): string {
-  for (const key of keys) {
-    const value = raw[key];
-    if (typeof value === "string" && value.trim().length > 0) return value.trim();
-  }
-  return "";
-}
-
 function isDomesticCountry(country: string) {
   const normalized = country.trim().toUpperCase();
   return (
@@ -112,125 +86,6 @@ function isDomesticCountry(country: string) {
     normalized === "UNITED STATES" ||
     normalized === "UNITED STATES OF AMERICA"
   );
-}
-
-async function fetchUsdRates(): Promise<Record<string, number>> {
-  if (cachedRates && Date.now() - ratesFetchedAt < 3600_000) return cachedRates;
-  try {
-    const res = await fetch("https://open.er-api.com/v6/latest/USD", {
-      cache: "no-store",
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return cachedRates ?? {};
-    const data = await res.json();
-    const rates: Record<string, number> = data.rates ?? {};
-    cachedRates = rates;
-    ratesFetchedAt = Date.now();
-    return rates;
-  } catch {
-    return cachedRates ?? {};
-  }
-}
-
-function toUsd(amount: number, currencyCode: string, rates: Record<string, number>): number | null {
-  if (!currencyCode || currencyCode === "USD") return amount;
-  const code = CURRENCY_MAP[currencyCode] ?? currencyCode;
-  const rate = rates[code];
-  if (rate && rate > 0) return amount / rate;
-  return null;
-}
-
-function formatPartsInEt(date: Date) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(date);
-  const pick = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
-  return {
-    year: pick("year"),
-    month: pick("month"),
-    day: pick("day"),
-    hour: pick("hour"),
-    minute: pick("minute"),
-    second: pick("second"),
-  };
-}
-
-function localEtToUtcMs(date: string, hour: number, minute: number, second: number, millisecond: number) {
-  const [year, month, day] = date.split("-").map(Number);
-  const targetLocalMs = Date.UTC(year, month - 1, day, hour, minute, second, millisecond);
-  let utcMs = targetLocalMs + 5 * 60 * 60 * 1000;
-
-  for (let i = 0; i < 3; i += 1) {
-    const parts = formatPartsInEt(new Date(utcMs));
-    const renderedLocalMs = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second, 0);
-    utcMs += targetLocalMs - renderedLocalMs;
-  }
-
-  return utcMs;
-}
-
-function nextDate(date: string) {
-  const [year, month, day] = date.split("-").map(Number);
-  const d = new Date(Date.UTC(year, month - 1, day + 1));
-  return d.toISOString().slice(0, 10);
-}
-
-function dateRangeForEtDay(date: string) {
-  const startMs = localEtToUtcMs(date, 0, 0, 0, 0);
-  const endMs = localEtToUtcMs(nextDate(date), 0, 0, 0, 0) - 1;
-  return {
-    fromDate: new Date(startMs).toISOString(),
-    toDate: new Date(endMs).toISOString(),
-  };
-}
-
-function etDateKey(iso: string) {
-  if (!iso) return "";
-  const parts = formatPartsInEt(new Date(iso));
-  return [
-    String(parts.year).padStart(4, "0"),
-    String(parts.month).padStart(2, "0"),
-    String(parts.day).padStart(2, "0"),
-  ].join("-");
-}
-
-function buildPayload(date: string, page: number, pageSize: number) {
-  const { fromDate, toDate } = dateRangeForEtDay(date);
-  return {
-    businessId: "AD",
-    category: "",
-    subCategory: "",
-    groupIds: [],
-    searchText: "",
-    isQAL: false,
-    locationId: null,
-    model: "",
-    makebrand: "",
-    accountIds: [],
-    agencies: [],
-    eventId: null,
-    auctionTypeId: null,
-    page,
-    displayRows: pageSize,
-    sortField: "currentBid",
-    sortOrder: "desc",
-    requestType: "search",
-    responseStyle: "",
-    facets: [],
-    facetsFilter: [],
-    timeType: "",
-    sellerTypeId: null,
-    rangeTimeSearchType: "sold",
-    fromDate,
-    toDate,
-  };
 }
 
 function saleUrl(raw: Record<string, unknown>) {
@@ -248,37 +103,37 @@ function rowKey(raw: Record<string, unknown>) {
   ].join(":");
 }
 
-function parseSale(raw: Record<string, unknown>, rates: Record<string, number>): HistoricalSaleRow {
+function parseSale(raw: Record<string, unknown>, fx: Awaited<ReturnType<typeof loadFxRates>>): HistoricalSaleRow {
   const currencyCode = typeof raw.currencyCode === "string" && raw.currencyCode ? raw.currencyCode : "USD";
   const nativeAmount = safeNumber(raw.currentBid);
-  const usdAmount = toUsd(nativeAmount, currencyCode, rates);
+  const { usd } = convertToUsd(nativeAmount, currencyCode, fx);
 
   return {
+    // platform is the row's true marketplace (AD/GD/GI), not the AD-site query.
     platform: typeof raw.businessId === "string" ? raw.businessId : "",
     asset_id: raw.assetId != null ? String(raw.assetId) : "",
     auction_id: raw.auctionId != null ? String(raw.auctionId) : "",
     account_id: raw.accountId != null ? String(raw.accountId) : "",
-    title: typeof raw.assetShortDescription === "string" ? raw.assetShortDescription : "",
-    seller: typeof raw.companyName === "string" ? raw.companyName : "",
-    category: typeof raw.categoryDescription === "string" ? raw.categoryDescription : "",
+    title: safeString(raw, ["assetShortDescription"]),
+    seller: safeString(raw, ["companyName", "displaySellerName"]),
+    category: safeString(raw, ["categoryDescription"]),
     country: safeString(raw, ["country", "countryCode", "assetCountry", "locationCountry"]),
     state: safeString(raw, ["locationState", "state", "stateCode", "province", "locationProvince"]),
     close_time_utc: typeof raw.assetAuctionEndDateUtc === "string" ? raw.assetAuctionEndDateUtc : "",
     close_time_display: typeof raw.assetAuctionEndDateDisplay === "string" ? raw.assetAuctionEndDateDisplay : "",
     currency_code: currencyCode,
     sale_amount_native: nativeAmount,
-    sale_amount_usd: usdAmount === null ? null : Math.round(usdAmount * 100) / 100,
+    sale_amount_usd: usd === null ? null : Math.round(usd * 100) / 100,
     bid_count: safeNumber(raw.bidCount),
     url: saleUrl(raw),
   };
 }
 
 async function fetchRawSalesPage(date: string, page: number, pageSize: number) {
-  if (!MAESTRO_KEY) {
-    throw new Error("MAESTRO_API_KEY is not configured");
-  }
+  if (!MAESTRO_KEY) throw new Error("MAESTRO_API_KEY is not configured");
 
-  const res = await fetch(`${MAESTRO_URL}/search/assets/advanced`, {
+  const { fromDate, toDate } = dateRangeForEtDay(date);
+  const res = await fetch(`${MAESTRO_URL}${SOLD_SEARCH_PATH}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -286,7 +141,9 @@ async function fetchRawSalesPage(date: string, page: number, pageSize: number) {
       "x-user-id": "-1",
       "x-api-correlation-id": randomUUID(),
     },
-    body: JSON.stringify(buildPayload(date, page, pageSize)),
+    // businessId "AD" is the *site*: it returns the broadest sold archive,
+    // including GD/GI rows, each labeled by its own row.businessId.
+    body: JSON.stringify(buildSoldPayload("AD", fromDate, toDate, page, pageSize)),
     cache: "no-store",
     signal: AbortSignal.timeout(60000),
   });
@@ -295,17 +152,9 @@ async function fetchRawSalesPage(date: string, page: number, pageSize: number) {
   if (!res.ok) throw new Error(`Maestro HTTP ${res.status}: ${text.slice(0, 300)}`);
 
   const data = JSON.parse(text);
-  const rows: Record<string, unknown>[] = Array.isArray(data?.assetSearchResults)
-    ? data.assetSearchResults
-    : Array.isArray(data?.searchResults)
-      ? data.searchResults
-      : Array.isArray(data)
-        ? data
-        : [];
-
   return {
-    rows,
-    total: Number(res.headers.get("x-total-count") ?? rows.length),
+    rows: extractListings(data),
+    total: Number(res.headers.get("x-total-count") ?? 0),
   };
 }
 
@@ -313,8 +162,8 @@ async function fetchAllSalesForDate(date: string): Promise<CachedSalesDay> {
   const cached = cachedSalesByDate.get(date);
   if (cached && Date.now() - cached.fetchedAt < SALES_CACHE_MS) return cached;
 
-  const [rates, firstPage] = await Promise.all([
-    fetchUsdRates(),
+  const [fx, firstPage] = await Promise.all([
+    loadFxRates(),
     fetchRawSalesPage(date, 1, FULL_FETCH_PAGE_SIZE),
   ]);
 
@@ -341,13 +190,9 @@ async function fetchAllSalesForDate(date: string): Promise<CachedSalesDay> {
       seen.add(key);
       return true;
     })
-    .map((row) => parseSale(row, rates));
+    .map((row) => parseSale(row, fx));
 
-  const result = {
-    fetchedAt: Date.now(),
-    totalRaw: firstPage.total,
-    rows,
-  };
+  const result = { fetchedAt: Date.now(), totalRaw: firstPage.total, rows };
   cachedSalesByDate.set(date, result);
   return result;
 }

@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
-import { supabase } from "@/lib/supabase";
+import { supabaseAdmin } from "@/lib/supabase";
 import { scrapeListings } from "@/lib/scraper";
-import { scrapeMarketplaceMetrics } from "@/lib/marketplace-metrics";
+import { scrapeMarketplaceMetrics, type PlatformMetrics, type SellerInfo } from "@/lib/marketplace-metrics";
 import { ingestAuctions } from "@/lib/auctions";
 import { fetchNewContracts, fetchContractSummary } from "@/lib/contracts";
 import { fetchSamOpportunities } from "@/lib/sam-opportunities";
 import { fetchAllStateContracts } from "@/lib/state-contracts";
 import { sendDailySummary } from "@/lib/email";
+import { CronLogger, type SourceSummary } from "@/lib/cron-log";
 
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
@@ -21,136 +22,229 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const querySecret = searchParams.get("secret");
   const authToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-  const valid =
-    authToken === cronSecret ||
-    (querySecret !== null && querySecret === cronSecret);
+  const valid = authToken === cronSecret || (querySecret !== null && querySecret === cronSecret);
   if (!valid) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const now = new Date(
-    new Date().toLocaleString("en-US", { timeZone: "America/New_York" }),
-  );
+  const now = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
   const date = now.toISOString().slice(0, 10);
   const timestamp = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
 
-  // Run all scrapes in parallel
-  const [listingResult, metricsResult, auctionsResult, newContracts, samResult, stateResult] = await Promise.all([
-    scrapeListings(),
-    scrapeMarketplaceMetrics().catch(() => null),
-    ingestAuctions().catch((e) => ({ error: e instanceof Error ? e.message : String(e) })),
-    fetchNewContracts(99999).catch(() => [] as Awaited<ReturnType<typeof fetchNewContracts>>),
-    fetchSamOpportunities(90).catch((e) => ({ opportunities: [], debug: `error: ${e instanceof Error ? e.message : String(e)}` })),
-    fetchAllStateContracts().catch((e) => ({ contracts: [], perState: { _error: { count: 0, error: e instanceof Error ? e.message : String(e) } } })),
+  const logger = new CronLogger();
+
+  // Each source is a self-contained scrape + write that returns its cron_runs
+  // summary alongside any payload later steps (email, response) need. Sources
+  // run in parallel and are isolated: one failing is logged, not fatal.
+  const listingsTask = logger.track(
+    "listings",
+    async () => {
+      const { allsurplus, govdeals } = await scrapeListings();
+      const { error } = await supabaseAdmin
+        .from("listings")
+        .upsert({ date, timestamp, allsurplus, govdeals }, { onConflict: "date" });
+      return { allsurplus, govdeals, error: error?.message ?? null };
+    },
+    (r): SourceSummary => ({
+      status: r.error ? "failed" : "success",
+      rows: r.error ? 0 : 1,
+      detail: { allsurplus: r.allsurplus, govdeals: r.govdeals },
+      error: r.error,
+    }),
+  );
+
+  const metricsTask = logger.track(
+    "marketplace_metrics",
+    async () => {
+      const metrics = await scrapeMarketplaceMetrics();
+      const metricRow = (m: PlatformMetrics) => ({
+        date,
+        timestamp,
+        platform: m.platform,
+        total_listings: m.total_listings,
+        total_bids: m.total_bids,
+        avg_bids_per_listing: m.avg_bids_per_listing,
+        total_current_price: m.total_current_price,
+        listings_with_bids: m.listings_with_bids,
+        bid_rate: m.bid_rate,
+        unique_seller_count: m.unique_seller_count,
+        listings_closing_24h: m.listings_closing_24h,
+        avg_watch_count: m.avg_watch_count,
+        listings_with_reserve: m.listings_with_reserve,
+        reserve_rate: m.reserve_rate,
+        top_categories: m.top_categories,
+        sample_size: m.sample_size,
+        pages_fetched: m.pages_fetched,
+        is_full_coverage: m.is_full_coverage,
+      });
+      const { error: metricsError } = await supabaseAdmin
+        .from("marketplace_metrics")
+        .upsert([metricRow(metrics.allsurplus), metricRow(metrics.govdeals)], { onConflict: "date,platform" });
+
+      const sellerRow = (s: SellerInfo, platform: "AD" | "GD") => ({
+        date,
+        platform,
+        account_id: s.account_id,
+        company_name: s.company_name,
+        country: s.country,
+        state: s.state,
+        listing_count: s.listing_count,
+        total_current_bid: s.total_current_bid,
+        total_bids: s.total_bids,
+        top_bid_asset_id: s.top_bid_asset_id,
+        sub_business_id: s.sub_business_id,
+      });
+      const sellerRows = [
+        ...metrics.allsurplus.sellers.map((s) => sellerRow(s, "AD")),
+        ...metrics.govdeals.sellers.map((s) => sellerRow(s, "GD")),
+      ];
+      let sellersStored = 0;
+      if (sellerRows.length > 0) {
+        const { error: sellerErr } = await supabaseAdmin
+          .from("marketplace_sellers")
+          .upsert(sellerRows, { onConflict: "date,platform,account_id" });
+        sellersStored = sellerErr ? 0 : sellerRows.length;
+      }
+      return {
+        metricsError: metricsError?.message ?? null,
+        sellersStored,
+        adSample: metrics.allsurplus.sample_size,
+        gdSample: metrics.govdeals.sample_size,
+        adCoverage: metrics.allsurplus.is_full_coverage,
+        gdCoverage: metrics.govdeals.is_full_coverage,
+      };
+    },
+    (r): SourceSummary => ({
+      status: r.metricsError ? "failed" : "success",
+      rows: (r.metricsError ? 0 : 2) + r.sellersStored,
+      detail: {
+        adSample: r.adSample,
+        gdSample: r.gdSample,
+        adCoverage: r.adCoverage,
+        gdCoverage: r.gdCoverage,
+        sellersStored: r.sellersStored,
+      },
+      error: r.metricsError,
+    }),
+  );
+
+  const auctionsTask = logger.track(
+    "auctions",
+    () => ingestAuctions(),
+    (r): SourceSummary => {
+      const upserted = r.allsurplus.upserted + r.govdeals.upserted + r.sold.allsurplus.upserted + r.sold.govdeals.upserted;
+      const error = r.rlsHint ?? r.allsurplus.upsertError ?? r.govdeals.upsertError ?? r.allsurplus.fetchError ?? r.govdeals.fetchError ?? null;
+      return {
+        status: error && upserted === 0 ? "failed" : error ? "partial" : "success",
+        rows: upserted,
+        detail: { closures: r.closures },
+        error,
+      };
+    },
+  );
+
+  const federalTask = logger.track(
+    "federal_contracts",
+    async () => {
+      const newContracts = await fetchNewContracts(99999);
+      const contractSummary = await fetchContractSummary(newContracts).catch(() => null);
+      let stored = 0;
+      if (newContracts.length > 0) {
+        const { error } = await supabaseAdmin
+          .from("federal_contracts")
+          .upsert(newContracts.map((c) => ({ ...c, first_seen_date: date })), {
+            onConflict: "award_id",
+            ignoreDuplicates: true,
+          });
+        stored = error ? 0 : newContracts.length;
+      }
+      let snapshot = false;
+      if (contractSummary) {
+        const { error } = await supabaseAdmin.from("contract_snapshots").upsert(
+          {
+            date,
+            total_active_contracts: contractSummary.total_active_contracts,
+            total_obligated_amount: contractSummary.total_obligated_amount,
+            new_contracts_last_30d: contractSummary.new_contracts_last_30d,
+            new_obligation_last_30d: contractSummary.new_obligation_last_30d,
+            top_agencies: contractSummary.top_agencies,
+          },
+          { onConflict: "date" },
+        );
+        snapshot = !error;
+      }
+      return { fetched: newContracts.length, stored, snapshot };
+    },
+    (r): SourceSummary => ({
+      status: "success",
+      rows: r.stored,
+      detail: { fetched: r.fetched, snapshot: r.snapshot },
+    }),
+  );
+
+  const samTask = logger.track(
+    "sam",
+    async () => {
+      const samResult = await fetchSamOpportunities(90);
+      let stored = 0;
+      let error: string | null = null;
+      if (samResult.opportunities.length > 0) {
+        const { error: e } = await supabaseAdmin
+          .from("sam_opportunities")
+          .upsert(samResult.opportunities.map((o) => ({ ...o, first_seen_date: date })), {
+            onConflict: "notice_id",
+            ignoreDuplicates: true,
+          });
+        error = e?.message ?? null;
+        stored = e ? 0 : samResult.opportunities.length;
+      }
+      return { stored, debug: samResult.debug, error };
+    },
+    (r): SourceSummary => ({
+      status: r.error ? "failed" : "success",
+      rows: r.stored,
+      detail: { debug: r.debug },
+      error: r.error,
+    }),
+  );
+
+  const stateTask = logger.track(
+    "state_contracts",
+    async () => {
+      const stateResult = await fetchAllStateContracts();
+      let stored = 0;
+      let error: string | null = null;
+      if (stateResult.contracts.length > 0) {
+        const { error: e } = await supabaseAdmin
+          .from("state_contracts")
+          .upsert(stateResult.contracts.map((c) => ({ ...c, first_seen_date: date })), {
+            onConflict:
+              "state_code,source_dataset_id,contract_id,vendor_normalized,year,quarter,customer_agency,record_type",
+            ignoreDuplicates: true,
+          });
+        error = e?.message ?? null;
+        stored = e ? 0 : stateResult.contracts.length;
+      }
+      return { stored, perState: stateResult.perState, error };
+    },
+    (r): SourceSummary => ({
+      status: r.error ? "failed" : "success",
+      rows: r.stored,
+      detail: { perState: r.perState },
+      error: r.error,
+    }),
+  );
+
+  const [listingResult] = await Promise.all([
+    listingsTask,
+    metricsTask,
+    auctionsTask,
+    federalTask,
+    samTask,
+    stateTask,
   ]);
 
-  const { allsurplus, govdeals } = listingResult;
-
-  // Build summary from already-fetched contracts (avoids redundant API calls)
-  const contractSummary = await fetchContractSummary(newContracts).catch(() => null);
-
-  // 1. Store listing counts (one row per date; later runs overwrite)
-  const { error: dbError } = await supabase
-    .from("listings")
-    .upsert({ date, timestamp, allsurplus, govdeals }, { onConflict: "date" });
-
-  // 2. Store marketplace metrics + sellers
-  let metricsDb: Record<string, unknown> = { success: false, error: "skipped" };
-  if (metricsResult) {
-    const { debug: adDebug, sellers: adSellers, ...adData } = metricsResult.allsurplus;
-    const { debug: gdDebug, sellers: gdSellers, ...gdData } = metricsResult.govdeals;
-    const rows = [
-      { date, timestamp, ...adData },
-      { date, timestamp, ...gdData },
-    ];
-    const { error } = await supabase
-      .from("marketplace_metrics")
-      .upsert(rows, { onConflict: "date,platform" });
-
-    // Store seller snapshots
-    const toRow = (s: typeof adSellers[number], plat: "AD" | "GD") => {
-      const { top_bid_amount, ...rest } = s;
-      void top_bid_amount;
-      return { date, platform: plat, ...rest };
-    };
-    const sellerRows = [
-      ...adSellers.map((s) => toRow(s, "AD")),
-      ...gdSellers.map((s) => toRow(s, "GD")),
-    ];
-    let sellersStored = 0;
-    if (sellerRows.length > 0) {
-      const { error: sellerErr } = await supabase
-        .from("marketplace_sellers")
-        .upsert(sellerRows, { onConflict: "date,platform,account_id" });
-      sellersStored = sellerErr ? 0 : sellerRows.length;
-    }
-
-    metricsDb = {
-      success: !error,
-      error: error?.message ?? "",
-      adDebug,
-      gdDebug,
-      adSample: metricsResult.allsurplus.sample_size,
-      gdSample: metricsResult.govdeals.sample_size,
-      sellersStored,
-    };
-  }
-
-  // 3. Store new contracts (upsert to avoid duplicates)
-  const contractsDb: Record<string, unknown> = { newContracts: 0, snapshot: false, contractsFetched: newContracts.length };
-  if (newContracts.length > 0) {
-    const contractRows = newContracts.map((c) => ({
-      ...c,
-      first_seen_date: date,
-    }));
-    const { error } = await supabase
-      .from("federal_contracts")
-      .upsert(contractRows, { onConflict: "award_id", ignoreDuplicates: true });
-    contractsDb.newContracts = error ? 0 : newContracts.length;
-  }
-
-  // 4. Store contract snapshot (one per date; later runs overwrite)
-  if (contractSummary) {
-    const { error } = await supabase.from("contract_snapshots").upsert(
-      {
-        date,
-        total_active_contracts: contractSummary.total_active_contracts,
-        total_obligated_amount: contractSummary.total_obligated_amount,
-        new_contracts_last_30d: contractSummary.new_contracts_last_30d,
-        new_obligation_last_30d: contractSummary.new_obligation_last_30d,
-        top_agencies: contractSummary.top_agencies,
-      },
-      { onConflict: "date" },
-    );
-    contractsDb.snapshot = !error;
-  }
-
-  // 5. Store SAM.gov opportunities
-  let samDb: Record<string, unknown> = { stored: 0, debug: samResult.debug };
-  if (samResult.opportunities.length > 0) {
-    const samRows = samResult.opportunities.map((o) => ({ ...o, first_seen_date: date }));
-    const { error } = await supabase
-      .from("sam_opportunities")
-      .upsert(samRows, { onConflict: "notice_id", ignoreDuplicates: true });
-    samDb = { stored: error ? 0 : samRows.length, debug: samResult.debug, error: error?.message ?? null };
-  }
-
-  // 6. Store state contracts
-  let stateDb: Record<string, unknown> = { stored: 0, perState: stateResult.perState };
-  if (stateResult.contracts.length > 0) {
-    const stateRows = stateResult.contracts.map((c) => ({ ...c, first_seen_date: date }));
-    const { error } = await supabase
-      .from("state_contracts")
-      .upsert(stateRows, {
-        onConflict: "state_code,source_dataset_id,contract_id,vendor_normalized,year,quarter,customer_agency",
-        ignoreDuplicates: true,
-      });
-    stateDb = { stored: error ? 0 : stateRows.length, perState: stateResult.perState, error: error?.message ?? null };
-  }
-
-  // 7. Send email — only on the noon ET run (cron fires every 4h at 00/04/08/12/16/20 UTC;
-  // 16 UTC = noon ET during DST, 17 UTC = noon ET during EST, so hour 16 is the closest
-  // scheduled slot to local noon year-round). Pass ?sendEmail=1 to override for manual runs.
+  // Email — only on the noon ET run (cron fires every 4h). ?sendEmail=1 forces.
   const forceEmail = searchParams.get("sendEmail") === "1";
   const skipEmail = searchParams.get("sendEmail") === "0";
   const isNoonRun = now.getHours() === 12;
@@ -159,21 +253,25 @@ export async function GET(request: Request) {
     success: false,
     error: shouldEmail ? "skipped" : "skipped: not noon ET run",
   };
-  if (shouldEmail && process.env.RESEND_API_KEY) {
-    emailResult = await sendDailySummary({ date, timestamp, allsurplus, govdeals });
+  if (shouldEmail && process.env.RESEND_API_KEY && listingResult) {
+    emailResult = await sendDailySummary({
+      date,
+      timestamp,
+      allsurplus: listingResult.allsurplus,
+      govdeals: listingResult.govdeals,
+    });
+    logger.push("email", emailResult.success ? "success" : "failed", null, { chartIncluded: emailResult.chartIncluded }, emailResult.error ?? null);
+  } else {
+    logger.push("email", "skipped", null, null, emailResult.error ?? null);
   }
 
+  const runs = await logger.flush();
+
   return NextResponse.json({
+    run_id: logger.runId,
     date,
     timestamp,
-    allsurplus,
-    govdeals,
-    db: dbError ? { error: dbError.message } : { success: true },
-    metrics: metricsDb,
-    auctions: auctionsResult,
-    contracts: contractsDb,
-    sam: samDb,
-    stateContracts: stateDb,
+    runs,
     email: emailResult,
   });
 }

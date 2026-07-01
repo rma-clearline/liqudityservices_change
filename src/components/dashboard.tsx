@@ -1,7 +1,16 @@
 "use client";
 
 import { useRef, useState, useMemo } from "react";
-import type { ListingRow, MarketplaceMetricsRow, FederalContractRow, ContractSnapshotRow, MarketplaceSellerRow, SamOpportunityRow, StateContractRow } from "@/lib/supabase";
+import type {
+  ListingRow,
+  MarketplaceMetricsRow,
+  FederalContractRow,
+  ContractSnapshotRow,
+  MarketplaceSellerRow,
+  SamOpportunityRow,
+  StateContractRow,
+  SellerDeltaRow,
+} from "@/lib/supabase";
 import { ListingsChart } from "./listings-chart";
 import { ListingsTable } from "./listings-table";
 import { EmailSnapshot } from "./email-snapshot";
@@ -9,11 +18,25 @@ import { MarketplaceMetrics } from "./marketplace-metrics";
 import { RevenueForecast } from "./revenue-forecast";
 import { FederalContracts } from "./federal-contracts";
 import { TopSellers } from "./top-sellers";
+import { SellerMovers } from "./seller-movers";
 import { SamOpportunities } from "./sam-opportunities";
 import { StateContracts } from "./state-contracts";
+import { ExecutiveSummary } from "./executive-summary";
+import { AlertsBanner, DataStatusProvider, Freshness } from "./freshness";
 
 const RANGES = ["All", "3Y", "1Y", "6M", "3M", "1M"] as const;
 type Range = (typeof RANGES)[number];
+
+const NAV = [
+  { id: "summary", label: "Summary" },
+  { id: "trend", label: "Listings" },
+  { id: "forecast", label: "Forecast" },
+  { id: "marketplace", label: "Marketplace" },
+  { id: "sellers", label: "Sellers" },
+  { id: "federal", label: "Federal" },
+  { id: "opportunities", label: "Opportunities" },
+  { id: "state", label: "State/Local" },
+];
 
 function fmt(n: number | null | undefined) {
   return n != null ? n.toLocaleString("en-US") : "—";
@@ -29,11 +52,39 @@ function cutoffDate(range: Range): string | null {
   return now.toISOString().slice(0, 10);
 }
 
+function SectionHeader({ title, source, table }: { title: string; source?: string; table?: string }) {
+  return (
+    <div className="mb-4 flex flex-wrap items-center gap-3">
+      <h2 className="text-lg font-semibold">{title}</h2>
+      <Freshness source={source} table={table} />
+    </div>
+  );
+}
+
+function SectionNav() {
+  return (
+    <nav className="sticky top-0 z-30 -mx-6 mb-6 border-b bg-white/90 px-6 py-2 backdrop-blur">
+      <div className="flex gap-1 overflow-x-auto text-sm">
+        {NAV.map((n) => (
+          <a
+            key={n.id}
+            href={`#${n.id}`}
+            className="whitespace-nowrap rounded-md px-3 py-1 text-gray-600 hover:bg-gray-100 hover:text-gray-900"
+          >
+            {n.label}
+          </a>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
 export function Dashboard({
   listings,
   metricsAllsurplus,
   sellersAllsurplus,
   sellersGovdeals,
+  sellerDeltas,
   metricsGovdeals,
   contracts,
   contractSnapshot,
@@ -47,6 +98,7 @@ export function Dashboard({
   contractSnapshot: ContractSnapshotRow | null;
   sellersAllsurplus: MarketplaceSellerRow[];
   sellersGovdeals: MarketplaceSellerRow[];
+  sellerDeltas: SellerDeltaRow[];
   samOpportunities: SamOpportunityRow[];
   stateContracts: StateContractRow[];
 }) {
@@ -61,24 +113,24 @@ export function Dashboard({
   }, [listings, range]);
 
   return (
-    <>
+    <DataStatusProvider>
+      <SectionNav />
+
+      <AlertsBanner />
+
+      <ExecutiveSummary />
+
       {latest && (
         <div className="grid grid-cols-2 gap-4 mb-8">
           <div className="rounded-lg border p-4">
-            <p className="text-xs text-gray-500 mb-1">AllSurplus</p>
-            <p className="text-3xl font-bold text-blue-600 tabular-nums">
-              {fmt(latest.allsurplus)}
-            </p>
+            <p className="text-xs text-gray-500 mb-1">AllSurplus active listings</p>
+            <p className="text-3xl font-bold text-blue-600 tabular-nums">{fmt(latest.allsurplus)}</p>
           </div>
           <div className="rounded-lg border p-4">
-            <p className="text-xs text-gray-500 mb-1">GovDeals</p>
-            <p className="text-3xl font-bold text-green-600 tabular-nums">
-              {fmt(latest.govdeals)}
-            </p>
+            <p className="text-xs text-gray-500 mb-1">GovDeals active listings</p>
+            <p className="text-3xl font-bold text-green-600 tabular-nums">{fmt(latest.govdeals)}</p>
           </div>
-          <p className="col-span-2 text-xs text-gray-400">
-            Last updated: {latest.date} {latest.timestamp} ET
-          </p>
+          <p className="col-span-2 text-xs text-gray-400">Last updated: {latest.date} {latest.timestamp} ET</p>
         </div>
       )}
 
@@ -100,47 +152,50 @@ export function Dashboard({
         ))}
       </div>
 
-      <section className="mb-8">
-        <h2 className="text-lg font-semibold mb-4">Trend</h2>
+      <section id="trend" className="mb-8 scroll-mt-20">
+        <SectionHeader title="Active Listings Trend" table="listings" source="listings" />
         <div ref={chartRef}>
           <ListingsChart data={filtered} allData={listings} />
         </div>
       </section>
 
-      <section className="mb-8">
-        <h2 className="text-lg font-semibold mb-4">Quarterly Revenue Forecast</h2>
+      <section id="forecast" className="mb-8 scroll-mt-20">
+        <SectionHeader title="Quarterly Revenue Forecast" source="auctions" table="auctions" />
         <RevenueForecast />
       </section>
 
-      <section className="mb-8">
-        <h2 className="text-lg font-semibold mb-4">Marketplace Metrics</h2>
+      <section id="marketplace" className="mb-8 scroll-mt-20">
+        <SectionHeader title="Marketplace Metrics" source="marketplace_metrics" table="marketplace_metrics" />
         <MarketplaceMetrics allsurplus={metricsAllsurplus} govdeals={metricsGovdeals} />
       </section>
 
-      <section className="mb-8">
-        <h2 className="text-lg font-semibold mb-4">Top Sellers</h2>
-        <TopSellers allsurplus={sellersAllsurplus} govdeals={sellersGovdeals} />
+      <section id="sellers" className="mb-8 scroll-mt-20">
+        <SectionHeader title="Top Sellers" source="marketplace_metrics" table="marketplace_sellers" />
+        <div className="space-y-6">
+          <SellerMovers deltas={sellerDeltas} />
+          <TopSellers allsurplus={sellersAllsurplus} govdeals={sellersGovdeals} />
+        </div>
       </section>
 
-      <section className="mb-8">
-        <h2 className="text-lg font-semibold mb-4">Federal Contracts</h2>
+      <section id="federal" className="mb-8 scroll-mt-20">
+        <SectionHeader title="Federal Contracts" source="federal_contracts" table="federal_contracts" />
         <FederalContracts contracts={contracts} snapshot={contractSnapshot} />
       </section>
 
-      <section className="mb-8">
-        <h2 className="text-lg font-semibold mb-4">Federal Opportunities (SAM.gov)</h2>
+      <section id="opportunities" className="mb-8 scroll-mt-20">
+        <SectionHeader title="Federal Opportunities (SAM.gov)" source="sam" table="sam_opportunities" />
         <SamOpportunities opportunities={samOpportunities} />
       </section>
 
-      <section className="mb-8">
-        <h2 className="text-lg font-semibold mb-4">State &amp; Local Contracts</h2>
+      <section id="state" className="mb-8 scroll-mt-20">
+        <SectionHeader title="State & Local Contracts" source="state_contracts" table="state_contracts" />
         <StateContracts contracts={stateContracts} />
       </section>
 
-      <section>
+      <section className="scroll-mt-20">
         <h2 className="text-lg font-semibold mb-4">History</h2>
         <ListingsTable data={filtered} />
       </section>
-    </>
+    </DataStatusProvider>
   );
 }

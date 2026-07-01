@@ -1,38 +1,14 @@
+import { convertToUsd, loadFxRates, type FxRates } from "./fx";
+import {
+  buildSearchPayload,
+  extractListings,
+  MAESTRO_KEY,
+  MAESTRO_URL,
+  safeNumber,
+  SEARCH_LIST_PATH,
+  type Platform,
+} from "./maestro";
 import { randomUUID } from "node:crypto";
-
-// Map Maestro currency codes to ISO codes
-const CURRENCY_MAP: Record<string, string> = {
-  USD: "USD", ZAR: "ZAR", EUR: "EUR", GBP: "GBP", CAD: "CAD",
-  AUD: "AUD", INR: "INR", BRL: "BRL", MXN: "MXN", JPY: "JPY",
-};
-
-let cachedRates: Record<string, number> | null = null;
-let ratesFetchedAt = 0;
-
-async function fetchUsdRates(): Promise<Record<string, number>> {
-  if (cachedRates && Date.now() - ratesFetchedAt < 3600_000) return cachedRates;
-  try {
-    const res = await fetch("https://open.er-api.com/v6/latest/USD", {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return cachedRates ?? {};
-    const data = await res.json();
-    const rates: Record<string, number> = data.rates ?? {};
-    cachedRates = rates;
-    ratesFetchedAt = Date.now();
-    return rates;
-  } catch {
-    return cachedRates ?? {};
-  }
-}
-
-function toUsd(amount: number, currencyCode: string, rates: Record<string, number>): number {
-  if (!currencyCode || currencyCode === "USD") return amount;
-  const code = CURRENCY_MAP[currencyCode] ?? currencyCode;
-  const rate = rates[code];
-  if (rate && rate > 0) return amount / rate;
-  return amount;
-}
 
 export type SellerInfo = {
   account_id: string;
@@ -48,7 +24,7 @@ export type SellerInfo = {
 };
 
 export type PlatformMetrics = {
-  platform: "AD" | "GD";
+  platform: Platform;
   total_listings: number;
   total_bids: number;
   avg_bids_per_listing: number;
@@ -57,53 +33,22 @@ export type PlatformMetrics = {
   bid_rate: number;
   unique_seller_count: number;
   listings_closing_24h: number;
-  avg_watch_count: number;
+  // Maestro exposes no watch/view count field, so this is intentionally null
+  // (was previously a misleading hardcoded 0).
+  avg_watch_count: number | null;
+  listings_with_reserve: number;
+  reserve_rate: number;
   top_categories: Record<string, number>;
   sample_size: number;
+  // Coverage metadata: was this a full census of active listings or a sample?
+  pages_fetched: number;
+  is_full_coverage: boolean;
   sellers: SellerInfo[];
   debug?: string;
 };
 
-const MAESTRO_URL = process.env.MAESTRO_API_URL || "https://maestro.lqdt1.com";
-const MAESTRO_KEY =
-  process.env.MAESTRO_API_KEY || "af93060f-337e-428c-87b8-c74b5837d6cd";
 const METRICS_PAGE_SIZE = Number(process.env.MARKETPLACE_METRICS_PAGE_SIZE) || 1000;
 const MAX_METRICS_PAGES = Number(process.env.MARKETPLACE_METRICS_MAX_PAGES) || 25;
-
-function buildPayload(businessId: "AD" | "GD", page: number) {
-  return {
-    category: "",
-    groupIds: [],
-    businessId,
-    searchText: "",
-    isQAL: false,
-    locationId: null,
-    model: "",
-    makebrand: "",
-    accountIds: [],
-    eventId: null,
-    auctionTypeId: null,
-    page,
-    displayRows: METRICS_PAGE_SIZE,
-    sortField: "bestfit",
-    sortOrder: "asc",
-    requestType: "search",
-    responseStyle: "",
-    facets: [],
-    facetsFilter: [],
-    timeType: "atauction",
-    sellerTypeId: null,
-  };
-}
-
-function safeNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number" && !Number.isNaN(value)) return value;
-  if (typeof value === "string") {
-    const parsed = parseFloat(value);
-    if (!Number.isNaN(parsed)) return parsed;
-  }
-  return fallback;
-}
 
 function listingKey(raw: Record<string, unknown>) {
   return [
@@ -114,7 +59,7 @@ function listingKey(raw: Record<string, unknown>) {
   ].join(":");
 }
 
-function emptyMetrics(platform: "AD" | "GD", debug: string): PlatformMetrics {
+function emptyMetrics(platform: Platform, debug: string): PlatformMetrics {
   return {
     platform,
     total_listings: 0,
@@ -125,30 +70,36 @@ function emptyMetrics(platform: "AD" | "GD", debug: string): PlatformMetrics {
     bid_rate: 0,
     unique_seller_count: 0,
     listings_closing_24h: 0,
-    avg_watch_count: 0,
+    avg_watch_count: null,
+    listings_with_reserve: 0,
+    reserve_rate: 0,
     top_categories: {},
     sample_size: 0,
+    pages_fetched: 0,
+    is_full_coverage: false,
     sellers: [],
     debug,
   };
 }
 
 function computeMetrics(
-  platform: "AD" | "GD",
+  platform: Platform,
   totalListings: number,
   listings: Record<string, unknown>[],
-  rates: Record<string, number>,
+  fx: FxRates,
+  pagesFetched: number,
 ): PlatformMetrics {
   const sampleSize = listings.length;
 
   if (sampleSize === 0) {
-    return { ...emptyMetrics(platform, "0 listings in response"), total_listings: totalListings };
+    return { ...emptyMetrics(platform, "0 listings in response"), total_listings: totalListings, pages_fetched: pagesFetched };
   }
 
   let totalBids = 0;
   let totalCurrentPrice = 0;
   let listingsWithBids = 0;
   let listingsClosing24h = 0;
+  let listingsWithReserve = 0;
 
   const sellerMap = new Map<string, SellerInfo>();
   const categoryCounts: Record<string, number> = {};
@@ -163,8 +114,12 @@ function computeMetrics(
 
     const rawBid = safeNumber(listing.currentBid);
     const currency = typeof listing.currencyCode === "string" ? listing.currencyCode : "USD";
-    const currentBidUsd = toUsd(rawBid, currency, rates);
+    // Non-convertible currencies contribute 0 to the USD GMV proxy rather than
+    // polluting it with a face-value foreign amount labeled as dollars.
+    const currentBidUsd = convertToUsd(rawBid, currency, fx).usd ?? 0;
     totalCurrentPrice += currentBidUsd;
+
+    if (listing.hasReservePrice === true) listingsWithReserve++;
 
     const accountId = listing.accountId != null ? String(listing.accountId) : null;
     const assetId = listing.assetId != null ? String(listing.assetId) : null;
@@ -219,6 +174,7 @@ function computeMetrics(
   }
 
   const sellers = Array.from(sellerMap.values()).sort((a, b) => b.total_current_bid - a.total_current_bid);
+  const isFullCoverage = totalListings > 0 ? sampleSize >= totalListings : true;
 
   return {
     platform,
@@ -230,9 +186,13 @@ function computeMetrics(
     bid_rate: Math.round((listingsWithBids / sampleSize) * 10000) / 10000,
     unique_seller_count: sellerMap.size,
     listings_closing_24h: listingsClosing24h,
-    avg_watch_count: 0,
+    avg_watch_count: null,
+    listings_with_reserve: listingsWithReserve,
+    reserve_rate: Math.round((listingsWithReserve / sampleSize) * 10000) / 10000,
     top_categories: topCategories,
     sample_size: sampleSize,
+    pages_fetched: pagesFetched,
+    is_full_coverage: isFullCoverage,
     sellers,
     debug: `ok, ${sampleSize} listings, ${totalBids} bids, ${sellerMap.size} sellers`,
   };
@@ -245,60 +205,41 @@ type PageFetchResult = {
   debug: string | null;
 };
 
-async function fetchMetricsPage(businessId: "AD" | "GD", page: number, signal: AbortSignal): Promise<PageFetchResult> {
-  const correlationId = randomUUID();
-  const res = await fetch(`${MAESTRO_URL}/search/list`, {
+// This module paginates a single connection with a shared AbortSignal, so it
+// uses fetch directly rather than the shared maestroFetch (which manages its
+// own per-call timeout). Payload/headers still come from the shared client.
+async function fetchMetricsPage(businessId: Platform, page: number, signal: AbortSignal): Promise<PageFetchResult> {
+  const res = await fetch(`${MAESTRO_URL}${SEARCH_LIST_PATH}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-api-key": MAESTRO_KEY,
       "x-user-id": "-1",
-      "x-api-correlation-id": correlationId,
+      "x-api-correlation-id": randomUUID(),
     },
-    body: JSON.stringify(buildPayload(businessId, page)),
+    body: JSON.stringify(buildSearchPayload(businessId, page, METRICS_PAGE_SIZE)),
     signal,
   });
 
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
-    return {
-      listings: [],
-      totalListings: 0,
-      status: res.status,
-      debug: `http ${res.status}: ${errText.slice(0, 100)}`,
-    };
+    return { listings: [], totalListings: 0, status: res.status, debug: `http ${res.status}: ${errText.slice(0, 100)}` };
   }
 
   const data = await res.json();
   const headerCount = res.headers.get("x-total-count");
   const totalListings = headerCount ? parseInt(headerCount, 10) || 0 : 0;
-
-  let listings: Record<string, unknown>[] = [];
-  if (Array.isArray(data?.assetSearchResults)) {
-    listings = data.assetSearchResults;
-  } else if (Array.isArray(data?.searchResults)) {
-    listings = data.searchResults;
-  } else if (Array.isArray(data)) {
-    listings = data;
-  }
+  const listings = extractListings(data);
 
   if (listings.length === 0) {
     const keys = data ? Object.keys(data).join(", ") : "null response";
-    return {
-      listings: [],
-      totalListings,
-      status: res.status,
-      debug: `no listings array. keys: ${keys}`,
-    };
+    return { listings: [], totalListings, status: res.status, debug: `no listings array. keys: ${keys}` };
   }
 
   return { listings, totalListings, status: res.status, debug: null };
 }
 
-async function fetchPlatformMetrics(
-  businessId: "AD" | "GD",
-  rates: Record<string, number>,
-): Promise<PlatformMetrics> {
+async function fetchPlatformMetrics(businessId: Platform, fx: FxRates): Promise<PlatformMetrics> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
 
@@ -332,15 +273,17 @@ async function fetchPlatformMetrics(
       page += 1;
     }
 
+    const pagesFetched = Math.min(page, MAX_METRICS_PAGES);
+
     if (listings.length === 0) {
       console.error(`[marketplace-metrics] ${businessId} no listings found. ${lastDebug ?? ""}`);
-      return emptyMetrics(businessId, lastDebug ?? "0 listings in response");
+      return { ...emptyMetrics(businessId, lastDebug ?? "0 listings in response"), pages_fetched: pagesFetched };
     }
 
-    const metrics = computeMetrics(businessId, totalListings, listings, rates);
-    metrics.debug = totalListings > listings.length
-      ? `sampled ${listings.length}/${totalListings} listings across ${page} pages`
-      : `ok, full coverage ${listings.length}/${totalListings || listings.length} listings`;
+    const metrics = computeMetrics(businessId, totalListings, listings, fx, pagesFetched);
+    metrics.debug = metrics.is_full_coverage
+      ? `ok, full coverage ${listings.length}/${totalListings || listings.length} listings`
+      : `sampled ${listings.length}/${totalListings} listings across ${pagesFetched} pages`;
     return metrics;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -355,10 +298,10 @@ export async function scrapeMarketplaceMetrics(): Promise<{
   allsurplus: PlatformMetrics;
   govdeals: PlatformMetrics;
 }> {
-  const rates = await fetchUsdRates();
+  const fx = await loadFxRates();
   const [allsurplus, govdeals] = await Promise.all([
-    fetchPlatformMetrics("AD", rates),
-    fetchPlatformMetrics("GD", rates),
+    fetchPlatformMetrics("AD", fx),
+    fetchPlatformMetrics("GD", fx),
   ]);
   return { allsurplus, govdeals };
 }

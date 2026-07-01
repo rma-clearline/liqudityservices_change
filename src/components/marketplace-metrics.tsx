@@ -30,7 +30,11 @@ function MetricCard({ label, value, sub }: { label: string; value: string; sub?:
 function PlatformSection({ label, color, data }: { label: string; color: string; data: MarketplaceMetricsRow }) {
   const sampleSize = data.sample_size ?? 0;
   const totalListings = data.total_listings ?? 0;
-  const isSample = totalListings > 0 && sampleSize > 0 && sampleSize < totalListings;
+  // Prefer the stored coverage flag; fall back to inferring from counts for
+  // rows written before the coverage columns existed.
+  const isSample =
+    data.is_full_coverage === false ||
+    (data.is_full_coverage == null && totalListings > 0 && sampleSize > 0 && sampleSize < totalListings);
   const sampleSub = isSample ? `${fmt(sampleSize)} of ${fmt(totalListings)} sampled` : undefined;
 
   return (
@@ -43,8 +47,16 @@ function PlatformSection({ label, color, data }: { label: string; color: string;
         <MetricCard label={isSample ? "GMV Proxy USD (sample)" : "GMV Proxy USD"} value={fmtDollar(data.total_current_price)} />
         <MetricCard label={isSample ? "Unique Sellers (sample)" : "Unique Sellers"} value={fmt(data.unique_seller_count)} />
         <MetricCard label={isSample ? "Closing in 24h (sample)" : "Closing in 24h"} value={fmt(data.listings_closing_24h)} />
-        <MetricCard label={isSample ? "Avg Watch Count (sample)" : "Avg Watch Count"} value={data.avg_watch_count?.toFixed(1) ?? "—"} />
-        <MetricCard label="Total Listings" value={fmt(data.total_listings)} />
+        <MetricCard
+          label={isSample ? "Reserve Rate (sample)" : "Reserve Rate"}
+          value={fmtPct(data.reserve_rate)}
+          sub={data.listings_with_reserve != null ? `${fmt(data.listings_with_reserve)} with reserve` : undefined}
+        />
+        <MetricCard
+          label="Total Listings"
+          value={fmt(data.total_listings)}
+          sub={isSample ? "sampled subset below" : "full coverage"}
+        />
       </div>
       {data.top_categories && Object.keys(data.top_categories).length > 0 && (
         <div className="mt-3">

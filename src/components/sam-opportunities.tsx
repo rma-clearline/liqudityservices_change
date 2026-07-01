@@ -1,6 +1,7 @@
 "use client";
 
 import type { SamOpportunityRow } from "@/lib/supabase";
+import { ExportButton } from "./export-button";
 
 function fmtDollar(n: number | null | undefined) {
   if (n == null) return "—";
@@ -43,6 +44,28 @@ export function SamOpportunities({ opportunities }: { opportunities: SamOpportun
 
   return (
     <div className="space-y-4">
+      <div className="flex justify-end">
+        <ExportButton
+          rows={opportunities}
+          filename="lqdt-sam-opportunities.csv"
+          columns={[
+            { key: "notice_id", label: "Notice ID" },
+            { key: "posted_date", label: "Posted" },
+            { key: "notice_type", label: "Type" },
+            { key: "title", label: "Title" },
+            { key: "organization", label: "Agency" },
+            { key: "naics_code", label: "NAICS" },
+            { key: "classification_code", label: "PSC" },
+            { key: "response_deadline", label: "Response Deadline" },
+            { key: "set_aside", label: "Set-Aside" },
+            { key: "pop_state", label: "PoP State" },
+            { key: "pop_city", label: "PoP City" },
+            { key: "awardee_name", label: "Awardee" },
+            { key: "award_amount", label: "Award $" },
+            { key: "ui_link", label: "Link" },
+          ]}
+        />
+      </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="rounded-lg border p-3">
           <p className="text-xs text-gray-500 mb-1">Total (last 90d)</p>
@@ -100,6 +123,12 @@ export function SamOpportunities({ opportunities }: { opportunities: SamOpportun
                       </a>
                     ) : (
                       <span className="truncate block" title={o.title}>{o.title}</span>
+                    )}
+                    {(o.set_aside || o.pop_state) && (
+                      <div className="mt-0.5 text-xs text-gray-400">
+                        {o.set_aside ? <span className="mr-2">{o.set_aside}</span> : null}
+                        {o.pop_state ? <span>{[o.pop_city, o.pop_state].filter(Boolean).join(", ")}</span> : null}
+                      </div>
                     )}
                   </td>
                   <td className="py-1.5 pr-4 truncate max-w-[180px] text-gray-500">{o.organization ?? "—"}</td>

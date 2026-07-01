@@ -1,11 +1,19 @@
-import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { supabase } from "./supabase";
-
-const MAESTRO_URL = process.env.MAESTRO_API_URL || "https://maestro.lqdt1.com";
-const MAESTRO_KEY =
-  process.env.MAESTRO_API_KEY || "af93060f-337e-428c-87b8-c74b5837d6cd";
+import { supabase, supabaseAdmin } from "./supabase";
+import { convertToUsd, loadFxRates, persistFxRates, roundUsd, type FxRates } from "./fx";
+import {
+  buildSearchPayload,
+  buildSoldPayload,
+  maestroFetch,
+  safeNumber,
+  safeString,
+  SEARCH_LIST_PATH,
+  SOLD_SEARCH_PATH,
+  type MaestroPage,
+  type Platform,
+} from "./maestro";
+import { dateKeyToUtcDate, enumerateDays, etDateKey, quarterBounds } from "./time";
 
 const PAGE_SIZE = Number(process.env.AUCTIONS_PAGE_SIZE) || 50;
 const MAX_PAGES_PER_PLATFORM = Number(process.env.AUCTIONS_MAX_PAGES) || 10;
@@ -27,13 +35,6 @@ const HISTORICAL_DAILY_MARKET_GMV_PATH = historicalCsvPath(
   "historical-gmv-daily-market-2025-06-2026-06.csv",
 );
 
-const CURRENCY_MAP: Record<string, string> = {
-  USD: "USD", ZAR: "ZAR", EUR: "EUR", GBP: "GBP", CAD: "CAD",
-  AUD: "AUD", INR: "INR", BRL: "BRL", MXN: "MXN", JPY: "JPY",
-};
-
-let cachedRates: Record<string, number> | null = null;
-let ratesFetchedAt = 0;
 let cachedHistoricalDailyGmv: HistoricalDailyGmvData | null = null;
 
 type HistoricalDailyGmv = {
@@ -57,44 +58,6 @@ function historicalCsvPath(rawPath: string | undefined, fallbackFile: string) {
   const normalized = (rawPath || fallbackFile).replace(/\\/g, "/");
   const fileName = path.basename(normalized);
   return path.join(HISTORICAL_GMV_DIR, fileName.endsWith(".csv") ? fileName : fallbackFile);
-}
-
-async function fetchUsdRates(): Promise<Record<string, number>> {
-  if (cachedRates && Date.now() - ratesFetchedAt < 3600_000) return cachedRates;
-  try {
-    const res = await fetch("https://open.er-api.com/v6/latest/USD", {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return cachedRates ?? {};
-    const data = await res.json();
-    const rates: Record<string, number> = data.rates ?? {};
-    cachedRates = rates;
-    ratesFetchedAt = Date.now();
-    return rates;
-  } catch {
-    return cachedRates ?? {};
-  }
-}
-
-// Returns the USD-equivalent amount, or null if the currency is non-USD and
-// no rate is available. Returning null is important: storing the raw amount
-// would silently pollute current_bid_usd / final_price_usd with foreign-
-// currency values labeled as USD.
-function toUsd(amount: number, currencyCode: string, rates: Record<string, number>): number | null {
-  if (!currencyCode || currencyCode === "USD") return amount;
-  const code = CURRENCY_MAP[currencyCode] ?? currencyCode;
-  const rate = rates[code];
-  if (rate && rate > 0) return amount / rate;
-  return null;
-}
-
-function safeNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number" && !Number.isNaN(value)) return value;
-  if (typeof value === "string") {
-    const parsed = parseFloat(value);
-    if (!Number.isNaN(parsed)) return parsed;
-  }
-  return fallback;
 }
 
 function emptyHistoricalDailyGmv(): HistoricalDailyGmv {
@@ -204,54 +167,72 @@ async function loadHistoricalDailyGmv(): Promise<HistoricalDailyGmvData> {
   return rows;
 }
 
-function buildPayload(businessId: "AD" | "GD", page: number) {
+// ---------------------------------------------------------------------------
+// Ingestion
+// ---------------------------------------------------------------------------
+
+function saleUrl(raw: Record<string, unknown>): string | null {
+  if (typeof raw.clickUrl !== "string" || raw.clickUrl.length === 0) return null;
+  if (raw.clickUrl.startsWith("http")) return raw.clickUrl;
+  return `https://www.govdeals.com${raw.clickUrl.startsWith("/") ? "" : "/"}${raw.clickUrl}`;
+}
+
+function reserveStatus(raw: Record<string, unknown>, sold: boolean): string | null {
+  const has = raw.hasReservePrice === true;
+  if (!has) return "none";
+  if (raw.isReserveNotMet === true) return "not_met";
+  if (raw.isReserveReduced === true) return "reduced";
+  return sold ? "met" : "set";
+}
+
+// Item-level enrichment shared by open + sold parsing. All fields come straight
+// from the Maestro payload (verified present via live probing).
+function enrichmentFields(raw: Record<string, unknown>, sold: boolean) {
   return {
-    category: "",
-    groupIds: [],
-    businessId,
-    searchText: "",
-    isQAL: false,
-    locationId: null,
-    model: "",
-    makebrand: "",
-    accountIds: [],
-    eventId: null,
-    auctionTypeId: null,
-    page,
-    displayRows: PAGE_SIZE,
-    sortField: "bestfit",
-    sortOrder: "asc",
-    requestType: "search",
-    responseStyle: "",
-    facets: [],
-    facetsFilter: [],
-    timeType: "atauction",
-    sellerTypeId: null,
+    row_business_id: typeof raw.businessId === "string" ? raw.businessId : null,
+    title: safeString(raw, ["assetShortDescription"]) || null,
+    country: safeString(raw, ["country", "countryCode", "assetCountry", "locationCountry"]) || null,
+    state: safeString(raw, ["locationState", "state", "stateCode"]) || null,
+    city: safeString(raw, ["locationCity"]) || null,
+    make: safeString(raw, ["makebrand"]) || null,
+    model: safeString(raw, ["model"]) || null,
+    model_year: safeString(raw, ["modelYear"]) || null,
+    lot_number: raw.lotNumber != null ? String(raw.lotNumber) : null,
+    keywords: safeString(raw, ["keywords"]) || null,
+    url: saleUrl(raw),
+    event_id:
+      raw.eventId != null ? String(raw.eventId) : raw.displayEventId != null ? String(raw.displayEventId) : null,
+    auction_type_id: raw.auctionTypeId != null ? String(raw.auctionTypeId) : null,
+    reserve_status: reserveStatus(raw, sold),
+    is_new_asset: typeof raw.isNewAsset === "boolean" ? raw.isNewAsset : null,
+    watch_count: null as number | null, // Maestro exposes no watch/view count
   };
 }
 
 type AuctionRow = {
-  platform: "AD" | "GD";
+  platform: Platform;
   asset_id: string;
   seller_account_id: string | null;
   seller_company: string | null;
   category: string | null;
   currency_code: string | null;
   current_bid_usd: number | null;
+  sale_amount_native: number;
+  fx_rate_used: number | null;
+  fx_source: string;
   bid_count: number;
   close_time_utc: string | null;
   status: "open";
   last_seen_at: string;
-};
+} & ReturnType<typeof enrichmentFields>;
 
-function parseListing(platform: "AD" | "GD", raw: Record<string, unknown>, rates: Record<string, number>, nowIso: string): AuctionRow | null {
+function parseListing(platform: Platform, raw: Record<string, unknown>, fx: FxRates, nowIso: string): AuctionRow | null {
   const assetId = raw.assetId != null ? String(raw.assetId) : null;
   if (!assetId) return null;
 
   const currency = typeof raw.currencyCode === "string" ? raw.currencyCode : "USD";
   const rawBid = safeNumber(raw.currentBid);
-  const usd = toUsd(rawBid, currency, rates);
-  const currentBidUsd = usd === null ? null : Math.round(usd * 100) / 100;
+  const conv = convertToUsd(rawBid, currency, fx);
   const endDate = typeof raw.assetAuctionEndDateUtc === "string" ? raw.assetAuctionEndDateUtc : null;
 
   return {
@@ -261,55 +242,16 @@ function parseListing(platform: "AD" | "GD", raw: Record<string, unknown>, rates
     seller_company: typeof raw.companyName === "string" ? raw.companyName : null,
     category: typeof raw.categoryDescription === "string" ? raw.categoryDescription : null,
     currency_code: currency,
-    current_bid_usd: currentBidUsd,
+    current_bid_usd: roundUsd(conv.usd),
+    sale_amount_native: rawBid,
+    fx_rate_used: conv.rateUsed,
+    fx_source: conv.rateSource,
     bid_count: safeNumber(raw.bidCount),
     close_time_utc: endDate,
     status: "open",
     last_seen_at: nowIso,
+    ...enrichmentFields(raw, false),
   };
-}
-
-type FetchPageResult = {
-  listings: Record<string, unknown>[];
-  total: number | null;
-  status: number | null;
-  errorMessage: string | null;
-  responseKeys: string | null;
-};
-
-async function fetchPage(platform: "AD" | "GD", page: number): Promise<FetchPageResult> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS);
-  try {
-    const res = await fetch(`${MAESTRO_URL}/search/list`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": MAESTRO_KEY,
-        "x-user-id": "-1",
-        "x-api-correlation-id": randomUUID(),
-      },
-      body: JSON.stringify(buildPayload(platform, page)),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      return { listings: [], total: null, status: res.status, errorMessage: `http ${res.status}: ${body.slice(0, 200)}`, responseKeys: null };
-    }
-    const data = await res.json();
-    const headerCount = res.headers.get("x-total-count");
-    const total = headerCount ? parseInt(headerCount, 10) || null : null;
-    let listings: Record<string, unknown>[] = [];
-    if (Array.isArray(data?.assetSearchResults)) listings = data.assetSearchResults;
-    else if (Array.isArray(data?.searchResults)) listings = data.searchResults;
-    else if (Array.isArray(data)) listings = data;
-    const responseKeys = data && !Array.isArray(data) ? Object.keys(data).slice(0, 10).join(",") : null;
-    return { listings, total, status: res.status, errorMessage: null, responseKeys };
-  } catch (e) {
-    return { listings: [], total: null, status: null, errorMessage: `fetch error: ${e instanceof Error ? e.message : String(e)}`, responseKeys: null };
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 type PlatformIngestResult = {
@@ -324,36 +266,44 @@ type PlatformIngestResult = {
   responseKeys: string | null;
 };
 
-async function ingestPlatform(platform: "AD" | "GD", rates: Record<string, number>, nowIso: string): Promise<PlatformIngestResult> {
-  const result: PlatformIngestResult = {
+function emptyIngestResult(): PlatformIngestResult {
+  return {
     upserted: 0, pagesFetched: 0, rowsParsed: 0, rowsSkippedFx: 0, total: null,
     lastStatus: null, fetchError: null, upsertError: null, responseKeys: null,
   };
+}
+
+function applyPageMeta(result: PlatformIngestResult, page: MaestroPage) {
+  if (result.total === null && page.total !== null) result.total = page.total;
+  result.lastStatus = page.status;
+  if (page.errorMessage && !result.fetchError) result.fetchError = page.errorMessage;
+  if (page.responseKeys && !result.responseKeys) result.responseKeys = page.responseKeys;
+  result.pagesFetched++;
+}
+
+async function ingestPlatform(platform: Platform, fx: FxRates, nowIso: string): Promise<PlatformIngestResult> {
+  const result = emptyIngestResult();
 
   for (let page = 1; page <= MAX_PAGES_PER_PLATFORM; page++) {
-    const { listings, total, status, errorMessage, responseKeys } = await fetchPage(platform, page);
-    if (result.total === null && total !== null) result.total = total;
-    result.lastStatus = status;
-    if (errorMessage && !result.fetchError) result.fetchError = errorMessage;
-    if (responseKeys && !result.responseKeys) result.responseKeys = responseKeys;
-    result.pagesFetched++;
-    if (listings.length === 0) break;
+    const pageResult = await maestroFetch(SEARCH_LIST_PATH, buildSearchPayload(platform, page, PAGE_SIZE), {
+      timeoutMs: PAGE_TIMEOUT_MS,
+    });
+    applyPageMeta(result, pageResult);
+    if (pageResult.listings.length === 0) break;
 
-    const rows = listings
-      .map((l) => parseListing(platform, l, rates, nowIso))
+    const rows = pageResult.listings
+      .map((l) => parseListing(platform, l, fx, nowIso))
       .filter((r): r is AuctionRow => r !== null);
     result.rowsParsed += rows.length;
     result.rowsSkippedFx += rows.filter((r) => r.current_bid_usd === null).length;
 
     if (rows.length > 0) {
-      const { error } = await supabase
-        .from("auctions")
-        .upsert(rows, { onConflict: "platform,asset_id" });
+      const { error } = await supabaseAdmin.from("auctions").upsert(rows, { onConflict: "platform,asset_id" });
       if (!error) result.upserted += rows.length;
       else if (!result.upsertError) result.upsertError = error.message;
     }
 
-    if (listings.length < PAGE_SIZE) break;
+    if (pageResult.listings.length < PAGE_SIZE) break;
     if (result.total !== null && page * PAGE_SIZE >= result.total) break;
   }
 
@@ -363,7 +313,7 @@ async function ingestPlatform(platform: "AD" | "GD", rates: Record<string, numbe
 type ClosureResult = { sold: number; nosale: number; unknown: number };
 
 async function sweepClosures(nowIso: string): Promise<ClosureResult> {
-  const { data, error } = await supabase
+  const { data, error } = await supabaseAdmin
     .from("auctions")
     .select("id, bid_count")
     .eq("status", "open")
@@ -376,8 +326,7 @@ async function sweepClosures(nowIso: string): Promise<ClosureResult> {
     const bids = row.bid_count ?? 0;
     if (bids > 0) {
       // A bid does not prove the reserve was met or that the auction closed
-      // as sold.
-      // Keep it out of realized GMV unless a sold feed verifies it.
+      // as sold. Keep it out of realized GMV unless a sold feed verifies it.
       unknownIds.push(row.id);
     } else {
       nosaleIds.push(row.id);
@@ -388,7 +337,7 @@ async function sweepClosures(nowIso: string): Promise<ClosureResult> {
     const CHUNK = 500;
     for (let i = 0; i < nosaleIds.length; i += CHUNK) {
       const chunk = nosaleIds.slice(i, i + CHUNK);
-      await supabase
+      await supabaseAdmin
         .from("auctions")
         .update({ status: "closed_nosale", final_price_usd: 0, closed_at: nowIso })
         .in("id", chunk);
@@ -399,7 +348,7 @@ async function sweepClosures(nowIso: string): Promise<ClosureResult> {
     const CHUNK = 500;
     for (let i = 0; i < unknownIds.length; i += CHUNK) {
       const chunk = unknownIds.slice(i, i + CHUNK);
-      await supabase
+      await supabaseAdmin
         .from("auctions")
         .update({ status: "unknown", closed_at: nowIso })
         .in("id", chunk);
@@ -418,7 +367,7 @@ export type AuctionsIngestResult = {
 };
 
 type SoldAuctionRow = {
-  platform: "AD" | "GD";
+  platform: Platform;
   asset_id: string;
   seller_account_id: string | null;
   seller_company: string | null;
@@ -426,57 +375,24 @@ type SoldAuctionRow = {
   currency_code: string | null;
   current_bid_usd: number | null;
   final_price_usd: number | null;
+  sale_amount_native: number;
+  fx_rate_used: number | null;
+  fx_source: string;
   bid_count: number;
   close_time_utc: string | null;
   status: "closed_sold";
   closed_at: string;
   last_seen_at: string;
-};
+} & ReturnType<typeof enrichmentFields>;
 
-function buildSoldPayload(businessId: "AD" | "GD", fromDate: string, toDate: string, page: number) {
-  return {
-    businessId,
-    category: "",
-    subCategory: "",
-    groupIds: [],
-    searchText: "",
-    isQAL: false,
-    locationId: null,
-    model: "",
-    makebrand: "",
-    accountIds: [],
-    agencies: [],
-    eventId: null,
-    auctionTypeId: null,
-    page,
-    displayRows: SOLD_PAGE_SIZE,
-    sortField: "currentBid",
-    sortOrder: "desc",
-    requestType: "search",
-    responseStyle: "",
-    facets: [],
-    facetsFilter: [],
-    timeType: "",
-    sellerTypeId: null,
-    rangeTimeSearchType: "sold",
-    fromDate,
-    toDate,
-  };
-}
-
-function parseSoldListing(
-  platform: "AD" | "GD",
-  raw: Record<string, unknown>,
-  rates: Record<string, number>,
-  nowIso: string,
-): SoldAuctionRow | null {
+function parseSoldListing(platform: Platform, raw: Record<string, unknown>, fx: FxRates, nowIso: string): SoldAuctionRow | null {
   const assetId = raw.assetId != null ? String(raw.assetId) : null;
   if (!assetId) return null;
 
   const currency = typeof raw.currencyCode === "string" && raw.currencyCode ? raw.currencyCode : "USD";
   const rawBid = safeNumber(raw.currentBid);
-  const usd = toUsd(rawBid, currency, rates);
-  const priceUsd = usd === null ? null : Math.round(usd * 100) / 100;
+  const conv = convertToUsd(rawBid, currency, fx);
+  const priceUsd = roundUsd(conv.usd);
   const endDate = typeof raw.assetAuctionEndDateUtc === "string" ? raw.assetAuctionEndDateUtc : null;
 
   return {
@@ -488,81 +404,42 @@ function parseSoldListing(
     currency_code: currency,
     current_bid_usd: priceUsd,
     final_price_usd: priceUsd,
+    sale_amount_native: rawBid,
+    fx_rate_used: conv.rateUsed,
+    fx_source: conv.rateSource,
     bid_count: safeNumber(raw.bidCount),
     close_time_utc: endDate,
     status: "closed_sold",
     closed_at: nowIso,
     last_seen_at: nowIso,
+    ...enrichmentFields(raw, true),
   };
-}
-
-async function fetchSoldPage(
-  platform: "AD" | "GD",
-  fromDate: string,
-  toDate: string,
-  page: number,
-): Promise<FetchPageResult> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS);
-  try {
-    const res = await fetch(`${MAESTRO_URL}/search/assets/advanced`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": MAESTRO_KEY,
-        "x-user-id": "-1",
-        "x-api-correlation-id": randomUUID(),
-      },
-      body: JSON.stringify(buildSoldPayload(platform, fromDate, toDate, page)),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      return { listings: [], total: null, status: res.status, errorMessage: `http ${res.status}: ${body.slice(0, 200)}`, responseKeys: null };
-    }
-    const data = await res.json();
-    const headerCount = res.headers.get("x-total-count");
-    const total = headerCount ? parseInt(headerCount, 10) || null : null;
-    let listings: Record<string, unknown>[] = [];
-    if (Array.isArray(data?.assetSearchResults)) listings = data.assetSearchResults;
-    else if (Array.isArray(data?.searchResults)) listings = data.searchResults;
-    else if (Array.isArray(data)) listings = data;
-    const responseKeys = data && !Array.isArray(data) ? Object.keys(data).slice(0, 10).join(",") : null;
-    return { listings, total, status: res.status, errorMessage: null, responseKeys };
-  } catch (e) {
-    return { listings: [], total: null, status: null, errorMessage: `fetch error: ${e instanceof Error ? e.message : String(e)}`, responseKeys: null };
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 // Fetches recently-sold auctions for one platform and upserts them as
 // closed_sold with a final price. Matches (platform, asset_id) so it corrects
 // rows we previously tracked as open, and inserts sold lots we never saw open.
 async function ingestSoldPlatform(
-  platform: "AD" | "GD",
-  rates: Record<string, number>,
+  platform: Platform,
+  fx: FxRates,
   nowIso: string,
   fromDate: string,
   toDate: string,
 ): Promise<PlatformIngestResult> {
-  const result: PlatformIngestResult = {
-    upserted: 0, pagesFetched: 0, rowsParsed: 0, rowsSkippedFx: 0, total: null,
-    lastStatus: null, fetchError: null, upsertError: null, responseKeys: null,
-  };
+  const result = emptyIngestResult();
 
   const seen = new Set<string>();
   for (let page = 1; page <= SOLD_MAX_PAGES; page++) {
-    const { listings, total, status, errorMessage, responseKeys } = await fetchSoldPage(platform, fromDate, toDate, page);
-    if (result.total === null && total !== null) result.total = total;
-    result.lastStatus = status;
-    if (errorMessage && !result.fetchError) result.fetchError = errorMessage;
-    if (responseKeys && !result.responseKeys) result.responseKeys = responseKeys;
-    result.pagesFetched++;
-    if (listings.length === 0) break;
+    const pageResult = await maestroFetch(
+      SOLD_SEARCH_PATH,
+      buildSoldPayload(platform, fromDate, toDate, page, SOLD_PAGE_SIZE),
+      { timeoutMs: PAGE_TIMEOUT_MS },
+    );
+    applyPageMeta(result, pageResult);
+    if (pageResult.listings.length === 0) break;
 
-    const rows = listings
-      .map((l) => parseSoldListing(platform, l, rates, nowIso))
+    const rows = pageResult.listings
+      .map((l) => parseSoldListing(platform, l, fx, nowIso))
       .filter((r): r is SoldAuctionRow => r !== null)
       .filter((r) => {
         const key = `${r.platform}:${r.asset_id}`;
@@ -574,42 +451,42 @@ async function ingestSoldPlatform(
     result.rowsSkippedFx += rows.filter((r) => r.final_price_usd === null).length;
 
     if (rows.length > 0) {
-      const { error } = await supabase
-        .from("auctions")
-        .upsert(rows, { onConflict: "platform,asset_id" });
+      const { error } = await supabaseAdmin.from("auctions").upsert(rows, { onConflict: "platform,asset_id" });
       if (!error) result.upserted += rows.length;
       else if (!result.upsertError) result.upsertError = error.message;
     }
 
-    if (listings.length < SOLD_PAGE_SIZE) break;
+    if (pageResult.listings.length < SOLD_PAGE_SIZE) break;
     if (result.total !== null && page * SOLD_PAGE_SIZE >= result.total) break;
   }
 
   return result;
 }
 
-async function ingestSoldAuctions(rates: Record<string, number>, nowIso: string) {
+async function ingestSoldAuctions(fx: FxRates, nowIso: string) {
   const toDate = nowIso;
   const fromDate = new Date(Date.now() - SOLD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
   const [allsurplus, govdeals] = await Promise.all([
-    ingestSoldPlatform("AD", rates, nowIso, fromDate, toDate),
-    ingestSoldPlatform("GD", rates, nowIso, fromDate, toDate),
+    ingestSoldPlatform("AD", fx, nowIso, fromDate, toDate),
+    ingestSoldPlatform("GD", fx, nowIso, fromDate, toDate),
   ]);
   return { allsurplus, govdeals };
 }
 
 export async function ingestAuctions(): Promise<AuctionsIngestResult> {
-  const rates = await fetchUsdRates();
+  const fx = await loadFxRates();
+  // Persist the day's rates for the audit trail (best-effort; never blocks).
+  void persistFxRates(fx);
   const nowIso = new Date().toISOString();
 
   const [allsurplus, govdeals] = await Promise.all([
-    ingestPlatform("AD", rates, nowIso),
-    ingestPlatform("GD", rates, nowIso),
+    ingestPlatform("AD", fx, nowIso),
+    ingestPlatform("GD", fx, nowIso),
   ]);
 
   // Mark recently-sold auctions before sweeping the rest closed, so a lot that
   // sold isn't misfiled as closed_nosale/unknown.
-  const sold = await ingestSoldAuctions(rates, nowIso);
+  const sold = await ingestSoldAuctions(fx, nowIso);
 
   const closures = await sweepClosures(nowIso);
 
@@ -620,12 +497,16 @@ export async function ingestAuctions(): Promise<AuctionsIngestResult> {
   const upserted = allsurplus.upserted + govdeals.upserted;
   if (parsed > 0 && upserted === 0) {
     result.rlsHint =
-      "Parsed rows but upserted 0. Likely RLS: auctions table has no insert policy for the anon role. " +
-      "Add one: create policy \"anon write\" on auctions for all using (true) with check (true);";
+      "Parsed rows but upserted 0. The auctions writer uses the Supabase service role; " +
+      "verify SUPABASE_SECRET_KEY is set (service role bypasses RLS).";
   }
 
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// Revenue forecast (unchanged model; shared date helpers)
+// ---------------------------------------------------------------------------
 
 export type RevenueForecast = {
   quarter: string;
@@ -676,56 +557,6 @@ export type RevenueForecast = {
     sample_row: Record<string, unknown> | null;
   };
 };
-
-function quarterBounds(d: Date): { start: Date; end: Date; label: string } {
-  // Determine the quarter from the Eastern-time calendar date, matching the ET
-  // day bucketing used everywhere else (see etDateKey / auction_daily_stats).
-  // Using UTC here flipped the quarter ~4-5h early at the boundary, so on the
-  // evening of the last day of a quarter (ET) the dashboard jumped to the next
-  // quarter — which has no data yet — and showed all zeros.
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-  }).formatToParts(d);
-  const y = Number(parts.find((p) => p.type === "year")?.value);
-  const month = Number(parts.find((p) => p.type === "month")?.value); // 1-based
-  const q = Math.floor((month - 1) / 3);
-  const start = new Date(Date.UTC(y, q * 3, 1));
-  const end = new Date(Date.UTC(y, q * 3 + 3, 1));
-  return { start, end, label: `${y}Q${q + 1}` };
-}
-
-// Convert a UTC ISO timestamp to a YYYY-MM-DD date in America/New_York.
-// Matches the `auction_daily_stats` view's bucketing.
-function etDateKey(iso: string): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date(iso));
-  const y = parts.find((p) => p.type === "year")?.value ?? "";
-  const m = parts.find((p) => p.type === "month")?.value ?? "";
-  const d = parts.find((p) => p.type === "day")?.value ?? "";
-  return `${y}-${m}-${d}`;
-}
-
-function enumerateQuarterDays(start: Date, end: Date): string[] {
-  const days: string[] = [];
-  const cursor = new Date(start);
-  while (cursor < end) {
-    days.push(cursor.toISOString().slice(0, 10));
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
-  }
-  return days;
-}
-
-function dateKeyToUtcDate(dateKey: string) {
-  const [year, month, day] = dateKey.split("-").map(Number);
-  if (!year || !month || !day) return null;
-  return new Date(Date.UTC(year, month - 1, day));
-}
 
 function earliestHistoricalDate(data: HistoricalDailyGmvData) {
   let earliest: string | null = null;
@@ -896,13 +727,8 @@ function sumHistoricalPlatform(
 
 async function collectDebug(nowIso: string, startIso: string, endIso: string) {
   const [allRes, sampleRes] = await Promise.all([
-    supabase
-      .from("auctions")
-      .select("platform, status, close_time_utc"),
-    supabase
-      .from("auctions")
-      .select("*")
-      .limit(1),
+    supabase.from("auctions").select("platform, status, close_time_utc"),
+    supabase.from("auctions").select("*").limit(1),
   ]);
   const rows = allRes.data ?? [];
   const by_platform: Record<string, number> = {};
@@ -951,12 +777,12 @@ export async function computeRevenueForecast(takeRate = 0.2): Promise<RevenueFor
   const startIso = start.toISOString();
   const endIso = end.toISOString();
   const historicalDailyGmv = await loadHistoricalDailyGmv();
-  const quarterDays = enumerateQuarterDays(start, end);
+  const quarterDays = enumerateDays(start, end);
   const quarterDaySet = new Set(quarterDays);
   const historicalStartKey = earliestHistoricalDate(historicalDailyGmv);
   const historicalStart = historicalStartKey ? dateKeyToUtcDate(historicalStartKey) : null;
   const chartStart = historicalStart && historicalStart < start ? historicalStart : start;
-  const chartDays = enumerateQuarterDays(chartStart, end);
+  const chartDays = enumerateDays(chartStart, end);
   const chartDaySet = new Set(chartDays);
 
   const platforms: ("AD" | "GD")[] = ["AD", "GD"];
@@ -1059,21 +885,20 @@ export async function computeRevenueForecast(takeRate = 0.2): Promise<RevenueFor
     }
   }
 
-  const daily = chartDays
-    .map((date) => {
-      const v = dailyMap.get(date) ?? { realized: emptyHistoricalDailyGmv(), projected: 0 };
-      return {
-        date,
-        realized_gmv_usd: Math.round(v.realized.all),
-        domestic_realized_gmv_usd: Math.round(v.realized.domestic),
-        international_realized_gmv_usd: Math.round(v.realized.international),
-        projected_gmv_usd: Math.round(v.projected),
-        realized_revenue_usd: Math.round(v.realized.all * takeRate),
-        domestic_realized_revenue_usd: Math.round(v.realized.domestic * takeRate),
-        international_realized_revenue_usd: Math.round(v.realized.international * takeRate),
-        projected_revenue_usd: Math.round(v.projected * takeRate),
-      };
-    });
+  const daily = chartDays.map((date) => {
+    const v = dailyMap.get(date) ?? { realized: emptyHistoricalDailyGmv(), projected: 0 };
+    return {
+      date,
+      realized_gmv_usd: Math.round(v.realized.all),
+      domestic_realized_gmv_usd: Math.round(v.realized.domestic),
+      international_realized_gmv_usd: Math.round(v.realized.international),
+      projected_gmv_usd: Math.round(v.projected),
+      realized_revenue_usd: Math.round(v.realized.all * takeRate),
+      domestic_realized_revenue_usd: Math.round(v.realized.domestic * takeRate),
+      international_realized_revenue_usd: Math.round(v.realized.international * takeRate),
+      projected_revenue_usd: Math.round(v.projected * takeRate),
+    };
+  });
 
   const rows = perPlatform.map((p) => {
     const totalGmv = p.realizedGmv + p.projectedOpenGmv;

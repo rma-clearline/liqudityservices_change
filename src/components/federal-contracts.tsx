@@ -1,6 +1,8 @@
 "use client";
 
 import type { FederalContractRow, ContractSnapshotRow } from "@/lib/supabase";
+import { ExportButton } from "./export-button";
+import { humanizeAwardType } from "@/lib/format";
 
 function fmtDollar(n: number | null | undefined) {
   if (n == null) return "—";
@@ -67,18 +69,38 @@ export function FederalContracts({
 
       {contracts.length > 0 && (
         <div>
-          <div className="flex items-baseline justify-between mb-2">
+          <div className="flex items-center justify-between mb-2 gap-3 flex-wrap">
             <p className="text-xs text-gray-500">Recent Contract Awards</p>
-            <p className="text-xs text-gray-400">
-              <span className="inline-block w-3 h-3 align-middle mr-1 bg-amber-50 border border-amber-200 rounded-sm" />
-              Current or past 6 months
-            </p>
+            <div className="flex items-center gap-3">
+              <p className="text-xs text-gray-400">
+                <span className="inline-block w-3 h-3 align-middle mr-1 bg-amber-50 border border-amber-200 rounded-sm" />
+                Current or past 6 months
+              </p>
+              <ExportButton
+                rows={contracts}
+                filename="lqdt-federal-contracts.csv"
+                columns={[
+                  { key: "award_id", label: "Award ID" },
+                  { key: "recipient_name", label: "Recipient" },
+                  { key: "awarding_agency", label: "Awarding Agency" },
+                  { key: "award_type", label: "Award Type" },
+                  { key: "award_amount", label: "Award Amount" },
+                  { key: "total_obligation", label: "Total Obligation" },
+                  { key: "start_date", label: "Start" },
+                  { key: "end_date", label: "End" },
+                  { key: "naics_code", label: "NAICS" },
+                  { key: "place_of_performance_state", label: "PoP State" },
+                  { key: "description", label: "Description" },
+                ]}
+              />
+            </div>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm border-collapse">
               <thead>
                 <tr className="border-b-2 border-gray-300">
                   <th className="py-2 pr-4 text-left">Award ID</th>
+                  <th className="py-2 pr-4 text-left">Type</th>
                   <th className="py-2 pr-4 text-left">Agency</th>
                   <th className="py-2 pr-4 text-right">Amount</th>
                   <th className="py-2 pr-4 text-left">Start</th>
@@ -92,6 +114,7 @@ export function FederalContracts({
                   return (
                     <tr key={c.award_id} className={`border-b border-gray-100 ${recent ? "bg-amber-50" : ""}`}>
                       <td className="py-1.5 pr-4 font-mono text-xs">{c.award_id}</td>
+                      <td className="py-1.5 pr-4 whitespace-nowrap text-gray-600">{humanizeAwardType(c.award_type)}</td>
                       <td className="py-1.5 pr-4 truncate max-w-[200px]">{c.awarding_agency ?? "—"}</td>
                       <td className="py-1.5 pr-4 text-right tabular-nums">{fmtDollar(c.total_obligation)}</td>
                       <td className="py-1.5 pr-4 whitespace-nowrap">{c.start_date ?? "—"}</td>

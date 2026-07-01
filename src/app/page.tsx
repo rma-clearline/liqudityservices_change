@@ -1,11 +1,11 @@
 import { supabase } from "@/lib/supabase";
-import type { ListingRow, MarketplaceMetricsRow, FederalContractRow, ContractSnapshotRow, MarketplaceSellerRow, SamOpportunityRow, StateContractRow } from "@/lib/supabase";
+import type { ListingRow, MarketplaceMetricsRow, FederalContractRow, ContractSnapshotRow, MarketplaceSellerRow, SamOpportunityRow, StateContractRow, SellerDeltaRow } from "@/lib/supabase";
 import { Dashboard } from "@/components/dashboard";
 
 export const dynamic = "force-dynamic";
 
 export default async function Home() {
-  const [listingsRes, metricsRes, contractsRes, snapshotsRes, sellersRes, samRes, stateRes] = await Promise.all([
+  const [listingsRes, metricsRes, contractsRes, snapshotsRes, sellersRes, samRes, stateRes, sellerDeltasRes] = await Promise.all([
     supabase
       .from("listings")
       .select("*")
@@ -44,6 +44,10 @@ export default async function Home() {
       .order("year", { ascending: false })
       .order("quarter", { ascending: false })
       .limit(200),
+    supabase
+      .from("marketplace_seller_deltas")
+      .select("*")
+      .limit(500),
   ]);
 
   const listings: ListingRow[] = listingsRes.data ?? [];
@@ -63,12 +67,13 @@ export default async function Home() {
 
   const samOpportunities: SamOpportunityRow[] = samRes.data ?? [];
   const stateContracts: StateContractRow[] = stateRes.data ?? [];
+  const sellerDeltas: SellerDeltaRow[] = sellerDeltasRes.data ?? [];
 
   return (
     <main className="px-6 py-10">
-      <h1 className="text-2xl font-bold mb-1">LQDT Listings Tracker</h1>
+      <h1 className="text-2xl font-bold mb-1">LQDT Analytics</h1>
       <p className="text-gray-500 text-sm mb-8">
-        Daily active listing counts for AllSurplus and GovDeals
+        Liquidity Services — marketplace &amp; auction GMV, quarterly revenue forecast, and federal/state procurement activity
       </p>
       <Dashboard
         listings={listings}
@@ -78,6 +83,7 @@ export default async function Home() {
         contractSnapshot={contractSnapshot}
         sellersAllsurplus={sellersAD}
         sellersGovdeals={sellersGD}
+        sellerDeltas={sellerDeltas}
         samOpportunities={samOpportunities}
         stateContracts={stateContracts}
       />
