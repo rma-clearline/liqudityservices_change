@@ -24,7 +24,7 @@ Copy `.env.local.example` to `.env.local` and fill in your values. On Vercel, se
 | Variable | Required | Description |
 |---|---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` | Yes | Supabase project URL |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Yes | Supabase anon/public key |
+| `SUPABASE_SECRET_KEY` | Yes | Supabase secret key (`sb_secret_...`), server-only — never use a `NEXT_PUBLIC_` name for this |
 | `CRON_SECRET` | Yes | Secret for authenticating cron requests |
 | `MAESTRO_API_URL` | No | Maestro API base URL (defaults to `https://maestro.lqdt1.com`) |
 | `MAESTRO_API_KEY` | No | Maestro API key (defaults to public key from LS frontend) |

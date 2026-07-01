@@ -462,3 +462,4 @@
  GET /api/historical-sales?date=2026-06-24&pageSize=1000&page=3&sortBy=amount&sortOrder=desc&market=all 200 in 10ms (next.js: 2ms, application-code: 8ms)
  GET / 200 in 1908ms (next.js: 4ms, application-code: 1904ms)
  GET /api/forecast?takeRate=0.2 200 in 296ms (next.js: 3ms, application-code: 293ms)
+[?25h
