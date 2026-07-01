@@ -13,7 +13,7 @@ import {
   type MaestroPage,
   type Platform,
 } from "./maestro";
-import { dateKeyToUtcDate, enumerateDays, etDateKey, quarterBounds } from "./time";
+import { enumerateDays, enumerateQuarterLabelsBetween, etDateKey, parseQuarterLabel, quarterBounds } from "./time";
 
 const PAGE_SIZE = Number(process.env.AUCTIONS_PAGE_SIZE) || 50;
 const MAX_PAGES_PER_PLATFORM = Number(process.env.AUCTIONS_MAX_PAGES) || 10;
@@ -513,6 +513,10 @@ export type RevenueForecast = {
   quarter_start: string;
   quarter_end: string;
   take_rate: number;
+  /** Whether `quarter` is the live (current) quarter — false for historical views. */
+  is_current: boolean;
+  /** All selectable quarter labels (earliest data quarter → current), chronological. */
+  available_quarters: string[];
   platforms: {
     platform: "AD" | "GD";
     realized_gmv_usd: number;
@@ -564,6 +568,14 @@ function earliestHistoricalDate(data: HistoricalDailyGmvData) {
     if (earliest === null || date < earliest) earliest = date;
   }
   return earliest;
+}
+
+// Quarter label ("YYYYQn") for an ET-bucketed date key ("YYYY-MM-DD"). The key
+// is already ET-bucketed, so the quarter derives directly from its month.
+function quarterLabelForDateKey(key: string): string {
+  const [y, m] = key.split("-").map(Number);
+  const q = Math.floor(((m || 1) - 1) / 3) + 1;
+  return `${y}Q${q}`;
 }
 
 type ClosedAuctionForProjection = {
@@ -770,20 +782,31 @@ async function collectDebug(nowIso: string, startIso: string, endIso: string) {
   };
 }
 
-export async function computeRevenueForecast(takeRate = 0.2): Promise<RevenueForecast> {
+export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: string): Promise<RevenueForecast> {
   const now = new Date();
   const nowIso = now.toISOString();
-  const { start, end, label } = quarterBounds(now);
+  const current = quarterBounds(now);
+  // Select the requested quarter (falling back to the current one for missing /
+  // malformed labels). Historical quarters are fully realized; the open-auction
+  // projection query naturally returns nothing for them.
+  const selected = (quarterLabel ? parseQuarterLabel(quarterLabel) : null) ?? current;
+  const { start, end, label } = selected;
+  const isCurrent = label === current.label;
   const startIso = start.toISOString();
   const endIso = end.toISOString();
   const historicalDailyGmv = await loadHistoricalDailyGmv();
   const quarterDays = enumerateDays(start, end);
   const quarterDaySet = new Set(quarterDays);
+
+  // Selectable quarters: earliest data quarter (from the historical export)
+  // through the current quarter.
   const historicalStartKey = earliestHistoricalDate(historicalDailyGmv);
-  const historicalStart = historicalStartKey ? dateKeyToUtcDate(historicalStartKey) : null;
-  const chartStart = historicalStart && historicalStart < start ? historicalStart : start;
-  const chartDays = enumerateDays(chartStart, end);
-  const chartDaySet = new Set(chartDays);
+  const earliestLabel = historicalStartKey ? quarterLabelForDateKey(historicalStartKey) : current.label;
+  const availableQuarters = enumerateQuarterLabelsBetween(earliestLabel, current.label);
+
+  // Chart is scoped to the selected quarter's days.
+  const chartDays = quarterDays;
+  const chartDaySet = quarterDaySet;
 
   const platforms: ("AD" | "GD")[] = ["AD", "GD"];
   const perPlatform = await Promise.all(
@@ -932,6 +955,8 @@ export async function computeRevenueForecast(takeRate = 0.2): Promise<RevenueFor
     quarter_start: startIso,
     quarter_end: endIso,
     take_rate: takeRate,
+    is_current: isCurrent,
+    available_quarters: availableQuarters,
     platforms: rows,
     daily,
     projected_total_gmv_usd,

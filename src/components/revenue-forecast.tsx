@@ -50,6 +50,8 @@ type Forecast = {
   quarter_start: string;
   quarter_end: string;
   take_rate: number;
+  is_current: boolean;
+  available_quarters: string[];
   platforms: PlatformForecast[];
   daily: DailyPoint[];
   projected_total_gmv_usd: number;
@@ -607,6 +609,7 @@ function DailyForecastChart({
   stockByDate,
   stockTicker,
   todayKey,
+  isCurrent,
   onSelectDate,
 }: {
   daily: DailyPoint[];
@@ -616,6 +619,7 @@ function DailyForecastChart({
   stockByDate: Record<string, number>;
   stockTicker: string;
   todayKey: string;
+  isCurrent: boolean;
   onSelectDate: (date: string) => void;
 }) {
   const data = daily.map((d) => ({
@@ -674,7 +678,9 @@ function DailyForecastChart({
             }}
           />
           <Legend />
-          <ReferenceLine x={todayLabel} stroke="#9ca3af" strokeDasharray="4 2" label={{ value: "today", position: "top", fontSize: 10, fill: "#6b7280" }} />
+          {isCurrent && (
+            <ReferenceLine x={todayLabel} stroke="#9ca3af" strokeDasharray="4 2" label={{ value: "today", position: "top", fontSize: 10, fill: "#6b7280" }} />
+          )}
           <Bar yAxisId="money" dataKey="Realized" stackId="a" fill="#2563eb" cursor="pointer" />
           {market === "all" && <Bar yAxisId="money" dataKey="Projected" stackId="a" fill="#93c5fd" cursor="pointer" />}
           {hasStock && (
@@ -697,6 +703,7 @@ function DailyForecastChart({
 
 export function RevenueForecast() {
   const [takeRate, setTakeRate] = useState(0.2);
+  const [quarter, setQuarter] = useState<string | null>(null);
   const [chartMetric, setChartMetric] = useState<ChartMetric>("gmv");
   const [chartMarket, setChartMarket] = useState<SalesMarketFilter>(DEFAULT_CHART_MARKET);
   const [showStockPrice, setShowStockPrice] = useState(false);
@@ -711,7 +718,9 @@ export function RevenueForecast() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/forecast?takeRate=${takeRate}`)
+    const params = new URLSearchParams({ takeRate: String(takeRate) });
+    if (quarter) params.set("quarter", quarter);
+    fetch(`/api/forecast?${params.toString()}`)
       .then((r) => r.json())
       .then((data) => {
         if (!cancelled) setState({ forecast: data, error: null, done: true });
@@ -722,7 +731,7 @@ export function RevenueForecast() {
     return () => {
       cancelled = true;
     };
-  }, [takeRate]);
+  }, [takeRate, quarter]);
 
   const stockDateRange = useMemo(() => {
     const daily = state.forecast?.daily ?? [];
@@ -801,9 +810,21 @@ export function RevenueForecast() {
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-4 flex-wrap">
-        <div className="text-sm text-gray-600">
-          Quarter <span className="font-semibold text-gray-900">{forecast.quarter}</span>
-        </div>
+        <label className="text-sm text-gray-600 flex items-center gap-2">
+          Quarter
+          <select
+            value={forecast.quarter}
+            onChange={(e) => setQuarter(e.target.value)}
+            className="border rounded px-2 py-0.5 text-sm text-gray-900"
+          >
+            {[...forecast.available_quarters].reverse().map((q, i) => (
+              <option key={q} value={q}>
+                {q}{i === 0 ? " (current)" : ""}
+              </option>
+            ))}
+          </select>
+          {!forecast.is_current && <span className="text-xs text-gray-400">closed quarter — realized only</span>}
+        </label>
         <label className="text-sm text-gray-600 flex items-center gap-2">
           Take rate
           <input
@@ -820,8 +841,8 @@ export function RevenueForecast() {
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <Card label={`Projected ${forecast.quarter} GMV`} value={fmtDollar(forecast.projected_total_gmv_usd)} />
-        <Card label={`Projected ${forecast.quarter} Revenue`} value={fmtDollar(forecast.projected_total_revenue_usd)} strong />
+        <Card label={`${forecast.is_current ? "Projected" : "Realized"} ${forecast.quarter} GMV`} value={fmtDollar(forecast.projected_total_gmv_usd)} />
+        <Card label={`${forecast.is_current ? "Projected" : "Realized"} ${forecast.quarter} Revenue`} value={fmtDollar(forecast.projected_total_revenue_usd)} strong />
       </div>
 
       <div>
@@ -882,6 +903,7 @@ export function RevenueForecast() {
           stockByDate={stockByDate}
           stockTicker={stockState.ticker}
           todayKey={new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" })}
+          isCurrent={forecast.is_current}
           onSelectDate={setSelectedSalesDate}
         />
       </div>

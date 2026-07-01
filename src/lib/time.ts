@@ -44,6 +44,46 @@ export function quarterBounds(d: Date): { start: Date; end: Date; label: string 
   return { start, end, label: `${y}Q${q + 1}` };
 }
 
+/**
+ * Parse a "YYYYQn" label (e.g. "2026Q3") into UTC quarter bounds.
+ * Uses fixed UTC month boundaries — the label already names the quarter, so no
+ * timezone inference is needed (unlike quarterBounds, which derives it from a
+ * timestamp). Returns null for malformed labels.
+ */
+export function parseQuarterLabel(label: string): { start: Date; end: Date; label: string } | null {
+  const m = /^(\d{4})Q([1-4])$/.exec(label.trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const q = Number(m[2]) - 1; // 0-based
+  const start = new Date(Date.UTC(y, q * 3, 1));
+  const end = new Date(Date.UTC(y, q * 3 + 3, 1));
+  return { start, end, label: `${y}Q${q + 1}` };
+}
+
+/**
+ * All quarter labels from `startLabel` to `endLabel` inclusive (chronological).
+ * Pure integer math on year/quarter — no timezone edge cases.
+ */
+export function enumerateQuarterLabelsBetween(startLabel: string, endLabel: string): string[] {
+  const s = parseQuarterLabel(startLabel);
+  const e = parseQuarterLabel(endLabel);
+  if (!s || !e) return [];
+  let y = s.start.getUTCFullYear();
+  let qi = s.start.getUTCMonth() / 3; // 0-3 (month is q*3)
+  const endY = e.start.getUTCFullYear();
+  const endQi = e.start.getUTCMonth() / 3;
+  const labels: string[] = [];
+  while (y < endY || (y === endY && qi <= endQi)) {
+    labels.push(`${y}Q${qi + 1}`);
+    qi += 1;
+    if (qi > 3) {
+      qi = 0;
+      y += 1;
+    }
+  }
+  return labels;
+}
+
 /** Enumerate YYYY-MM-DD keys from `start` (inclusive) to `end` (exclusive). */
 export function enumerateDays(start: Date, end: Date): string[] {
   const days: string[] = [];
