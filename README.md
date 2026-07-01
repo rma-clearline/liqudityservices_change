@@ -52,8 +52,25 @@ curl -H "Authorization: Bearer YOUR_CRON_SECRET" https://your-app.vercel.app/api
 
 ## Architecture
 
+The dashboard is split into tabbed pages under a shared layout (`src/app/(dashboard)/`),
+each fetching only the data it needs:
+
 ```
-/api/cron     — Vercel cron handler: scrapes both sites, inserts row into Supabase, sends email
-/api/listings — REST endpoint returning historical data as JSON
-/             — Dashboard page with stats cards, trend chart, and history table
+/             — Listings: active-listing trend chart + history table + email snapshot
+/overview     — Executive summary (realized/projected GMV reconciliation) + listing counts
+/forecast     — Quarterly revenue/GMV forecast
+/marketplace  — Marketplace metrics + top sellers + seller movers
+/contracts    — Federal contracts, SAM.gov opportunities, and state/local contracts
+```
+
+API routes:
+
+```
+/api/cron          — Vercel cron handler: scrapes all sources, upserts to Supabase, logs to cron_runs, sends email
+/api/data-status   — Per-table freshness + latest cron-run status/alerts (powers the freshness badges + alerts banner)
+/api/forecast      — Quarterly revenue forecast (auctions-derived), short-cached
+/api/historical-sales — Sold-auction detail for the forecast drill-down modal
+/api/stock-prices  — LQDT daily closes (Yahoo Finance) for the forecast chart overlay
+/api/listings      — Historical listing counts as JSON
+/api/send-snapshot — Manual email snapshot (allow-listed recipients, rate + size limited)
 ```
