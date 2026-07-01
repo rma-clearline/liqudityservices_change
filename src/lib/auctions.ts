@@ -11,6 +11,12 @@ const PAGE_SIZE = Number(process.env.AUCTIONS_PAGE_SIZE) || 50;
 const MAX_PAGES_PER_PLATFORM = Number(process.env.AUCTIONS_MAX_PAGES) || 10;
 const PAGE_TIMEOUT_MS = Number(process.env.AUCTIONS_PAGE_TIMEOUT_MS) || 40000;
 const DEFAULT_CLOSE_RATE = Number(process.env.AUCTIONS_DEFAULT_CLOSE_RATE) || 0.35;
+// Sold-auction ingestion (the realized-GMV feed). A rolling window of recent
+// days is re-fetched each cron run and upserted as closed_sold, so realized GMV
+// for the live quarter accumulates without relying on the offline CSV export.
+const SOLD_LOOKBACK_DAYS = Number(process.env.AUCTIONS_SOLD_LOOKBACK_DAYS) || 2;
+const SOLD_PAGE_SIZE = Number(process.env.AUCTIONS_SOLD_PAGE_SIZE) || 1000;
+const SOLD_MAX_PAGES = Number(process.env.AUCTIONS_SOLD_MAX_PAGES) || 10;
 const HISTORICAL_GMV_DIR = path.join(process.cwd(), "scripts");
 const HISTORICAL_DAILY_GMV_PATH = historicalCsvPath(
   process.env.HISTORICAL_GMV_DAILY_PATH,
@@ -406,9 +412,191 @@ async function sweepClosures(nowIso: string): Promise<ClosureResult> {
 export type AuctionsIngestResult = {
   allsurplus: PlatformIngestResult;
   govdeals: PlatformIngestResult;
+  sold: { allsurplus: PlatformIngestResult; govdeals: PlatformIngestResult };
   closures: ClosureResult;
   rlsHint?: string;
 };
+
+type SoldAuctionRow = {
+  platform: "AD" | "GD";
+  asset_id: string;
+  seller_account_id: string | null;
+  seller_company: string | null;
+  category: string | null;
+  currency_code: string | null;
+  current_bid_usd: number | null;
+  final_price_usd: number | null;
+  bid_count: number;
+  close_time_utc: string | null;
+  status: "closed_sold";
+  closed_at: string;
+  last_seen_at: string;
+};
+
+function buildSoldPayload(businessId: "AD" | "GD", fromDate: string, toDate: string, page: number) {
+  return {
+    businessId,
+    category: "",
+    subCategory: "",
+    groupIds: [],
+    searchText: "",
+    isQAL: false,
+    locationId: null,
+    model: "",
+    makebrand: "",
+    accountIds: [],
+    agencies: [],
+    eventId: null,
+    auctionTypeId: null,
+    page,
+    displayRows: SOLD_PAGE_SIZE,
+    sortField: "currentBid",
+    sortOrder: "desc",
+    requestType: "search",
+    responseStyle: "",
+    facets: [],
+    facetsFilter: [],
+    timeType: "",
+    sellerTypeId: null,
+    rangeTimeSearchType: "sold",
+    fromDate,
+    toDate,
+  };
+}
+
+function parseSoldListing(
+  platform: "AD" | "GD",
+  raw: Record<string, unknown>,
+  rates: Record<string, number>,
+  nowIso: string,
+): SoldAuctionRow | null {
+  const assetId = raw.assetId != null ? String(raw.assetId) : null;
+  if (!assetId) return null;
+
+  const currency = typeof raw.currencyCode === "string" && raw.currencyCode ? raw.currencyCode : "USD";
+  const rawBid = safeNumber(raw.currentBid);
+  const usd = toUsd(rawBid, currency, rates);
+  const priceUsd = usd === null ? null : Math.round(usd * 100) / 100;
+  const endDate = typeof raw.assetAuctionEndDateUtc === "string" ? raw.assetAuctionEndDateUtc : null;
+
+  return {
+    platform,
+    asset_id: assetId,
+    seller_account_id: raw.accountId != null ? String(raw.accountId) : null,
+    seller_company: typeof raw.companyName === "string" ? raw.companyName : null,
+    category: typeof raw.categoryDescription === "string" ? raw.categoryDescription : null,
+    currency_code: currency,
+    current_bid_usd: priceUsd,
+    final_price_usd: priceUsd,
+    bid_count: safeNumber(raw.bidCount),
+    close_time_utc: endDate,
+    status: "closed_sold",
+    closed_at: nowIso,
+    last_seen_at: nowIso,
+  };
+}
+
+async function fetchSoldPage(
+  platform: "AD" | "GD",
+  fromDate: string,
+  toDate: string,
+  page: number,
+): Promise<FetchPageResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${MAESTRO_URL}/search/assets/advanced`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": MAESTRO_KEY,
+        "x-user-id": "-1",
+        "x-api-correlation-id": randomUUID(),
+      },
+      body: JSON.stringify(buildSoldPayload(platform, fromDate, toDate, page)),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      return { listings: [], total: null, status: res.status, errorMessage: `http ${res.status}: ${body.slice(0, 200)}`, responseKeys: null };
+    }
+    const data = await res.json();
+    const headerCount = res.headers.get("x-total-count");
+    const total = headerCount ? parseInt(headerCount, 10) || null : null;
+    let listings: Record<string, unknown>[] = [];
+    if (Array.isArray(data?.assetSearchResults)) listings = data.assetSearchResults;
+    else if (Array.isArray(data?.searchResults)) listings = data.searchResults;
+    else if (Array.isArray(data)) listings = data;
+    const responseKeys = data && !Array.isArray(data) ? Object.keys(data).slice(0, 10).join(",") : null;
+    return { listings, total, status: res.status, errorMessage: null, responseKeys };
+  } catch (e) {
+    return { listings: [], total: null, status: null, errorMessage: `fetch error: ${e instanceof Error ? e.message : String(e)}`, responseKeys: null };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Fetches recently-sold auctions for one platform and upserts them as
+// closed_sold with a final price. Matches (platform, asset_id) so it corrects
+// rows we previously tracked as open, and inserts sold lots we never saw open.
+async function ingestSoldPlatform(
+  platform: "AD" | "GD",
+  rates: Record<string, number>,
+  nowIso: string,
+  fromDate: string,
+  toDate: string,
+): Promise<PlatformIngestResult> {
+  const result: PlatformIngestResult = {
+    upserted: 0, pagesFetched: 0, rowsParsed: 0, rowsSkippedFx: 0, total: null,
+    lastStatus: null, fetchError: null, upsertError: null, responseKeys: null,
+  };
+
+  const seen = new Set<string>();
+  for (let page = 1; page <= SOLD_MAX_PAGES; page++) {
+    const { listings, total, status, errorMessage, responseKeys } = await fetchSoldPage(platform, fromDate, toDate, page);
+    if (result.total === null && total !== null) result.total = total;
+    result.lastStatus = status;
+    if (errorMessage && !result.fetchError) result.fetchError = errorMessage;
+    if (responseKeys && !result.responseKeys) result.responseKeys = responseKeys;
+    result.pagesFetched++;
+    if (listings.length === 0) break;
+
+    const rows = listings
+      .map((l) => parseSoldListing(platform, l, rates, nowIso))
+      .filter((r): r is SoldAuctionRow => r !== null)
+      .filter((r) => {
+        const key = `${r.platform}:${r.asset_id}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    result.rowsParsed += rows.length;
+    result.rowsSkippedFx += rows.filter((r) => r.final_price_usd === null).length;
+
+    if (rows.length > 0) {
+      const { error } = await supabase
+        .from("auctions")
+        .upsert(rows, { onConflict: "platform,asset_id" });
+      if (!error) result.upserted += rows.length;
+      else if (!result.upsertError) result.upsertError = error.message;
+    }
+
+    if (listings.length < SOLD_PAGE_SIZE) break;
+    if (result.total !== null && page * SOLD_PAGE_SIZE >= result.total) break;
+  }
+
+  return result;
+}
+
+async function ingestSoldAuctions(rates: Record<string, number>, nowIso: string) {
+  const toDate = nowIso;
+  const fromDate = new Date(Date.now() - SOLD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const [allsurplus, govdeals] = await Promise.all([
+    ingestSoldPlatform("AD", rates, nowIso, fromDate, toDate),
+    ingestSoldPlatform("GD", rates, nowIso, fromDate, toDate),
+  ]);
+  return { allsurplus, govdeals };
+}
 
 export async function ingestAuctions(): Promise<AuctionsIngestResult> {
   const rates = await fetchUsdRates();
@@ -419,9 +607,13 @@ export async function ingestAuctions(): Promise<AuctionsIngestResult> {
     ingestPlatform("GD", rates, nowIso),
   ]);
 
+  // Mark recently-sold auctions before sweeping the rest closed, so a lot that
+  // sold isn't misfiled as closed_nosale/unknown.
+  const sold = await ingestSoldAuctions(rates, nowIso);
+
   const closures = await sweepClosures(nowIso);
 
-  const result: AuctionsIngestResult = { allsurplus, govdeals, closures };
+  const result: AuctionsIngestResult = { allsurplus, govdeals, sold, closures };
 
   // If we parsed rows but upserted zero, it's almost always RLS blocking writes.
   const parsed = allsurplus.rowsParsed + govdeals.rowsParsed;
@@ -486,8 +678,19 @@ export type RevenueForecast = {
 };
 
 function quarterBounds(d: Date): { start: Date; end: Date; label: string } {
-  const y = d.getUTCFullYear();
-  const q = Math.floor(d.getUTCMonth() / 3);
+  // Determine the quarter from the Eastern-time calendar date, matching the ET
+  // day bucketing used everywhere else (see etDateKey / auction_daily_stats).
+  // Using UTC here flipped the quarter ~4-5h early at the boundary, so on the
+  // evening of the last day of a quarter (ET) the dashboard jumped to the next
+  // quarter — which has no data yet — and showed all zeros.
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(d);
+  const y = Number(parts.find((p) => p.type === "year")?.value);
+  const month = Number(parts.find((p) => p.type === "month")?.value); // 1-based
+  const q = Math.floor((month - 1) / 3);
   const start = new Date(Date.UTC(y, q * 3, 1));
   const end = new Date(Date.UTC(y, q * 3 + 3, 1));
   return { start, end, label: `${y}Q${q + 1}` };
