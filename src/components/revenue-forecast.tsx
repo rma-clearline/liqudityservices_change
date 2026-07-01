@@ -802,6 +802,13 @@ export function RevenueForecast() {
 
   const ad = forecast.platforms.find((p) => p.platform === "AD");
   const gd = forecast.platforms.find((p) => p.platform === "GD");
+  const isAll = forecast.quarter === "ALL";
+  const totalGmvLabel = isAll
+    ? "Total GMV (all data)"
+    : `${forecast.is_current ? "Projected" : "Realized"} ${forecast.quarter} GMV`;
+  const totalRevLabel = isAll
+    ? "Total Revenue (all data)"
+    : `${forecast.is_current ? "Projected" : "Realized"} ${forecast.quarter} Revenue`;
   const dailyStart = forecast.daily[0]?.date;
   const dailyEnd = forecast.daily[forecast.daily.length - 1]?.date;
   const dailyRange = dailyStart && dailyEnd ? `${dailyStart} to ${dailyEnd}` : forecast.quarter;
@@ -817,13 +824,18 @@ export function RevenueForecast() {
             onChange={(e) => setQuarter(e.target.value)}
             className="border rounded px-2 py-0.5 text-sm text-gray-900"
           >
+            <option value="ALL">All (full history)</option>
             {[...forecast.available_quarters].reverse().map((q, i) => (
               <option key={q} value={q}>
                 {q}{i === 0 ? " (current)" : ""}
               </option>
             ))}
           </select>
-          {!forecast.is_current && <span className="text-xs text-gray-400">closed quarter — realized only</span>}
+          {forecast.quarter === "ALL" ? (
+            <span className="text-xs text-gray-400">full daily history + current-quarter projection</span>
+          ) : (
+            !forecast.is_current && <span className="text-xs text-gray-400">closed quarter — realized only</span>
+          )}
         </label>
         <label className="text-sm text-gray-600 flex items-center gap-2">
           Take rate
@@ -841,8 +853,8 @@ export function RevenueForecast() {
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <Card label={`${forecast.is_current ? "Projected" : "Realized"} ${forecast.quarter} GMV`} value={fmtDollar(forecast.projected_total_gmv_usd)} />
-        <Card label={`${forecast.is_current ? "Projected" : "Realized"} ${forecast.quarter} Revenue`} value={fmtDollar(forecast.projected_total_revenue_usd)} strong />
+        <Card label={totalGmvLabel} value={fmtDollar(forecast.projected_total_gmv_usd)} />
+        <Card label={totalRevLabel} value={fmtDollar(forecast.projected_total_revenue_usd)} strong />
       </div>
 
       <div>
@@ -908,8 +920,13 @@ export function RevenueForecast() {
         />
       </div>
 
-      {ad && <PlatformBlock label="AllSurplus" color="text-blue-600" p={ad} />}
-      {gd && <PlatformBlock label="GovDeals" color="text-green-600" p={gd} />}
+      {!isAll && ad && <PlatformBlock label="AllSurplus" color="text-blue-600" p={ad} />}
+      {!isAll && gd && <PlatformBlock label="GovDeals" color="text-green-600" p={gd} />}
+      {isAll && (
+        <p className="text-sm text-gray-500">
+          Per-platform breakdown (close rate, avg hammer, projection) is shown per quarter — select a quarter above.
+        </p>
+      )}
 
       <p className="text-xs text-gray-400">
         Forecast = historical realized GMV where available + open-auction estimates using segment, category, then platform close rates and average hammer values.

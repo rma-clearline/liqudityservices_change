@@ -13,7 +13,7 @@ import {
   type MaestroPage,
   type Platform,
 } from "./maestro";
-import { enumerateDays, enumerateQuarterLabelsBetween, etDateKey, parseQuarterLabel, quarterBounds } from "./time";
+import { dateKeyToUtcDate, enumerateDays, enumerateQuarterLabelsBetween, etDateKey, parseQuarterLabel, quarterBounds } from "./time";
 
 const PAGE_SIZE = Number(process.env.AUCTIONS_PAGE_SIZE) || 50;
 const MAX_PAGES_PER_PLATFORM = Number(process.env.AUCTIONS_MAX_PAGES) || 10;
@@ -786,17 +786,7 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   const now = new Date();
   const nowIso = now.toISOString();
   const current = quarterBounds(now);
-  // Select the requested quarter (falling back to the current one for missing /
-  // malformed labels). Historical quarters are fully realized; the open-auction
-  // projection query naturally returns nothing for them.
-  const selected = (quarterLabel ? parseQuarterLabel(quarterLabel) : null) ?? current;
-  const { start, end, label } = selected;
-  const isCurrent = label === current.label;
-  const startIso = start.toISOString();
-  const endIso = end.toISOString();
   const historicalDailyGmv = await loadHistoricalDailyGmv();
-  const quarterDays = enumerateDays(start, end);
-  const quarterDaySet = new Set(quarterDays);
 
   // Selectable quarters: earliest data quarter (from the historical export)
   // through the current quarter.
@@ -804,7 +794,33 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   const earliestLabel = historicalStartKey ? quarterLabelForDateKey(historicalStartKey) : current.label;
   const availableQuarters = enumerateQuarterLabelsBetween(earliestLabel, current.label);
 
-  // Chart is scoped to the selected quarter's days.
+  // Resolve the view. "ALL" spans the earliest data day through the current
+  // quarter end — the full daily GMV history in one series. Otherwise a single
+  // quarter (falling back to the current one for missing/malformed labels).
+  // Historical days are fully realized; the open-auction projection query
+  // returns nothing for them, so only the live tail carries a projection.
+  const wantsAll = (quarterLabel ?? "").trim().toUpperCase() === "ALL";
+  let start: Date;
+  let end: Date;
+  let label: string;
+  let isCurrent: boolean;
+  if (wantsAll) {
+    const earliestStart = (historicalStartKey ? dateKeyToUtcDate(historicalStartKey) : null) ?? current.start;
+    start = earliestStart < current.start ? earliestStart : current.start;
+    end = current.end;
+    label = "ALL";
+    isCurrent = true; // includes the live quarter → keep projection + today line
+  } else {
+    const selected = (quarterLabel ? parseQuarterLabel(quarterLabel) : null) ?? current;
+    start = selected.start;
+    end = selected.end;
+    label = selected.label;
+    isCurrent = label === current.label;
+  }
+  const startIso = start.toISOString();
+  const endIso = end.toISOString();
+  const quarterDays = enumerateDays(start, end);
+  const quarterDaySet = new Set(quarterDays);
   const chartDays = quarterDays;
   const chartDaySet = quarterDaySet;
 
