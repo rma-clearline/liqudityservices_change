@@ -98,12 +98,15 @@ coverage) instead of a value-ranked sample:
 - **Harder retries** (4 attempts, exponential backoff) at bounded concurrency (5) so
   a transient throttle no longer silently zeroes a week; a genuinely failed chunk is
   reported as partial rather than dropped.
-- **Per-quarter splitting in the export modal.** Since a full-history complete fetch
-  (~830 pages, ~90–120s) exceeds the 60s serverless limit, the modal splits any range
-  wider than a quarter into **per-quarter requests** (each complete, ~20–30s), shows
-  progress, and concatenates the CSVs (quarters are date-disjoint, so no cross-quarter
-  duplicates). Result: full-history export now reconciles to ~$882M, and a wider range
-  never captures less (monotonic).
+- **Per-month splitting in the export modal.** Since a full-history complete fetch
+  (~830 pages, ~90–120s) far exceeds the serverless limit — and even a single dense
+  *quarter* can exceed it (a 504 was observed on 2025Q3, vs 38s for 2026Q1) — the modal
+  splits the range into **per-month requests** (each ~10–25s, comfortably under the
+  limit even on Azure SWA's ~45s managed-function cap), shows progress, and assembles
+  the result. Raw rows are date-disjoint across months so their CSVs concatenate
+  directly; pivot rows are **merged by period×site×type×market** client-side (a
+  quarter/week period can straddle month boundaries). Result: full-history export
+  reconciles to ~$882M, and a wider range never captures less (monotonic).
 - **Category chart stays a fast sample.** `/api/gmv-by-category` passes `maxPages: 80`
   — it only needs to surface outsized categories, and it labels the result a sample.
 
