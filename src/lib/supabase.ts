@@ -9,29 +9,6 @@ export type ListingRow = {
   created_at: string;
 };
 
-export type MarketplaceMetricsRow = {
-  id: number;
-  date: string;
-  timestamp: string;
-  platform: "AD" | "GD";
-  total_listings: number | null;
-  total_bids: number | null;
-  avg_bids_per_listing: number | null;
-  total_current_price: number | null;
-  listings_with_bids: number | null;
-  bid_rate: number | null;
-  unique_seller_count: number | null;
-  listings_closing_24h: number | null;
-  avg_watch_count: number | null;
-  listings_with_reserve: number | null;
-  reserve_rate: number | null;
-  top_categories: Record<string, number> | null;
-  sample_size: number | null;
-  pages_fetched: number | null;
-  is_full_coverage: boolean | null;
-  created_at: string;
-};
-
 export type FederalContractRow = {
   id: number;
   award_id: string;

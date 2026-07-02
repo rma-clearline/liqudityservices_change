@@ -88,10 +88,21 @@ export function isDomesticCountry(country: string) {
   );
 }
 
-function saleUrl(raw: Record<string, unknown>) {
-  if (typeof raw.clickUrl !== "string" || raw.clickUrl.length === 0) return null;
-  if (raw.clickUrl.startsWith("http")) return raw.clickUrl;
-  return `https://www.govdeals.com${raw.clickUrl.startsWith("/") ? "" : "/"}${raw.clickUrl}`;
+function saleUrl(raw: Record<string, unknown>): string | null {
+  // Prefer the feed-provided clickUrl when present.
+  if (typeof raw.clickUrl === "string" && raw.clickUrl.length > 0) {
+    if (raw.clickUrl.startsWith("http")) return raw.clickUrl;
+    return `https://www.govdeals.com${raw.clickUrl.startsWith("/") ? "" : "/"}${raw.clickUrl}`;
+  }
+  // The sold archive usually omits clickUrl, so construct the listing URL from
+  // ids the same way the seller tables do (top-sellers.tsx): asset + account on
+  // the row's marketplace domain. GI (industrial) surfaces on AllSurplus.
+  const biz = typeof raw.businessId === "string" ? raw.businessId : "";
+  const assetId = raw.assetId != null ? String(raw.assetId) : "";
+  const accountId = raw.accountId != null ? String(raw.accountId) : "";
+  if (!assetId || !accountId) return null;
+  const domain = biz === "GD" ? "www.govdeals.com" : "www.allsurplus.com";
+  return `https://${domain}/asset/${assetId}/${accountId}`;
 }
 
 export function rowKey(raw: Record<string, unknown>) {

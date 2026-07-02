@@ -263,6 +263,47 @@ function periodKey(dateKey: string, period: ExportPeriod): string {
   return dateKey;
 }
 
+export type CategoryByPeriod = {
+  categories: string[]; // top-N category names + "Other"
+  data: Array<Record<string, number | string>>; // [{ period, [category]: gmv, ... }]
+};
+
+/**
+ * GMV by (period × category), keeping the top-N categories (by total GMV) and
+ * bucketing the rest as "Other" — shaped for a stacked bar chart.
+ */
+export function categoryByPeriod(rows: SoldExportRow[], period: ExportPeriod, topN = 8): CategoryByPeriod {
+  const catTotals = new Map<string, number>();
+  for (const r of rows) {
+    const c = r.category || "Uncategorized";
+    catTotals.set(c, (catTotals.get(c) ?? 0) + (r.sale_amount_usd ?? 0));
+  }
+  const topCats = [...catTotals.entries()].sort((a, b) => b[1] - a[1]).slice(0, topN).map((e) => e[0]);
+  const topSet = new Set(topCats);
+  const categories = [...topCats, "Other"];
+
+  const periodMap = new Map<string, Record<string, number>>();
+  for (const r of rows) {
+    const p = periodKey(r.close_date_et, period);
+    const c0 = r.category || "Uncategorized";
+    const cat = topSet.has(c0) ? c0 : "Other";
+    let bucket = periodMap.get(p);
+    if (!bucket) {
+      bucket = Object.fromEntries(categories.map((c) => [c, 0]));
+      periodMap.set(p, bucket);
+    }
+    bucket[cat] += r.sale_amount_usd ?? 0;
+  }
+
+  const data = [...periodMap.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([p, vals]) => ({
+      period: p,
+      ...Object.fromEntries(categories.map((c) => [c, Math.round(vals[c] ?? 0)])),
+    }));
+  return { categories, data };
+}
+
 /** Aggregate GMV (Σ USD) + lot count by period × site × type × market. */
 export function aggregateExport(rows: SoldExportRow[], period: ExportPeriod): PivotRow[] {
   const map = new Map<string, PivotRow>();

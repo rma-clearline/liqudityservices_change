@@ -2,10 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
 import { downloadCsv, toCsv } from "@/lib/format";
-import { etMonthKey, etWeekKey, parseQuarterLabel } from "@/lib/time";
+import { etMonthKey, etQuarterKey, etWeekKey, parseQuarterLabel } from "@/lib/time";
 import { GmvExportModal } from "./gmv-export-modal";
 import {
   ComposedChart,
+  BarChart,
   Bar,
   Line,
   XAxis,
@@ -23,10 +24,16 @@ type DailyPoint = {
   domestic_realized_gmv_usd: number;
   international_realized_gmv_usd: number;
   projected_gmv_usd: number;
+  ad_realized_gmv_usd: number;
+  gd_realized_gmv_usd: number;
+  gi_realized_gmv_usd: number;
   realized_revenue_usd: number;
   domestic_realized_revenue_usd: number;
   international_realized_revenue_usd: number;
   projected_revenue_usd: number;
+  ad_realized_revenue_usd: number;
+  gd_realized_revenue_usd: number;
+  gi_realized_revenue_usd: number;
 };
 
 type PlatformForecast = {
@@ -163,6 +170,17 @@ const CHART_MARKET_OPTIONS = SALES_MARKET_OPTIONS;
 
 const DEFAULT_CHART_MARKET: SalesMarketFilter = "all";
 const STOCK_TICKER = "LQDT";
+
+// Source = true marketplace. Selecting a specific source shows that source's
+// realized GMV/revenue; it's mutually exclusive with the market split (the
+// underlying data has per-source OR per-market totals, not the cross).
+type SourceFilter = "all" | "AD" | "GD" | "GI";
+const CHART_SOURCE_OPTIONS: { value: SourceFilter; label: string }[] = [
+  { value: "all", label: "All sources" },
+  { value: "AD", label: "AllSurplus" },
+  { value: "GD", label: "GovDeals" },
+  { value: "GI", label: "Industrial" },
+];
 
 const SALES_SORT_OPTIONS: { value: SalesSortKey; label: string }[] = [
   { value: "amount", label: "Amount" },
@@ -591,13 +609,18 @@ type FetchState = { forecast: Forecast | null; error: string | null; done: boole
 
 type ChartMetric = "gmv" | "revenue";
 
-function realizedValueForMarket(point: DailyPoint, metric: ChartMetric, market: SalesMarketFilter) {
-  if (metric === "revenue") {
+function realizedValue(point: DailyPoint, metric: ChartMetric, market: SalesMarketFilter, source: SourceFilter) {
+  const revenue = metric === "revenue";
+  if (source !== "all") {
+    if (source === "AD") return revenue ? point.ad_realized_revenue_usd : point.ad_realized_gmv_usd;
+    if (source === "GD") return revenue ? point.gd_realized_revenue_usd : point.gd_realized_gmv_usd;
+    return revenue ? point.gi_realized_revenue_usd : point.gi_realized_gmv_usd; // GI
+  }
+  if (revenue) {
     if (market === "domestic") return point.domestic_realized_revenue_usd;
     if (market === "international") return point.international_realized_revenue_usd;
     return point.realized_revenue_usd;
   }
-
   if (market === "domestic") return point.domestic_realized_gmv_usd;
   if (market === "international") return point.international_realized_gmv_usd;
   return point.realized_gmv_usd;
@@ -626,10 +649,16 @@ function bucketDaily(daily: DailyPoint[], granularity: Granularity): DailyPoint[
         domestic_realized_gmv_usd: 0,
         international_realized_gmv_usd: 0,
         projected_gmv_usd: 0,
+        ad_realized_gmv_usd: 0,
+        gd_realized_gmv_usd: 0,
+        gi_realized_gmv_usd: 0,
         realized_revenue_usd: 0,
         domestic_realized_revenue_usd: 0,
         international_realized_revenue_usd: 0,
         projected_revenue_usd: 0,
+        ad_realized_revenue_usd: 0,
+        gd_realized_revenue_usd: 0,
+        gi_realized_revenue_usd: 0,
       };
       map.set(key, agg);
     }
@@ -637,10 +666,16 @@ function bucketDaily(daily: DailyPoint[], granularity: Granularity): DailyPoint[
     agg.domestic_realized_gmv_usd += d.domestic_realized_gmv_usd;
     agg.international_realized_gmv_usd += d.international_realized_gmv_usd;
     agg.projected_gmv_usd += d.projected_gmv_usd;
+    agg.ad_realized_gmv_usd += d.ad_realized_gmv_usd;
+    agg.gd_realized_gmv_usd += d.gd_realized_gmv_usd;
+    agg.gi_realized_gmv_usd += d.gi_realized_gmv_usd;
     agg.realized_revenue_usd += d.realized_revenue_usd;
     agg.domestic_realized_revenue_usd += d.domestic_realized_revenue_usd;
     agg.international_realized_revenue_usd += d.international_realized_revenue_usd;
     agg.projected_revenue_usd += d.projected_revenue_usd;
+    agg.ad_realized_revenue_usd += d.ad_realized_revenue_usd;
+    agg.gd_realized_revenue_usd += d.gd_realized_revenue_usd;
+    agg.gi_realized_revenue_usd += d.gi_realized_revenue_usd;
   }
   return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
 }
@@ -649,6 +684,7 @@ function DailyForecastChart({
   daily,
   metric,
   market,
+  source,
   granularity,
   showStock,
   stockByDate,
@@ -660,6 +696,7 @@ function DailyForecastChart({
   daily: DailyPoint[];
   metric: ChartMetric;
   market: SalesMarketFilter;
+  source: SourceFilter;
   granularity: Granularity;
   showStock: boolean;
   stockByDate: Record<string, number>;
@@ -668,10 +705,13 @@ function DailyForecastChart({
   isCurrent: boolean;
   onSelectDate: (date: string) => void;
 }) {
+  // Projected (future open auctions) only has meaning for the unfiltered total —
+  // it isn't split by market or source — so show it only when both are "All".
+  const showProjected = market === "all" && source === "all";
   const data = daily.map((d) => ({
     date: d.date,
-    Realized: realizedValueForMarket(d, metric, market),
-    Projected: market === "all" ? (metric === "gmv" ? d.projected_gmv_usd : d.projected_revenue_usd) : 0,
+    Realized: realizedValue(d, metric, market, source),
+    Projected: showProjected ? (metric === "gmv" ? d.projected_gmv_usd : d.projected_revenue_usd) : 0,
     Stock: showStock ? stockByDate[d.date] ?? null : null,
   }));
   const hasAny = data.some((d) => d.Realized > 0 || d.Projected > 0);
@@ -735,7 +775,7 @@ function DailyForecastChart({
             <ReferenceLine x={todayLabel} stroke="#9ca3af" strokeDasharray="4 2" label={{ value: "today", position: "top", fontSize: 10, fill: "#6b7280" }} />
           )}
           <Bar yAxisId="money" dataKey="Realized" stackId="a" fill="#2563eb" cursor="pointer" />
-          {market === "all" && <Bar yAxisId="money" dataKey="Projected" stackId="a" fill="#93c5fd" cursor="pointer" />}
+          {showProjected && <Bar yAxisId="money" dataKey="Projected" stackId="a" fill="#93c5fd" cursor="pointer" />}
           {hasStock && (
             <Line
               yAxisId="stock"
@@ -754,13 +794,197 @@ function DailyForecastChart({
   );
 }
 
+// --- Feature helpers/components -------------------------------------------
+
+/** QTD realized (GMV + revenue) for the quarter containing `asOf`, through that day. */
+function qtdRealizedAsOf(daily: DailyPoint[], asOf: string): { gmv: number; revenue: number; days: number } | null {
+  if (!asOf) return null;
+  const q = etQuarterKey(asOf);
+  const inQ = daily.filter((d) => d.date <= asOf && etQuarterKey(d.date) === q);
+  if (inQ.length === 0) return null;
+  return {
+    gmv: inQ.reduce((s, d) => s + d.realized_gmv_usd, 0),
+    revenue: inQ.reduce((s, d) => s + d.realized_revenue_usd, 0),
+    days: inQ.length,
+  };
+}
+
+type PeriodRow = { period: string; gmv: number; revenue: number; seq: number | null; yoy: number | null; partial: boolean };
+
+// Same formula works for month ("YYYY-MM") and quarter ("YYYYQn") keys.
+const priorYearKey = (k: string) => `${Number(k.slice(0, 4)) - 1}${k.slice(4)}`;
+
+function buildPeriodRows(daily: DailyPoint[], keyFn: (d: string) => string, currentKey: string): PeriodRow[] {
+  const map = new Map<string, { gmv: number; revenue: number }>();
+  for (const d of daily) {
+    const k = keyFn(d.date);
+    const b = map.get(k) ?? { gmv: 0, revenue: 0 };
+    b.gmv += d.realized_gmv_usd;
+    b.revenue += d.realized_revenue_usd;
+    map.set(k, b);
+  }
+  const keys = [...map.keys()].sort((a, b) => a.localeCompare(b));
+  return keys.map((k, i) => {
+    const cur = map.get(k)!;
+    const prevSeq = i > 0 ? map.get(keys[i - 1]) : undefined;
+    const prevYoy = map.get(priorYearKey(k));
+    return {
+      period: k,
+      gmv: cur.gmv,
+      revenue: cur.revenue,
+      seq: prevSeq && prevSeq.gmv > 0 ? (cur.gmv - prevSeq.gmv) / prevSeq.gmv : null,
+      yoy: prevYoy && prevYoy.gmv > 0 ? (cur.gmv - prevYoy.gmv) / prevYoy.gmv : null,
+      partial: k === currentKey,
+    };
+  });
+}
+
+function GrowthPct({ v }: { v: number | null }) {
+  if (v == null) return <span className="text-gray-300">—</span>;
+  return (
+    <span className={v >= 0 ? "text-green-600" : "text-red-600"}>
+      {v >= 0 ? "+" : ""}
+      {(v * 100).toFixed(1)}%
+    </span>
+  );
+}
+
+function PeriodTable({ title, seqLabel, rows }: { title: string; seqLabel: string; rows: PeriodRow[] }) {
+  if (rows.length === 0) return null;
+  return (
+    <div className="overflow-x-auto">
+      <h4 className="mb-1 text-xs font-semibold uppercase text-gray-500">{title}</h4>
+      <table className="w-full border-collapse text-sm">
+        <thead>
+          <tr className="border-b-2 border-gray-300 text-left">
+            <th className="py-1 pr-4">Period</th>
+            <th className="py-1 pr-4 text-right">GMV</th>
+            <th className="py-1 pr-4 text-right">Revenue</th>
+            <th className="py-1 pr-4 text-right">{seqLabel}</th>
+            <th className="py-1 text-right">Y/Y</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.period} className="border-b border-gray-100">
+              <td className="py-1 pr-4 whitespace-nowrap">
+                {r.period}
+                {r.partial && <span className="ml-1 text-xs text-amber-600">(partial)</span>}
+              </td>
+              <td className="py-1 pr-4 text-right tabular-nums">{fmtDollar(r.gmv)}</td>
+              <td className="py-1 pr-4 text-right tabular-nums text-gray-500">{fmtDollar(r.revenue)}</td>
+              <td className="py-1 pr-4 text-right tabular-nums"><GrowthPct v={r.seq} /></td>
+              <td className="py-1 text-right tabular-nums"><GrowthPct v={r.yoy} /></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Monthly + quarterly realized GMV with sequential (MoM/QoQ) and Y/Y growth. */
+function GmvGrowthTable({ daily }: { daily: DailyPoint[] }) {
+  const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const monthly = buildPeriodRows(daily, etMonthKey, etMonthKey(todayKey));
+  const quarterly = buildPeriodRows(daily, etQuarterKey, etQuarterKey(todayKey));
+  if (monthly.length === 0 && quarterly.length === 0) return null;
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-gray-400">
+        Realized GMV/revenue by period (this view — select &ldquo;All (full history)&rdquo; for the complete series). Δ is sequential
+        growth; Y/Y shows &ldquo;—&rdquo; until a prior-year period exists (~2 years of data).
+      </p>
+      <div className="grid gap-6 lg:grid-cols-2">
+        <PeriodTable title="Monthly" seqLabel="MoM" rows={monthly} />
+        <PeriodTable title="Quarterly" seqLabel="QoQ" rows={quarterly} />
+      </div>
+    </div>
+  );
+}
+
+const CATEGORY_COLORS = [
+  "#2563eb", "#16a34a", "#dc2626", "#d97706", "#7c3aed", "#0891b2", "#db2777", "#65a30d", "#94a3b8",
+];
+
+/** Stacked quarterly revenue (GMV × take rate) by category, from the sold archive. */
+function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string; takeRate: number }) {
+  const [state, setState] = useState<{
+    loading: boolean;
+    error: string | null;
+    categories: string[];
+    data: Array<Record<string, number | string>>;
+    truncated: boolean;
+  }>({ loading: true, error: null, categories: [], data: [], truncated: false });
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/gmv-by-category?from=${from}&to=${to}&period=quarter`)
+      .then(async (r) => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        return d;
+      })
+      .then((d) => {
+        if (!cancelled) {
+          setState({ loading: false, error: null, categories: d.categories ?? [], data: d.data ?? [], truncated: Boolean(d.truncated) });
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) setState((s) => ({ ...s, loading: false, error: e instanceof Error ? e.message : String(e) }));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [from, to]);
+
+  if (state.loading) {
+    return <p className="py-8 text-center text-sm text-gray-500">Loading category breakdown… (querying the sold archive can take ~10s)</p>;
+  }
+  if (state.error) return <p className="py-4 text-sm text-red-600">Category breakdown unavailable: {state.error}</p>;
+  if (state.data.length === 0) return <p className="py-4 text-sm text-gray-500">No category data in range.</p>;
+
+  const data = state.data.map((row) => {
+    const out: Record<string, number | string> = { period: row.period };
+    for (const c of state.categories) out[c] = Math.round(Number(row[c] ?? 0) * takeRate);
+    return out;
+  });
+
+  return (
+    <div>
+      <ResponsiveContainer width="100%" height={340}>
+        <BarChart data={data} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey="period" tick={{ fontSize: 11 }} />
+          <YAxis
+            tickFormatter={(v: number) => (v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : (v / 1000).toFixed(0) + "k")}
+            tick={{ fontSize: 11 }}
+          />
+          <Tooltip formatter={(v) => (typeof v === "number" ? "$" + v.toLocaleString() : v)} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          {state.categories.map((c, i) => (
+            <Bar key={c} dataKey={c} stackId="cat" fill={CATEGORY_COLORS[i % CATEGORY_COLORS.length]} />
+          ))}
+        </BarChart>
+      </ResponsiveContainer>
+      <p className="mt-1 text-xs text-gray-400">
+        Revenue = category GMV × {(takeRate * 100).toFixed(0)}% take rate, from the sold archive.
+        {state.truncated ? " Value-ranked sample (top lots by value) — captures most GMV, not every tail lot." : ""}
+      </p>
+    </div>
+  );
+}
+
 export function RevenueForecast() {
   const [takeRate, setTakeRate] = useState(0.2);
   const [quarter, setQuarter] = useState<string | null>(null);
   const [chartMetric, setChartMetric] = useState<ChartMetric>("gmv");
   const [chartMarket, setChartMarket] = useState<SalesMarketFilter>(DEFAULT_CHART_MARKET);
+  const [chartSource, setChartSource] = useState<SourceFilter>("all");
   const [granularity, setGranularity] = useState<Granularity>("day");
   const [showExport, setShowExport] = useState(false);
+  const [qtdDate, setQtdDate] = useState("");
+  const [showCategory, setShowCategory] = useState(false);
   const [showStockPrice, setShowStockPrice] = useState(false);
   const [stockState, setStockState] = useState<StockState>({
     ticker: STOCK_TICKER,
@@ -868,7 +1092,14 @@ export function RevenueForecast() {
   const dailyEnd = forecast.daily[forecast.daily.length - 1]?.date;
   const dailyRange = dailyStart && dailyEnd ? `${dailyStart} to ${dailyEnd}` : forecast.quarter;
   const chartMarketLabel = chartMarket === "all" ? "" : `${CHART_MARKET_OPTIONS.find((option) => option.value === chartMarket)?.label ?? ""} `;
+  const chartSliceLabel =
+    chartSource !== "all"
+      ? `${CHART_SOURCE_OPTIONS.find((o) => o.value === chartSource)?.label ?? ""} `
+      : chartMarketLabel;
+  // Cheap derived values (≤ ~458 rows); computed inline since this is past the
+  // component's early returns where hooks can't be called.
   const chartDaily = bucketDaily(forecast.daily, granularity);
+  const qtd = qtdRealizedAsOf(forecast.daily, qtdDate);
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
   // Export defaults to the FULL history (earliest quarter we track → today),
   // regardless of the quarter currently selected in the chart. Analysts narrow
@@ -927,9 +1158,36 @@ export function RevenueForecast() {
         <Card label={totalRevLabel} value={fmtDollar(forecast.projected_total_revenue_usd)} strong />
       </div>
 
+      <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-gray-50 p-3 text-sm">
+        <label className="flex items-center gap-2 text-gray-600">
+          QTD as of
+          <input
+            type="date"
+            value={qtdDate}
+            onChange={(e) => setQtdDate(e.target.value)}
+            className="rounded border px-2 py-0.5 text-sm text-gray-900"
+          />
+        </label>
+        {qtd ? (
+          <span className="text-gray-700">
+            <strong>{etQuarterKey(qtdDate)}</strong> realized through {qtdDate}:{" "}
+            <strong className="text-gray-900">{fmtDollar(qtd.revenue)}</strong> revenue ·{" "}
+            {fmtDollar(qtd.gmv)} GMV <span className="text-gray-400">({qtd.days} days in)</span>
+          </span>
+        ) : qtdDate ? (
+          <span className="text-xs text-gray-400">
+            No realized data for that date in this view — switch the Quarter selector to &ldquo;All (full history)&rdquo;.
+          </span>
+        ) : (
+          <span className="text-xs text-gray-400">
+            Pick a date to see quarter-to-date realized revenue as of that day (compare the QTD pace vs full-quarter guidance).
+          </span>
+        )}
+      </div>
+
       <div>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h3 className="text-sm font-semibold text-gray-700">{GRANULARITY_LABEL[granularity]} {chartMarketLabel}{chartMetric === "gmv" ? "GMV" : "Revenue"} - {dailyRange}</h3>
+          <h3 className="text-sm font-semibold text-gray-700">{GRANULARITY_LABEL[granularity]} {chartSliceLabel}{chartMetric === "gmv" ? "GMV" : "Revenue"} - {dailyRange}</h3>
           <div className="flex flex-wrap gap-2">
             <div className="flex gap-1">
               {(["day", "week", "month"] as Granularity[]).map((g) => (
@@ -950,10 +1208,33 @@ export function RevenueForecast() {
               {CHART_MARKET_OPTIONS.map((option) => (
                 <button
                   key={option.value}
-                  onClick={() => setChartMarket(option.value)}
+                  // Market and source are mutually exclusive (no source×market data).
+                  onClick={() => {
+                    setChartMarket(option.value);
+                    if (option.value !== "all") setChartSource("all");
+                  }}
                   className={`px-2 py-0.5 text-xs rounded border transition-colors ${
                     chartMarket === option.value
                       ? "bg-gray-900 text-white border-gray-900"
+                      : "bg-white text-gray-600 border-gray-300 hover:border-gray-400"
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-1">
+              {CHART_SOURCE_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  onClick={() => {
+                    setChartSource(option.value);
+                    if (option.value !== "all") setChartMarket("all");
+                  }}
+                  title="Filter by source (marketplace)"
+                  className={`px-2 py-0.5 text-xs rounded border transition-colors ${
+                    chartSource === option.value
+                      ? "bg-indigo-600 text-white border-indigo-600"
                       : "bg-white text-gray-600 border-gray-300 hover:border-gray-400"
                   }`}
                 >
@@ -998,6 +1279,7 @@ export function RevenueForecast() {
           daily={chartDaily}
           metric={chartMetric}
           market={chartMarket}
+          source={chartSource}
           granularity={granularity}
           showStock={showStockPrice && !stockError && granularity === "day"}
           stockByDate={stockByDate}
@@ -1006,6 +1288,21 @@ export function RevenueForecast() {
           isCurrent={forecast.is_current}
           onSelectDate={setSelectedSalesDate}
         />
+      </div>
+
+      <GmvGrowthTable daily={forecast.daily} />
+
+      <div>
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-semibold text-gray-700">Quarterly revenue by category</h3>
+          <button
+            onClick={() => setShowCategory((v) => !v)}
+            className="rounded border border-gray-300 bg-white px-2.5 py-1 text-xs text-gray-700 hover:bg-gray-50"
+          >
+            {showCategory ? "Hide" : "Show category breakdown"}
+          </button>
+        </div>
+        {showCategory && <CategoryRevenueChart from={exportFrom} to={exportTo} takeRate={takeRate} />}
       </div>
 
       {!isAll && ad && <PlatformBlock label="AllSurplus" color="text-blue-600" p={ad} />}

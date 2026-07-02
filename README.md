@@ -59,7 +59,7 @@ each fetching only the data it needs:
 /             — Listings: active-listing trend chart + history table + email snapshot
 /overview     — Executive summary (realized/projected GMV reconciliation) + listing counts
 /forecast     — Quarterly revenue/GMV forecast
-/marketplace  — Marketplace metrics + top sellers + seller movers
+/marketplace  — Top sellers + seller movers
 /contracts    — Federal contracts, SAM.gov opportunities, and state/local contracts
 ```
 

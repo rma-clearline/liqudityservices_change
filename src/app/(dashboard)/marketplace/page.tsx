@@ -1,6 +1,5 @@
 import { supabase } from "@/lib/supabase";
-import type { MarketplaceMetricsRow, MarketplaceSellerRow, SellerDeltaRow } from "@/lib/supabase";
-import { MarketplaceMetrics } from "@/components/marketplace-metrics";
+import type { MarketplaceSellerRow, SellerDeltaRow } from "@/lib/supabase";
 import { TopSellers } from "@/components/top-sellers";
 import { SellerMovers } from "@/components/seller-movers";
 import { SectionHeader } from "@/components/section-header";
@@ -8,13 +7,7 @@ import { SectionHeader } from "@/components/section-header";
 export const dynamic = "force-dynamic";
 
 export default async function MarketplacePage() {
-  const [metricsRes, sellersRes, deltasRes] = await Promise.all([
-    supabase
-      .from("marketplace_metrics")
-      .select("*")
-      .order("date", { ascending: false })
-      .order("timestamp", { ascending: false })
-      .limit(2),
+  const [sellersRes, deltasRes] = await Promise.all([
     supabase
       .from("marketplace_sellers")
       .select("*")
@@ -23,10 +16,6 @@ export default async function MarketplacePage() {
       .limit(200),
     supabase.from("marketplace_seller_deltas").select("*").limit(500),
   ]);
-
-  const metricsRows: MarketplaceMetricsRow[] = metricsRes.data ?? [];
-  const latestAllsurplus = metricsRows.find((r) => r.platform === "AD") ?? null;
-  const latestGovdeals = metricsRows.find((r) => r.platform === "GD") ?? null;
 
   const allSellers: MarketplaceSellerRow[] = sellersRes.data ?? [];
   const latestSellerDate = allSellers[0]?.date;
@@ -38,11 +27,6 @@ export default async function MarketplacePage() {
 
   return (
     <div className="space-y-10">
-      <section>
-        <SectionHeader title="Marketplace Metrics" source="marketplace_metrics" table="marketplace_metrics" />
-        <MarketplaceMetrics allsurplus={latestAllsurplus} govdeals={latestGovdeals} />
-      </section>
-
       <section>
         <SectionHeader title="Top Sellers" source="marketplace_metrics" table="marketplace_sellers" />
         <div className="space-y-6">

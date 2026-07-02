@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase";
 import { scrapeListings } from "@/lib/scraper";
-import { scrapeMarketplaceMetrics, type PlatformMetrics, type SellerInfo } from "@/lib/marketplace-metrics";
+import { scrapeMarketplaceMetrics, type SellerInfo } from "@/lib/marketplace-metrics";
 import { ingestAuctions } from "@/lib/auctions";
 import { fetchNewContracts, fetchContractSummary } from "@/lib/contracts";
 import { fetchSamOpportunities } from "@/lib/sam-opportunities";
@@ -53,49 +53,13 @@ export async function GET(request: Request) {
     }),
   );
 
+  // The marketplace_metrics cards were removed from the UI; we no longer persist
+  // that table. This task still scrapes the marketplace to populate
+  // marketplace_sellers, which powers the Government Sellers widget (Contracts).
   const metricsTask = logger.track(
     "marketplace_metrics",
     async () => {
       const metrics = await scrapeMarketplaceMetrics();
-      const metricRow = (m: PlatformMetrics) => ({
-        date,
-        timestamp,
-        platform: m.platform,
-        total_listings: m.total_listings,
-        total_bids: m.total_bids,
-        avg_bids_per_listing: m.avg_bids_per_listing,
-        total_current_price: m.total_current_price,
-        listings_with_bids: m.listings_with_bids,
-        bid_rate: m.bid_rate,
-        unique_seller_count: m.unique_seller_count,
-        listings_closing_24h: m.listings_closing_24h,
-        avg_watch_count: m.avg_watch_count,
-        listings_with_reserve: m.listings_with_reserve,
-        reserve_rate: m.reserve_rate,
-        top_categories: m.top_categories,
-        sample_size: m.sample_size,
-        pages_fetched: m.pages_fetched,
-        is_full_coverage: m.is_full_coverage,
-      });
-      // A fetch failure yields sample_size 0. Persisting that all-zero row would
-      // overwrite the last good snapshot for the day and blank the dashboard's
-      // "latest" marketplace view. Only write platforms that actually returned
-      // listings; if both failed, skip the write and report the run failed.
-      const metricsRows = [metrics.allsurplus, metrics.govdeals]
-        .filter((m) => m.sample_size > 0)
-        .map(metricRow);
-      let metricsError: string | null = null;
-      if (metricsRows.length > 0) {
-        const { error } = await supabaseAdmin
-          .from("marketplace_metrics")
-          .upsert(metricsRows, { onConflict: "date,platform" });
-        metricsError = error?.message ?? null;
-      } else {
-        metricsError =
-          `both platforms returned 0 listings (AD: ${metrics.allsurplus.debug ?? "?"}; ` +
-          `GD: ${metrics.govdeals.debug ?? "?"}) — skipped write to preserve last good snapshot`;
-      }
-
       const sellerRow = (s: SellerInfo, platform: "AD" | "GD") => ({
         date,
         platform,
@@ -114,33 +78,33 @@ export async function GET(request: Request) {
         ...metrics.govdeals.sellers.map((s) => sellerRow(s, "GD")),
       ];
       let sellersStored = 0;
+      let sellersError: string | null = null;
       if (sellerRows.length > 0) {
-        const { error: sellerErr } = await supabaseAdmin
+        const { error } = await supabaseAdmin
           .from("marketplace_sellers")
           .upsert(sellerRows, { onConflict: "date,platform,account_id" });
-        sellersStored = sellerErr ? 0 : sellerRows.length;
+        sellersError = error?.message ?? null;
+        sellersStored = error ? 0 : sellerRows.length;
       }
+      // scrapeMarketplaceMetrics never throws; a total fetch failure returns
+      // empty metrics (sample_size 0, no sellers). Surface that as a failed run
+      // rather than a silent 0-row "success" (which would leave the freshness
+      // badge green during an outage).
+      const scrapeFailed = metrics.allsurplus.sample_size === 0 && metrics.govdeals.sample_size === 0;
       return {
-        metricsError,
-        metricsWritten: metricsRows.length,
         sellersStored,
+        sellersError,
+        scrapeFailed,
         adSample: metrics.allsurplus.sample_size,
         gdSample: metrics.govdeals.sample_size,
-        adCoverage: metrics.allsurplus.is_full_coverage,
-        gdCoverage: metrics.govdeals.is_full_coverage,
+        scrapeDebug: `AD: ${metrics.allsurplus.debug ?? "?"}; GD: ${metrics.govdeals.debug ?? "?"}`,
       };
     },
     (r): SourceSummary => ({
-      status: r.metricsError && r.metricsWritten === 0 ? "failed" : r.metricsError ? "partial" : "success",
-      rows: r.metricsWritten + r.sellersStored,
-      detail: {
-        adSample: r.adSample,
-        gdSample: r.gdSample,
-        adCoverage: r.adCoverage,
-        gdCoverage: r.gdCoverage,
-        sellersStored: r.sellersStored,
-      },
-      error: r.metricsError,
+      status: r.sellersError || r.scrapeFailed ? "failed" : "success",
+      rows: r.sellersStored,
+      detail: { adSample: r.adSample, gdSample: r.gdSample, sellersStored: r.sellersStored },
+      error: r.sellersError ?? (r.scrapeFailed ? `marketplace scrape returned 0 listings (${r.scrapeDebug})` : null),
     }),
   );
 

@@ -8,7 +8,6 @@ export const dynamic = "force-dynamic";
 // migration) so the endpoint degrades gracefully instead of reporting "no data".
 const TABLE_FRESHNESS: { table: string; column: string; fallback?: string }[] = [
   { table: "listings", column: "date" },
-  { table: "marketplace_metrics", column: "date" },
   { table: "marketplace_sellers", column: "date" },
   { table: "auctions", column: "last_seen_at" },
   { table: "federal_contracts", column: "first_seen_date" },

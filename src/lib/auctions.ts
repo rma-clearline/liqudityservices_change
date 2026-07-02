@@ -49,9 +49,14 @@ type HistoricalPlatformDailyGmv = {
   soldLots: number;
 };
 
+// Source (true marketplace) keys carried in the daily series so the chart can
+// toggle by source. GI (industrial) is historical-only — it isn't tracked live.
+type SourceKey = "AD" | "GD" | "GI";
+const SOURCE_KEYS: SourceKey[] = ["AD", "GD", "GI"];
+
 type HistoricalDailyGmvData = {
   totals: Map<string, HistoricalDailyGmv>;
-  platforms: Map<"AD" | "GD", Map<string, HistoricalPlatformDailyGmv>>;
+  platforms: Map<SourceKey, Map<string, HistoricalPlatformDailyGmv>>;
 };
 
 function historicalCsvPath(rawPath: string | undefined, fallbackFile: string) {
@@ -67,10 +72,9 @@ function emptyHistoricalDailyGmv(): HistoricalDailyGmv {
 function emptyHistoricalDailyGmvData(): HistoricalDailyGmvData {
   return {
     totals: new Map(),
-    platforms: new Map([
-      ["AD", new Map()],
-      ["GD", new Map()],
-    ]),
+    platforms: new Map(
+      SOURCE_KEYS.map((k) => [k, new Map()] as [SourceKey, Map<string, HistoricalPlatformDailyGmv>]),
+    ),
   };
 }
 
@@ -122,7 +126,7 @@ async function loadHistoricalDailyGmv(): Promise<HistoricalDailyGmvData> {
       if (!Number.isFinite(gmv)) continue;
       const soldLots = safeNumber(soldLotsRaw, 0);
 
-      if (businessId === "AD" || businessId === "GD") {
+      if (businessId === "AD" || businessId === "GD" || businessId === "GI") {
         rows.platforms.get(businessId)?.set(date, { gmv, soldLots });
       }
       if (businessId !== "ALL") continue;
@@ -540,10 +544,17 @@ export type RevenueForecast = {
     domestic_realized_gmv_usd: number;
     international_realized_gmv_usd: number;
     projected_gmv_usd: number;
+    // Per-source realized (true marketplace). GI is historical-only.
+    ad_realized_gmv_usd: number;
+    gd_realized_gmv_usd: number;
+    gi_realized_gmv_usd: number;
     realized_revenue_usd: number;
     domestic_realized_revenue_usd: number;
     international_realized_revenue_usd: number;
     projected_revenue_usd: number;
+    ad_realized_revenue_usd: number;
+    gd_realized_revenue_usd: number;
+    gi_realized_revenue_usd: number;
   }[];
   projected_total_gmv_usd: number;
   projected_total_revenue_usd: number;
@@ -891,11 +902,20 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     }),
   );
 
-  const dailyMap = new Map<string, { realized: HistoricalDailyGmv; projected: number; hasHistoricalRealized: boolean }>();
+  const emptyBySource = (): Record<SourceKey, number> => ({ AD: 0, GD: 0, GI: 0 });
+  const dailyMap = new Map<
+    string,
+    { realized: HistoricalDailyGmv; bySource: Record<SourceKey, number>; projected: number; hasHistoricalRealized: boolean }
+  >();
   for (const day of chartDays) {
     const realized = historicalDailyGmv.totals.get(day);
+    const bySource = emptyBySource();
+    if (realized) {
+      for (const src of SOURCE_KEYS) bySource[src] = historicalDailyGmv.platforms.get(src)?.get(day)?.gmv ?? 0;
+    }
     dailyMap.set(day, {
       realized: realized ? { ...realized } : emptyHistoricalDailyGmv(),
+      bySource,
       projected: 0,
       hasHistoricalRealized: Boolean(realized),
     });
@@ -912,6 +932,8 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
         bucket.realized.all += amount;
         bucket.realized.domestic += amount;
         if (amount > 0) bucket.realized.soldLots += 1;
+        // Tracked auctions only cover AD/GD (GI is historical-only).
+        bucket.bySource[p.platform] += amount;
       }
     }
     for (const row of p.openProjections) {
@@ -925,17 +947,23 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   }
 
   const daily = chartDays.map((date) => {
-    const v = dailyMap.get(date) ?? { realized: emptyHistoricalDailyGmv(), projected: 0 };
+    const v = dailyMap.get(date) ?? { realized: emptyHistoricalDailyGmv(), bySource: emptyBySource(), projected: 0 };
     return {
       date,
       realized_gmv_usd: Math.round(v.realized.all),
       domestic_realized_gmv_usd: Math.round(v.realized.domestic),
       international_realized_gmv_usd: Math.round(v.realized.international),
       projected_gmv_usd: Math.round(v.projected),
+      ad_realized_gmv_usd: Math.round(v.bySource.AD),
+      gd_realized_gmv_usd: Math.round(v.bySource.GD),
+      gi_realized_gmv_usd: Math.round(v.bySource.GI),
       realized_revenue_usd: Math.round(v.realized.all * takeRate),
       domestic_realized_revenue_usd: Math.round(v.realized.domestic * takeRate),
       international_realized_revenue_usd: Math.round(v.realized.international * takeRate),
       projected_revenue_usd: Math.round(v.projected * takeRate),
+      ad_realized_revenue_usd: Math.round(v.bySource.AD * takeRate),
+      gd_realized_revenue_usd: Math.round(v.bySource.GD * takeRate),
+      gi_realized_revenue_usd: Math.round(v.bySource.GI * takeRate),
     };
   });
 
