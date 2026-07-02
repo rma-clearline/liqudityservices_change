@@ -18,13 +18,19 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 import { loadFxRates } from "./fx";
 import { buildSoldPayload, extractListings, MAESTRO_KEY, MAESTRO_URL, SOLD_SEARCH_PATH } from "./maestro";
-import { dateRangeForEtDay, etDateKey, etMonthKey, etQuarterKey, etWeekKey } from "./time";
+import { dateKeyToUtcDate, dateRangeForEtDay, etDateKey, etMonthKey, etQuarterKey, etWeekKey } from "./time";
 import { classifySellerLevel, type GovLevel } from "./gov-seller";
 import { isDomesticCountry, parseSale, rowKey, type HistoricalSaleRow } from "./historical-sales";
 
 const PAGE_SIZE = 1000;
-// 25 pages × 1000 = 25k top-value lots per export (env-overridable).
-const MAX_PAGES = Number(process.env.GMV_EXPORT_MAX_PAGES) || 25;
+// Maestro sorts the whole result set on every page, so wide windows are slow
+// (a 3-month window took ~35s and started returning 400s; a 1-week window is
+// sub-second). We split the range into ~weekly chunks and spend a bounded page
+// budget across them, value-ranked (currentBid desc) within each week. GMV is
+// top-heavy, so this still captures the large majority of GMV; narrow ranges
+// get complete coverage. All env-overridable.
+const CHUNK_DAYS = Number(process.env.GMV_EXPORT_CHUNK_DAYS) || 7;
+const PAGE_BUDGET = Number(process.env.GMV_EXPORT_PAGE_BUDGET) || 60;
 const RANGE_CACHE_MS = Number(process.env.GMV_EXPORT_CACHE_MS) || 5 * 60_000;
 
 export type ExportSite = "all" | "AD" | "GD" | "GI";
@@ -69,50 +75,144 @@ export type PivotRow = {
   lots: number;
 };
 
-async function fetchPage(fromDate: string, toDate: string, page: number) {
-  if (!MAESTRO_KEY) throw new Error("MAESTRO_API_KEY is not configured");
-  const res = await fetch(`${MAESTRO_URL}${SOLD_SEARCH_PATH}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": MAESTRO_KEY,
-      "x-user-id": "-1",
-      "x-api-correlation-id": randomUUID(),
-    },
-    // "AD" site = broadest sold archive (incl. GD/GI), sorted by currentBid desc.
-    body: JSON.stringify(buildSoldPayload("AD", fromDate, toDate, page, PAGE_SIZE)),
-    cache: "no-store",
-    signal: AbortSignal.timeout(60_000),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`Maestro HTTP ${res.status}: ${text.slice(0, 300)}`);
-  const data = JSON.parse(text);
-  return { rows: extractListings(data), total: Number(res.headers.get("x-total-count") ?? 0) };
+// Cap concurrent Maestro requests: firing many sold-page requests at once makes
+// Maestro 400 ("exception logged for Correlation ID …") or drop connections.
+const CONCURRENCY = Number(process.env.GMV_EXPORT_CONCURRENCY) || 4;
+
+type PageResult = { rows: Record<string, unknown>[]; total: number; ok: boolean };
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function fetchPageOnce(fromIso: string, toIso: string, page: number): Promise<PageResult> {
+  try {
+    const res = await fetch(`${MAESTRO_URL}${SOLD_SEARCH_PATH}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": MAESTRO_KEY,
+        "x-user-id": "-1",
+        "x-api-correlation-id": randomUUID(),
+      },
+      // "AD" site = broadest sold archive (incl. GD/GI), sorted by currentBid desc.
+      body: JSON.stringify(buildSoldPayload("AD", fromIso, toIso, page, PAGE_SIZE)),
+      cache: "no-store",
+      signal: AbortSignal.timeout(45_000),
+    });
+    if (!res.ok) {
+      await res.text().catch(() => "");
+      return { rows: [], total: 0, ok: false };
+    }
+    const data = await res.json();
+    return { rows: extractListings(data), total: Number(res.headers.get("x-total-count") ?? 0), ok: true };
+  } catch {
+    return { rows: [], total: 0, ok: false };
+  }
+}
+
+/** Fetch one page with backoff retries — Maestro's failures here are transient. */
+async function fetchPage(fromIso: string, toIso: string, page: number, retries = 3): Promise<PageResult> {
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetchPageOnce(fromIso, toIso, page);
+    if (r.ok || attempt >= retries) return r;
+    await sleep(300 * 2 ** attempt);
+  }
+}
+
+/** Run async tasks with bounded concurrency, preserving input order. */
+async function runPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      results[idx] = await fn(items[idx]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+type Chunk = { fromIso: string; toIso: string };
+
+/** Split [from, to] (ET day keys) into ≤CHUNK_DAYS windows with UTC ISO bounds. */
+function chunkRange(from: string, to: string): Chunk[] {
+  const chunks: Chunk[] = [];
+  let cursor = from;
+  for (let guard = 0; cursor <= to && guard < 520; guard++) {
+    const startD = dateKeyToUtcDate(cursor);
+    if (!startD) break;
+    const endD = new Date(startD);
+    endD.setUTCDate(endD.getUTCDate() + (CHUNK_DAYS - 1));
+    let endKey = endD.toISOString().slice(0, 10);
+    if (endKey > to) endKey = to;
+    chunks.push({ fromIso: dateRangeForEtDay(cursor).fromDate, toIso: dateRangeForEtDay(endKey).toDate });
+    const next = new Date(startD);
+    next.setUTCDate(next.getUTCDate() + CHUNK_DAYS);
+    cursor = next.toISOString().slice(0, 10);
+  }
+  return chunks;
 }
 
 const rangeCache = new Map<string, { at: number; val: SoldExportFetch }>();
 
-/** Fetch + classify all sold lots in [from, to] (ET days), value-ranked, capped. */
+/**
+ * Fetch + classify sold lots in [from, to] (ET days). The range is split into
+ * weekly chunks; each chunk is paged value-ranked up to a share of the global
+ * page budget (breadth-first across chunks), so wide ranges stay fast/reliable
+ * while narrow ranges get complete coverage. Returns dedup'd, classified rows.
+ */
 export async function fetchSoldRange(from: string, to: string): Promise<SoldExportFetch> {
   const cacheKey = `${from}|${to}`;
   const hit = rangeCache.get(cacheKey);
   if (hit && Date.now() - hit.at < RANGE_CACHE_MS) return hit.val;
 
-  const { fromDate } = dateRangeForEtDay(from);
-  const { toDate } = dateRangeForEtDay(to);
+  if (!MAESTRO_KEY) throw new Error("MAESTRO_API_KEY is not configured");
 
-  const [fx, first] = await Promise.all([loadFxRates(), fetchPage(fromDate, toDate, 1)]);
-  const total = first.total;
-  const neededPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const pages = Math.min(MAX_PAGES, neededPages);
-  const truncated = neededPages > MAX_PAGES;
+  const fx = await loadFxRates();
+  const chunks = chunkRange(from, to);
+  if (chunks.length === 0) {
+    return { rows: [], total_in_range: 0, fetched: 0, truncated: false };
+  }
+  const pagesPerChunk = Math.max(1, Math.floor(PAGE_BUDGET / chunks.length));
 
-  const remaining = Array.from({ length: pages - 1 }, (_, i) => i + 2);
-  const rest = await Promise.all(remaining.map((p) => fetchPage(fromDate, toDate, p)));
+  // Phase 1: page 1 of every chunk (per-chunk totals + each week's top lots).
+  const firstPages = await runPool(chunks, CONCURRENCY, (c) => fetchPage(c.fromIso, c.toIso, 1));
+  if (firstPages.every((r) => !r.ok)) {
+    throw new Error("Maestro sold-archive request failed — please retry in a moment.");
+  }
+
+  let totalInRange = 0;
+  let truncated = false;
+  const takePerChunk = firstPages.map((r) => {
+    if (!r.ok) {
+      truncated = true;
+      return 0;
+    }
+    totalInRange += r.total;
+    const needed = Math.max(1, Math.ceil(r.total / PAGE_SIZE));
+    const take = Math.min(needed, pagesPerChunk);
+    if (needed > take) truncated = true;
+    return take;
+  });
+
+  // Phase 2: deeper pages, breadth-first (page 2 of all chunks, then page 3…),
+  // capped by the remaining budget so total requests stay bounded.
+  const maxTake = takePerChunk.reduce((m, t) => Math.max(m, t), 0);
+  const deeper: { chunk: Chunk; page: number }[] = [];
+  for (let p = 2; p <= maxTake; p++) {
+    takePerChunk.forEach((take, idx) => {
+      if (p <= take) deeper.push({ chunk: chunks[idx], page: p });
+    });
+  }
+  const budgetForDeeper = Math.max(0, PAGE_BUDGET - chunks.length);
+  const deeperCapped = deeper.slice(0, budgetForDeeper);
+  if (deeperCapped.length < deeper.length) truncated = true;
+  const deeperPages = await runPool(deeperCapped, CONCURRENCY, (t) => fetchPage(t.chunk.fromIso, t.chunk.toIso, t.page));
+  if (deeperPages.some((r) => !r.ok)) truncated = true;
 
   const seen = new Set<string>();
   const rows: SoldExportRow[] = [];
-  for (const raw of [first, ...rest].flatMap((r) => r.rows)) {
+  for (const raw of [...firstPages, ...deeperPages].flatMap((r) => r.rows)) {
     const key = rowKey(raw);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -131,7 +231,7 @@ export async function fetchSoldRange(from: string, to: string): Promise<SoldExpo
     });
   }
 
-  const val: SoldExportFetch = { rows, total_in_range: total, fetched: rows.length, truncated };
+  const val: SoldExportFetch = { rows, total_in_range: totalInRange, fetched: rows.length, truncated };
   rangeCache.set(cacheKey, { at: Date.now(), val });
   return val;
 }

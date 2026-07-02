@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
 import { downloadCsv, toCsv } from "@/lib/format";
-import { etMonthKey, etWeekKey } from "@/lib/time";
+import { etMonthKey, etWeekKey, parseQuarterLabel } from "@/lib/time";
 import { GmvExportModal } from "./gmv-export-modal";
 import {
   ComposedChart,
@@ -870,9 +870,13 @@ export function RevenueForecast() {
   const chartMarketLabel = chartMarket === "all" ? "" : `${CHART_MARKET_OPTIONS.find((option) => option.value === chartMarket)?.label ?? ""} `;
   const chartDaily = bucketDaily(forecast.daily, granularity);
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-  // Export defaults to the selected view's range, capped at today (sold data only).
-  const exportFrom = dailyStart ?? todayKey;
-  const exportTo = dailyEnd && dailyEnd < todayKey ? dailyEnd : todayKey;
+  // Export defaults to the FULL history (earliest quarter we track → today),
+  // regardless of the quarter currently selected in the chart. Analysts narrow
+  // it in the modal. available_quarters is chronological, so [0] is the oldest.
+  const earliestQuarter = forecast.available_quarters[0];
+  const parsedEarliest = earliestQuarter ? parseQuarterLabel(earliestQuarter) : null;
+  const exportFrom = parsedEarliest ? parsedEarliest.start.toISOString().slice(0, 10) : (dailyStart ?? todayKey);
+  const exportTo = todayKey;
 
   return (
     <div className="space-y-6">
