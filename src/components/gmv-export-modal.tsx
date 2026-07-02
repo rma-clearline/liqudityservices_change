@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { downloadCsv } from "@/lib/format";
+import { enumerateQuarterLabelsBetween, etQuarterKey, parseQuarterLabel } from "@/lib/time";
 
 const SITES = [
   { v: "all", l: "All sites" },
@@ -29,23 +30,52 @@ const PERIODS = [
   { v: "quarter", l: "Quarter" },
 ];
 
+const MAX_SUBRANGES = 12; // guard: at most ~3 years of quarters per export
+
+/**
+ * Quarter sub-ranges overlapping [from, to], each clamped to [from, to]. Quarters
+ * are date-disjoint, so each request is bounded (≈1 quarter → complete in one
+ * call) and the per-quarter CSVs concatenate with no cross-quarter duplicates.
+ */
+function quarterSubRanges(from: string, to: string): { from: string; to: string }[] {
+  const labels = enumerateQuarterLabelsBetween(etQuarterKey(from), etQuarterKey(to));
+  const out: { from: string; to: string }[] = [];
+  for (const label of labels) {
+    const q = parseQuarterLabel(label);
+    if (!q) continue;
+    const qStart = q.start.toISOString().slice(0, 10);
+    const qLast = new Date(q.end.getTime() - 86_400_000).toISOString().slice(0, 10); // last day of quarter
+    const subFrom = from > qStart ? from : qStart;
+    const subTo = to < qLast ? to : qLast;
+    if (subFrom <= subTo) out.push({ from: subFrom, to: subTo });
+  }
+  return out;
+}
+
 /**
  * Analyst-facing filter panel that drives /api/export/gmv. Two actions:
  *  • Raw transactions — one row per sold lot (Excel-ready detail).
  *  • Pivot summary — GMV + lot count by period × site × type × market.
- * The route is value-ranked + capped; we surface coverage from response headers.
+ * Wide ranges are split into per-quarter requests (each complete) and assembled,
+ * so the export doesn't lose data. Date inputs are clamped to the data range.
  */
 export function GmvExportModal({
   defaultFrom,
   defaultTo,
+  minDate,
+  maxDate,
   onClose,
 }: {
   defaultFrom: string;
   defaultTo: string;
+  minDate: string;
+  maxDate: string;
   onClose: () => void;
 }) {
-  const [from, setFrom] = useState(defaultFrom);
-  const [to, setTo] = useState(defaultTo);
+  const clampDate = (v: string) => (!v ? v : v < minDate ? minDate : v > maxDate ? maxDate : v);
+
+  const [from, setFrom] = useState(clampDate(defaultFrom));
+  const [to, setTo] = useState(clampDate(defaultTo));
   const [site, setSite] = useState("all");
   const [type, setType] = useState("all");
   const [market, setMarket] = useState("all");
@@ -55,45 +85,78 @@ export function GmvExportModal({
   const [maxUsd, setMaxUsd] = useState("");
   const [period, setPeriod] = useState("month");
   const [busy, setBusy] = useState<null | "raw" | "pivot">(null);
+  const [progress, setProgress] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const runExport = async (mode: "raw" | "pivot") => {
-    setBusy(mode);
     setError(null);
     setNotice(null);
-    const params = new URLSearchParams({ mode, from, to, site, type, market });
-    if (category.trim()) params.set("category", category.trim());
-    if (stateFilter.trim()) params.set("state", stateFilter.trim());
-    if (minUsd.trim()) params.set("minUsd", minUsd.trim());
-    if (maxUsd.trim()) params.set("maxUsd", maxUsd.trim());
-    if (mode === "pivot") params.set("period", period);
+    setProgress(null);
+
+    const f = clampDate(from);
+    const t = clampDate(to);
+    if (!f || !t || f > t) {
+      setError("Pick a valid date range (start on or before end, within the data range).");
+      return;
+    }
+    const subRanges = quarterSubRanges(f, t);
+    if (subRanges.length === 0) {
+      setError("No valid quarters in the selected range.");
+      return;
+    }
+    if (subRanges.length > MAX_SUBRANGES) {
+      setError(`Range spans ${subRanges.length} quarters (max ${MAX_SUBRANGES}). Narrow the dates.`);
+      return;
+    }
+
+    setBusy(mode);
     try {
-      const res = await fetch(`/api/export/gmv?${params.toString()}`);
-      if (!res.ok) {
-        let msg = `Export failed (${res.status})`;
-        try {
-          const j = await res.json();
-          if (j?.error) msg = j.error;
-        } catch {
-          /* non-JSON error body */
+      const parts: string[] = [];
+      let matched = 0;
+      let truncated = false;
+
+      for (let i = 0; i < subRanges.length; i++) {
+        const sr = subRanges[i];
+        if (subRanges.length > 1) setProgress(`Fetching ${etQuarterKey(sr.from)} — ${i + 1} of ${subRanges.length}…`);
+        const params = new URLSearchParams({ mode, from: sr.from, to: sr.to, site, type, market });
+        if (category.trim()) params.set("category", category.trim());
+        if (stateFilter.trim()) params.set("state", stateFilter.trim());
+        if (minUsd.trim()) params.set("minUsd", minUsd.trim());
+        if (maxUsd.trim()) params.set("maxUsd", maxUsd.trim());
+        if (mode === "pivot") params.set("period", period);
+
+        const res = await fetch(`/api/export/gmv?${params.toString()}`);
+        if (!res.ok) {
+          let msg = `Export failed for ${etQuarterKey(sr.from)} (${res.status})`;
+          try {
+            const j = await res.json();
+            if (j?.error) msg = j.error;
+          } catch {
+            /* non-JSON error body */
+          }
+          throw new Error(msg);
         }
-        throw new Error(msg);
+        matched += Number(res.headers.get("X-Export-Matched") ?? 0);
+        if (res.headers.get("X-Export-Truncated") === "true") truncated = true;
+
+        const csv = await res.text();
+        // Keep the header only from the first part; later parts contribute rows.
+        parts.push(i === 0 ? csv : csv.split("\n").slice(1).join("\n"));
       }
-      const total = Number(res.headers.get("X-Export-Total-In-Range") ?? 0);
-      const fetched = Number(res.headers.get("X-Export-Fetched") ?? 0);
-      const matched = Number(res.headers.get("X-Export-Matched") ?? 0);
-      const truncated = res.headers.get("X-Export-Truncated") === "true";
-      const csv = await res.text();
-      downloadCsv(`lqdt-gmv-${mode}-${from}_to_${to}.csv`, csv);
+
+      downloadCsv(`lqdt-gmv-${mode}-${f}_to_${t}.csv`, parts.join(""));
+      setProgress(null);
+      const span = `${subRanges.length} quarter${subRanges.length === 1 ? "" : "s"}`;
       setNotice(
         matched === 0
-          ? "No lots matched. Widen the date range or relax filters. (The sold archive starts ~mid-July 2025.)"
+          ? "No lots matched. Widen the date range or relax filters."
           : truncated
-            ? `Exported ${matched.toLocaleString()} matching lots. This range holds ${total.toLocaleString()} sold lots; the top ${fetched.toLocaleString()} by value were pulled — narrow the range or add filters for complete tail coverage.`
-            : `Exported ${matched.toLocaleString()} lots — complete coverage of this range and filters.`,
+            ? `Exported ${matched.toLocaleString()} lots across ${span}. Some chunks hit the safety cap — coverage may be slightly partial for an unusually dense quarter.`
+            : `Exported ${matched.toLocaleString()} lots — complete coverage across ${span}.`,
       );
     } catch (e) {
+      setProgress(null);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(null);
@@ -108,16 +171,14 @@ export function GmvExportModal({
       className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-4 overflow-y-auto"
       onClick={onClose}
     >
-      <div
-        className="mt-10 w-full max-w-2xl rounded-lg bg-white p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className="mt-10 w-full max-w-2xl rounded-lg bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="mb-4 flex items-start justify-between gap-4">
           <div>
             <h3 className="text-lg font-semibold">Export GMV data</h3>
             <p className="mt-0.5 text-xs text-gray-500">
-              Per-lot sold data for Excel. Filter, then export raw transactions or a pivot summary.
-              &ldquo;Type&rdquo; is by seller identity (government = federal/state/local agencies; retail = commercial).
+              Per-lot sold data for Excel. Filter, then export raw transactions or a pivot summary. &ldquo;Type&rdquo; is by
+              seller identity (government = federal/state/local agencies; retail = commercial). Wide ranges are fetched
+              per-quarter and combined.
             </p>
           </div>
           <button onClick={onClose} className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600" aria-label="Close">
@@ -128,11 +189,25 @@ export function GmvExportModal({
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
           <div>
             <label className={labelCls}>From</label>
-            <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className={field} />
+            <input
+              type="date"
+              value={from}
+              min={minDate}
+              max={maxDate}
+              onChange={(e) => setFrom(clampDate(e.target.value))}
+              className={field}
+            />
           </div>
           <div>
             <label className={labelCls}>To</label>
-            <input type="date" value={to} onChange={(e) => setTo(e.target.value)} className={field} />
+            <input
+              type="date"
+              value={to}
+              min={minDate}
+              max={maxDate}
+              onChange={(e) => setTo(clampDate(e.target.value))}
+              className={field}
+            />
           </div>
           <div>
             <label className={labelCls}>Site</label>
@@ -203,11 +278,12 @@ export function GmvExportModal({
           </div>
         </div>
 
+        {progress && <p className="mt-3 rounded bg-blue-50 p-2 text-xs text-blue-700">{progress}</p>}
         {notice && <p className="mt-3 rounded bg-gray-50 p-2 text-xs text-gray-600">{notice}</p>}
         {error && <p className="mt-3 rounded bg-red-50 p-2 text-xs text-red-600">Error: {error}</p>}
         <p className="mt-3 text-[11px] leading-relaxed text-gray-400">
-          Source: Maestro sold archive (realized hammer, USD via daily FX). Lots are ranked by value; very large ranges
-          export the top lots by GMV with a coverage note. Pivot columns: Period · Site · Type · Market · GMV · Lots.
+          Source: Maestro sold archive (realized hammer, USD via daily FX). Each quarter is fetched completely (every page),
+          so totals reconcile with the GMV chart. Pivot columns: Period · Site · Type · Market · GMV · Lots.
         </p>
       </div>
     </div>

@@ -25,7 +25,9 @@ export async function GET(request: Request) {
   const topN = Math.max(3, Math.min(15, Number(searchParams.get("topN")) || 8));
 
   try {
-    const fetched = await fetchSoldRange(from, to);
+    // Category composition only needs to surface outsized categories, so a fast
+    // value-ranked sample (bounded pages) is fine — the chart notes it's a sample.
+    const fetched = await fetchSoldRange(from, to, { maxPages: 80 });
     const { categories, data } = categoryByPeriod(fetched.rows, period, topN);
     return NextResponse.json({
       from,

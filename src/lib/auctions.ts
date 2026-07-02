@@ -521,6 +521,8 @@ export type RevenueForecast = {
   is_current: boolean;
   /** All selectable quarter labels (earliest data quarter → current), chronological. */
   available_quarters: string[];
+  /** Earliest YYYY-MM-DD with GMV data (drives date-input min bounds). */
+  earliest_data_date: string;
   platforms: {
     platform: "AD" | "GD";
     realized_gmv_usd: number;
@@ -558,6 +560,9 @@ export type RevenueForecast = {
   }[];
   projected_total_gmv_usd: number;
   projected_total_revenue_usd: number;
+  /** Realized-only totals (exclude the current-quarter projection). */
+  realized_total_gmv_usd: number;
+  realized_total_revenue_usd: number;
   debug: {
     now_iso: string;
     total_rows: number;
@@ -991,6 +996,10 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   const quarterDaily = daily.filter((row) => quarterDaySet.has(row.date));
   const projected_total_gmv_usd = quarterDaily.reduce((s, r) => s + r.realized_gmv_usd + r.projected_gmv_usd, 0);
   const projected_total_revenue_usd = quarterDaily.reduce((s, r) => s + r.realized_revenue_usd + r.projected_revenue_usd, 0);
+  // Realized-only totals: used as the "all data" headline (which is historical,
+  // so it must exclude the current quarter's open-auction projection).
+  const realized_total_gmv_usd = quarterDaily.reduce((s, r) => s + r.realized_gmv_usd, 0);
+  const realized_total_revenue_usd = quarterDaily.reduce((s, r) => s + r.realized_revenue_usd, 0);
 
   const debug = await collectDebug(nowIso, startIso, endIso);
 
@@ -1001,10 +1010,15 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     take_rate: takeRate,
     is_current: isCurrent,
     available_quarters: availableQuarters,
+    // Earliest day for which we have GMV data (drives date-input min bounds so
+    // users can't query dates with no data). Falls back to the view start.
+    earliest_data_date: historicalStartKey ?? start.toISOString().slice(0, 10),
     platforms: rows,
     daily,
     projected_total_gmv_usd,
     projected_total_revenue_usd,
+    realized_total_gmv_usd,
+    realized_total_revenue_usd,
     debug,
   };
 }

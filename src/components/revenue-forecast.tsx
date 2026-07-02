@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
 import { downloadCsv, toCsv } from "@/lib/format";
-import { etMonthKey, etQuarterKey, etWeekKey, parseQuarterLabel } from "@/lib/time";
+import { etMonthKey, etQuarterKey, etWeekKey } from "@/lib/time";
 import { GmvExportModal } from "./gmv-export-modal";
 import {
   ComposedChart,
@@ -65,6 +65,9 @@ type Forecast = {
   daily: DailyPoint[];
   projected_total_gmv_usd: number;
   projected_total_revenue_usd: number;
+  realized_total_gmv_usd: number;
+  realized_total_revenue_usd: number;
+  earliest_data_date: string;
 };
 
 type StockPoint = {
@@ -1101,12 +1104,11 @@ export function RevenueForecast() {
   const chartDaily = bucketDaily(forecast.daily, granularity);
   const qtd = qtdRealizedAsOf(forecast.daily, qtdDate);
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-  // Export defaults to the FULL history (earliest quarter we track → today),
-  // regardless of the quarter currently selected in the chart. Analysts narrow
-  // it in the modal. available_quarters is chronological, so [0] is the oldest.
-  const earliestQuarter = forecast.available_quarters[0];
-  const parsedEarliest = earliestQuarter ? parseQuarterLabel(earliestQuarter) : null;
-  const exportFrom = parsedEarliest ? parsedEarliest.start.toISOString().slice(0, 10) : (dailyStart ?? todayKey);
+  // Export/QTD date bounds: the actual GMV data range (earliest data day →
+  // today), so users can't query dates with no data. Default the export to the
+  // full history; analysts narrow it in the modal.
+  const earliestDataDate = forecast.earliest_data_date || dailyStart || todayKey;
+  const exportFrom = earliestDataDate;
   const exportTo = todayKey;
 
   return (
@@ -1154,8 +1156,8 @@ export function RevenueForecast() {
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <Card label={totalGmvLabel} value={fmtDollar(forecast.projected_total_gmv_usd)} />
-        <Card label={totalRevLabel} value={fmtDollar(forecast.projected_total_revenue_usd)} strong />
+        <Card label={totalGmvLabel} value={fmtDollar(isAll ? forecast.realized_total_gmv_usd : forecast.projected_total_gmv_usd)} />
+        <Card label={totalRevLabel} value={fmtDollar(isAll ? forecast.realized_total_revenue_usd : forecast.projected_total_revenue_usd)} strong />
       </div>
 
       <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-gray-50 p-3 text-sm">
@@ -1164,7 +1166,13 @@ export function RevenueForecast() {
           <input
             type="date"
             value={qtdDate}
-            onChange={(e) => setQtdDate(e.target.value)}
+            min={earliestDataDate}
+            max={todayKey}
+            onChange={(e) => {
+              const v = e.target.value;
+              // Clamp to the data range so users can't pick dates with no data.
+              setQtdDate(!v ? "" : v < earliestDataDate ? earliestDataDate : v > todayKey ? todayKey : v);
+            }}
             className="rounded border px-2 py-0.5 text-sm text-gray-900"
           />
         </label>
@@ -1323,7 +1331,13 @@ export function RevenueForecast() {
       )}
 
       {showExport && (
-        <GmvExportModal defaultFrom={exportFrom} defaultTo={exportTo} onClose={() => setShowExport(false)} />
+        <GmvExportModal
+          defaultFrom={exportFrom}
+          defaultTo={exportTo}
+          minDate={earliestDataDate}
+          maxDate={todayKey}
+          onClose={() => setShowExport(false)}
+        />
       )}
     </div>
   );

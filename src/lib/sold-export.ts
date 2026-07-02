@@ -23,14 +23,16 @@ import { classifySellerLevel, type GovLevel } from "./gov-seller";
 import { isDomesticCountry, parseSale, rowKey, type HistoricalSaleRow } from "./historical-sales";
 
 const PAGE_SIZE = 1000;
-// Maestro sorts the whole result set on every page, so wide windows are slow
-// (a 3-month window took ~35s and started returning 400s; a 1-week window is
-// sub-second). We split the range into ~weekly chunks and spend a bounded page
-// budget across them, value-ranked (currentBid desc) within each week. GMV is
-// top-heavy, so this still captures the large majority of GMV; narrow ranges
-// get complete coverage. All env-overridable.
+// Maestro sorts the whole result set on every page, so WIDE windows are slow (a
+// 3-month window took ~35s and started 400ing) while a 1-week window is
+// sub-second. We split the range into ~weekly chunks and, by default, fetch
+// EVERY page of every non-empty chunk (complete coverage — no value-ranked
+// sampling). A high `maxPages` safety cap bounds a single request; callers that
+// only need a sample (the category chart) pass a small maxPages. Ranges up to
+// ~1 quarter (~200 pages) complete in one request; the export modal splits
+// wider ranges into per-quarter requests. All env-overridable.
 const CHUNK_DAYS = Number(process.env.GMV_EXPORT_CHUNK_DAYS) || 7;
-const PAGE_BUDGET = Number(process.env.GMV_EXPORT_PAGE_BUDGET) || 60;
+const DEFAULT_MAX_PAGES = Number(process.env.GMV_EXPORT_MAX_PAGES) || 500;
 const RANGE_CACHE_MS = Number(process.env.GMV_EXPORT_CACHE_MS) || 5 * 60_000;
 
 export type ExportSite = "all" | "AD" | "GD" | "GI";
@@ -77,7 +79,7 @@ export type PivotRow = {
 
 // Cap concurrent Maestro requests: firing many sold-page requests at once makes
 // Maestro 400 ("exception logged for Correlation ID …") or drop connections.
-const CONCURRENCY = Number(process.env.GMV_EXPORT_CONCURRENCY) || 4;
+const CONCURRENCY = Number(process.env.GMV_EXPORT_CONCURRENCY) || 5;
 
 type PageResult = { rows: Record<string, unknown>[]; total: number; ok: boolean };
 
@@ -109,8 +111,9 @@ async function fetchPageOnce(fromIso: string, toIso: string, page: number): Prom
   }
 }
 
-/** Fetch one page with backoff retries — Maestro's failures here are transient. */
-async function fetchPage(fromIso: string, toIso: string, page: number, retries = 3): Promise<PageResult> {
+/** Fetch one page with backoff retries — Maestro's failures here are transient
+ *  (throttling under load). Retry hard so a blip never silently zeroes a week. */
+async function fetchPage(fromIso: string, toIso: string, page: number, retries = 4): Promise<PageResult> {
   for (let attempt = 0; ; attempt++) {
     const r = await fetchPageOnce(fromIso, toIso, page);
     if (r.ok || attempt >= retries) return r;
@@ -157,12 +160,20 @@ const rangeCache = new Map<string, { at: number; val: SoldExportFetch }>();
 
 /**
  * Fetch + classify sold lots in [from, to] (ET days). The range is split into
- * weekly chunks; each chunk is paged value-ranked up to a share of the global
- * page budget (breadth-first across chunks), so wide ranges stay fast/reliable
- * while narrow ranges get complete coverage. Returns dedup'd, classified rows.
+ * weekly chunks; by default EVERY page of every non-empty chunk is fetched
+ * (complete coverage), bounded only by `maxPages` as a safety cap. Empty chunks
+ * (e.g. pre-archive weeks) are skipped so they don't waste the budget. Callers
+ * that only need a sample (the category chart) pass a small `maxPages`.
+ * Returns dedup'd, classified rows. For ranges wider than the modal exports in
+ * one shot (~1 quarter), the modal splits into per-quarter calls.
  */
-export async function fetchSoldRange(from: string, to: string): Promise<SoldExportFetch> {
-  const cacheKey = `${from}|${to}`;
+export async function fetchSoldRange(
+  from: string,
+  to: string,
+  opts: { maxPages?: number } = {},
+): Promise<SoldExportFetch> {
+  const maxPages = opts.maxPages ?? DEFAULT_MAX_PAGES;
+  const cacheKey = `${from}|${to}|${maxPages}`;
   const hit = rangeCache.get(cacheKey);
   if (hit && Date.now() - hit.at < RANGE_CACHE_MS) return hit.val;
 
@@ -173,9 +184,8 @@ export async function fetchSoldRange(from: string, to: string): Promise<SoldExpo
   if (chunks.length === 0) {
     return { rows: [], total_in_range: 0, fetched: 0, truncated: false };
   }
-  const pagesPerChunk = Math.max(1, Math.floor(PAGE_BUDGET / chunks.length));
 
-  // Phase 1: page 1 of every chunk (per-chunk totals + each week's top lots).
+  // Phase 1: page 1 of every chunk → per-chunk totals (x-total-count).
   const firstPages = await runPool(chunks, CONCURRENCY, (c) => fetchPage(c.fromIso, c.toIso, 1));
   if (firstPages.every((r) => !r.ok)) {
     throw new Error("Maestro sold-archive request failed — please retry in a moment.");
@@ -183,36 +193,34 @@ export async function fetchSoldRange(from: string, to: string): Promise<SoldExpo
 
   let totalInRange = 0;
   let truncated = false;
-  const takePerChunk = firstPages.map((r) => {
+  // Non-empty chunks that need more than their first page.
+  const deeperNeed: { chunk: Chunk; pagesNeeded: number }[] = [];
+  firstPages.forEach((r, idx) => {
     if (!r.ok) {
-      truncated = true;
-      return 0;
+      truncated = true; // a page-1 failed after retries → partial coverage
+      return;
     }
     totalInRange += r.total;
-    const needed = Math.max(1, Math.ceil(r.total / PAGE_SIZE));
-    const take = Math.min(needed, pagesPerChunk);
-    if (needed > take) truncated = true;
-    return take;
+    const pagesNeeded = Math.ceil(r.total / PAGE_SIZE);
+    if (pagesNeeded > 1) deeperNeed.push({ chunk: chunks[idx], pagesNeeded });
   });
 
-  // Phase 2: deeper pages, breadth-first (page 2 of all chunks, then page 3…),
-  // capped by the remaining budget so total requests stay bounded.
-  const maxTake = takePerChunk.reduce((m, t) => Math.max(m, t), 0);
+  // Phase 2: ALL remaining pages of every non-empty chunk, breadth-first
+  // (page 2 of each, then page 3…), bounded by the maxPages safety cap.
+  const maxNeeded = deeperNeed.reduce((m, c) => Math.max(m, c.pagesNeeded), 1);
   const deeper: { chunk: Chunk; page: number }[] = [];
-  for (let p = 2; p <= maxTake; p++) {
-    takePerChunk.forEach((take, idx) => {
-      if (p <= take) deeper.push({ chunk: chunks[idx], page: p });
-    });
+  for (let p = 2; p <= maxNeeded; p++) {
+    for (const c of deeperNeed) if (p <= c.pagesNeeded) deeper.push({ chunk: c.chunk, page: p });
   }
-  const budgetForDeeper = Math.max(0, PAGE_BUDGET - chunks.length);
+  const budgetForDeeper = Math.max(0, maxPages - chunks.length);
   const deeperCapped = deeper.slice(0, budgetForDeeper);
-  if (deeperCapped.length < deeper.length) truncated = true;
+  if (deeperCapped.length < deeper.length) truncated = true; // hit the maxPages safety cap
   const deeperPages = await runPool(deeperCapped, CONCURRENCY, (t) => fetchPage(t.chunk.fromIso, t.chunk.toIso, t.page));
   if (deeperPages.some((r) => !r.ok)) truncated = true;
 
   const seen = new Set<string>();
   const rows: SoldExportRow[] = [];
-  for (const raw of [...firstPages, ...deeperPages].flatMap((r) => r.rows)) {
+  for (const raw of [...firstPages.flatMap((r) => r.rows), ...deeperPages.flatMap((r) => r.rows)]) {
     const key = rowKey(raw);
     if (seen.has(key)) continue;
     seen.add(key);
