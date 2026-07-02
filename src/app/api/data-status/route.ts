@@ -3,8 +3,10 @@ import { supabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
 
-// Which column best represents "freshness" for each data table.
-const TABLE_FRESHNESS: { table: string; column: string }[] = [
+// Which column best represents "freshness" for each data table. `fallback` is
+// used when the primary column doesn't exist yet (e.g. a not-yet-applied
+// migration) so the endpoint degrades gracefully instead of reporting "no data".
+const TABLE_FRESHNESS: { table: string; column: string; fallback?: string }[] = [
   { table: "listings", column: "date" },
   { table: "marketplace_metrics", column: "date" },
   { table: "marketplace_sellers", column: "date" },
@@ -12,16 +14,21 @@ const TABLE_FRESHNESS: { table: string; column: string }[] = [
   { table: "federal_contracts", column: "first_seen_date" },
   { table: "contract_snapshots", column: "date" },
   { table: "sam_opportunities", column: "first_seen_date" },
-  { table: "state_contracts", column: "first_seen_date" },
+  // last_seen_date advances every run (migration 023); fall back to first_seen_date
+  // until that migration is applied.
+  { table: "state_contracts", column: "last_seen_date", fallback: "first_seen_date" },
 ];
 
-async function latestValue(table: string, column: string): Promise<string | null> {
+async function latestValue(table: string, column: string, fallback?: string): Promise<string | null> {
   const { data, error } = await supabase
     .from(table)
     .select(column)
     .order(column, { ascending: false })
     .limit(1);
-  if (error || !data || data.length === 0) return null;
+  if (error) {
+    return fallback ? latestValue(table, fallback) : null;
+  }
+  if (!data || data.length === 0) return null;
   const row = data[0] as unknown as Record<string, unknown>;
   const value = row[column];
   return typeof value === "string" ? value : null;
@@ -41,7 +48,7 @@ type CronRunRow = {
 export async function GET() {
   const [tableEntries, cronRes] = await Promise.all([
     Promise.all(
-      TABLE_FRESHNESS.map(async ({ table, column }) => [table, await latestValue(table, column)] as const),
+      TABLE_FRESHNESS.map(async ({ table, column, fallback }) => [table, await latestValue(table, column, fallback)] as const),
     ),
     supabase
       .from("cron_runs")

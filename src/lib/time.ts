@@ -102,6 +102,34 @@ export function dateKeyToUtcDate(dateKey: string): Date | null {
   return new Date(Date.UTC(year, month - 1, day));
 }
 
+/**
+ * ISO-week-start (Monday) key for a YYYY-MM-DD date, as YYYY-MM-DD.
+ * The input is already an ET calendar day, so we treat it as a UTC midnight
+ * date and walk back to Monday — consistent bucketing without TZ edge cases.
+ * Shared by the forecast granularity toggle and the pivot export's week grouping.
+ */
+export function etWeekKey(dateKey: string): string {
+  const d = dateKeyToUtcDate(dateKey);
+  if (!d) return dateKey;
+  const dow = d.getUTCDay(); // 0=Sun..6=Sat
+  const backToMonday = (dow + 6) % 7; // days since Monday
+  d.setUTCDate(d.getUTCDate() - backToMonday);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Month key (YYYY-MM) for a YYYY-MM-DD date. */
+export function etMonthKey(dateKey: string): string {
+  return dateKey.slice(0, 7);
+}
+
+/** Quarter label (YYYYQn) for a YYYY-MM-DD date. */
+export function etQuarterKey(dateKey: string): string {
+  const [year, month] = dateKey.split("-").map(Number);
+  if (!year || !month) return dateKey;
+  const q = Math.floor((month - 1) / 3) + 1;
+  return `${year}Q${q}`;
+}
+
 export function formatPartsInEt(date: Date) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: ET_TIME_ZONE,

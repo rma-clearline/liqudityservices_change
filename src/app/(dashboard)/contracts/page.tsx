@@ -4,16 +4,33 @@ import type {
   ContractSnapshotRow,
   SamOpportunityRow,
   StateContractRow,
+  MarketplaceSellerRow,
 } from "@/lib/supabase";
 import { FederalContracts } from "@/components/federal-contracts";
 import { SamOpportunities } from "@/components/sam-opportunities";
 import { StateContracts } from "@/components/state-contracts";
+import { GovernmentSellers } from "@/components/government-sellers";
 import { SectionHeader } from "@/components/section-header";
 
 export const dynamic = "force-dynamic";
 
+// Latest marketplace_sellers snapshot: find the newest date, then pull all of
+// that day's rows (both platforms) so the government-level mix reflects a single
+// consistent snapshot rather than a mix of dates.
+async function latestSellerSnapshot(): Promise<{ date: string | null; sellers: MarketplaceSellerRow[] }> {
+  const latest = await supabase
+    .from("marketplace_sellers")
+    .select("date")
+    .order("date", { ascending: false })
+    .limit(1);
+  const date = latest.data?.[0]?.date ?? null;
+  if (!date) return { date: null, sellers: [] };
+  const rows = await supabase.from("marketplace_sellers").select("*").eq("date", date);
+  return { date, sellers: rows.data ?? [] };
+}
+
 export default async function ContractsPage() {
-  const [contractsRes, snapshotsRes, samRes, stateRes] = await Promise.all([
+  const [contractsRes, snapshotsRes, samRes, stateRes, sellerSnapshot] = await Promise.all([
     supabase.from("federal_contracts").select("*").order("start_date", { ascending: false }).limit(20),
     supabase.from("contract_snapshots").select("*").order("date", { ascending: false }).limit(1),
     supabase.from("sam_opportunities").select("*").order("posted_date", { ascending: false }).limit(100),
@@ -23,6 +40,7 @@ export default async function ContractsPage() {
       .order("year", { ascending: false })
       .order("quarter", { ascending: false })
       .limit(200),
+    latestSellerSnapshot(),
   ]);
 
   const contracts: FederalContractRow[] = contractsRes.data ?? [];
@@ -33,12 +51,32 @@ export default async function ContractsPage() {
   return (
     <div className="space-y-10">
       <section>
-        <SectionHeader title="Federal Contracts" source="federal_contracts" table="federal_contracts" />
+        <SectionHeader
+          title="Government Surplus Sellers"
+          source="marketplace_metrics"
+          table="marketplace_sellers"
+          note="Who is actually selling on AllSurplus/GovDeals right now, by level of government. This is LQDT's live government-surplus franchise — the federal/state/local contract sections below are the paper trail. Filter by level; GMV is the current-bid proxy, not realized."
+        />
+        <GovernmentSellers sellers={sellerSnapshot.sellers} snapshotDate={sellerSnapshot.date} />
+      </section>
+
+      <section>
+        <SectionHeader
+          title="Federal Contracts — LQDT as prime vendor"
+          source="federal_contracts"
+          table="federal_contracts"
+          note="Sparse by nature: LQDT is a surplus seller/agent, not a federal prime recipient, so USAspending shows only a handful of lifetime prime awards. LQDT's real federal activity is disposal solicitations (see Federal Opportunities below) and the DoD/DLA surplus program — not obligations paid to LQDT."
+        />
         <FederalContracts contracts={contracts} snapshot={contractSnapshot} />
       </section>
 
       <section>
-        <SectionHeader title="Federal Opportunities (SAM.gov)" source="sam" table="sam_opportunities" />
+        <SectionHeader
+          title="Federal Opportunities (SAM.gov)"
+          source="sam"
+          table="sam_opportunities"
+          note="The forward-looking federal pipeline: new government surplus-disposal solicitations. Requires a valid SAM.gov Opportunities API key — if empty, the SAM_API_KEY is unset or unauthorized (see freshness/alerts)."
+        />
         <SamOpportunities opportunities={samOpportunities} />
       </section>
 

@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
 import { downloadCsv, toCsv } from "@/lib/format";
+import { etMonthKey, etWeekKey } from "@/lib/time";
+import { GmvExportModal } from "./gmv-export-modal";
 import {
   ComposedChart,
   Bar,
@@ -601,10 +603,53 @@ function realizedValueForMarket(point: DailyPoint, metric: ChartMetric, market: 
   return point.realized_gmv_usd;
 }
 
+type Granularity = "day" | "week" | "month";
+
+const GRANULARITY_LABEL: Record<Granularity, string> = { day: "Daily", week: "Weekly", month: "Monthly" };
+
+/**
+ * Re-bucket the daily forecast series into weekly (ISO week-start) or monthly
+ * buckets by summing every GMV/revenue field. The API always returns daily
+ * points, so this is a pure client-side view transform.
+ */
+function bucketDaily(daily: DailyPoint[], granularity: Granularity): DailyPoint[] {
+  if (granularity === "day") return daily;
+  const keyFn = granularity === "week" ? etWeekKey : etMonthKey;
+  const map = new Map<string, DailyPoint>();
+  for (const d of daily) {
+    const key = keyFn(d.date);
+    let agg = map.get(key);
+    if (!agg) {
+      agg = {
+        date: key,
+        realized_gmv_usd: 0,
+        domestic_realized_gmv_usd: 0,
+        international_realized_gmv_usd: 0,
+        projected_gmv_usd: 0,
+        realized_revenue_usd: 0,
+        domestic_realized_revenue_usd: 0,
+        international_realized_revenue_usd: 0,
+        projected_revenue_usd: 0,
+      };
+      map.set(key, agg);
+    }
+    agg.realized_gmv_usd += d.realized_gmv_usd;
+    agg.domestic_realized_gmv_usd += d.domestic_realized_gmv_usd;
+    agg.international_realized_gmv_usd += d.international_realized_gmv_usd;
+    agg.projected_gmv_usd += d.projected_gmv_usd;
+    agg.realized_revenue_usd += d.realized_revenue_usd;
+    agg.domestic_realized_revenue_usd += d.domestic_realized_revenue_usd;
+    agg.international_realized_revenue_usd += d.international_realized_revenue_usd;
+    agg.projected_revenue_usd += d.projected_revenue_usd;
+  }
+  return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
+}
+
 function DailyForecastChart({
   daily,
   metric,
   market,
+  granularity,
   showStock,
   stockByDate,
   stockTicker,
@@ -615,6 +660,7 @@ function DailyForecastChart({
   daily: DailyPoint[];
   metric: ChartMetric;
   market: SalesMarketFilter;
+  granularity: Granularity;
   showStock: boolean;
   stockByDate: Record<string, number>;
   stockTicker: string;
@@ -636,6 +682,9 @@ function DailyForecastChart({
   const todayLabel = todayKey;
 
   const handleChartAreaClick = (event: MouseEvent<HTMLDivElement>) => {
+    // Drill-down opens a single-day sales modal; only meaningful in day mode
+    // (week/month bars carry a bucket key, not a single date).
+    if (granularity !== "day") return;
     if (event.target instanceof Element && event.target.closest(".recharts-legend-wrapper")) return;
 
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -650,7 +699,11 @@ function DailyForecastChart({
   };
 
   return (
-    <div className="cursor-pointer" onClick={handleChartAreaClick} aria-label="Open sales for selected daily GMV date">
+    <div
+      className={granularity === "day" ? "cursor-pointer" : ""}
+      onClick={handleChartAreaClick}
+      aria-label="Open sales for selected daily GMV date"
+    >
       <ResponsiveContainer width="100%" height={340}>
         <ComposedChart data={data} margin={{ top: 10, right: hasStock ? 22 : 16, bottom: 5, left: 20 }}>
           <CartesianGrid strokeDasharray="3 3" />
@@ -678,7 +731,7 @@ function DailyForecastChart({
             }}
           />
           <Legend />
-          {isCurrent && (
+          {isCurrent && granularity === "day" && (
             <ReferenceLine x={todayLabel} stroke="#9ca3af" strokeDasharray="4 2" label={{ value: "today", position: "top", fontSize: 10, fill: "#6b7280" }} />
           )}
           <Bar yAxisId="money" dataKey="Realized" stackId="a" fill="#2563eb" cursor="pointer" />
@@ -706,6 +759,8 @@ export function RevenueForecast() {
   const [quarter, setQuarter] = useState<string | null>(null);
   const [chartMetric, setChartMetric] = useState<ChartMetric>("gmv");
   const [chartMarket, setChartMarket] = useState<SalesMarketFilter>(DEFAULT_CHART_MARKET);
+  const [granularity, setGranularity] = useState<Granularity>("day");
+  const [showExport, setShowExport] = useState(false);
   const [showStockPrice, setShowStockPrice] = useState(false);
   const [stockState, setStockState] = useState<StockState>({
     ticker: STOCK_TICKER,
@@ -813,6 +868,11 @@ export function RevenueForecast() {
   const dailyEnd = forecast.daily[forecast.daily.length - 1]?.date;
   const dailyRange = dailyStart && dailyEnd ? `${dailyStart} to ${dailyEnd}` : forecast.quarter;
   const chartMarketLabel = chartMarket === "all" ? "" : `${CHART_MARKET_OPTIONS.find((option) => option.value === chartMarket)?.label ?? ""} `;
+  const chartDaily = bucketDaily(forecast.daily, granularity);
+  const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  // Export defaults to the selected view's range, capped at today (sold data only).
+  const exportFrom = dailyStart ?? todayKey;
+  const exportTo = dailyEnd && dailyEnd < todayKey ? dailyEnd : todayKey;
 
   return (
     <div className="space-y-6">
@@ -850,6 +910,12 @@ export function RevenueForecast() {
           />
           <span className="text-xs text-gray-400">{(takeRate * 100).toFixed(0)}%</span>
         </label>
+        <button
+          onClick={() => setShowExport(true)}
+          className="ml-auto rounded border border-gray-300 bg-white px-3 py-1 text-sm font-medium text-gray-700 hover:bg-gray-50"
+        >
+          Export GMV data
+        </button>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -859,8 +925,23 @@ export function RevenueForecast() {
 
       <div>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h3 className="text-sm font-semibold text-gray-700">Daily {chartMarketLabel}{chartMetric === "gmv" ? "GMV" : "Revenue"} - {dailyRange}</h3>
+          <h3 className="text-sm font-semibold text-gray-700">{GRANULARITY_LABEL[granularity]} {chartMarketLabel}{chartMetric === "gmv" ? "GMV" : "Revenue"} - {dailyRange}</h3>
           <div className="flex flex-wrap gap-2">
+            <div className="flex gap-1">
+              {(["day", "week", "month"] as Granularity[]).map((g) => (
+                <button
+                  key={g}
+                  onClick={() => setGranularity(g)}
+                  className={`px-2 py-0.5 text-xs rounded border transition-colors ${
+                    granularity === g
+                      ? "bg-gray-900 text-white border-gray-900"
+                      : "bg-white text-gray-600 border-gray-300 hover:border-gray-400"
+                  }`}
+                >
+                  {g === "day" ? "Day" : g === "week" ? "Week" : "Month"}
+                </button>
+              ))}
+            </div>
             <div className="flex gap-1">
               {CHART_MARKET_OPTIONS.map((option) => (
                 <button
@@ -894,8 +975,10 @@ export function RevenueForecast() {
             <button
               onClick={() => setShowStockPrice((current) => !current)}
               aria-pressed={showStockPrice}
-              className={`px-2 py-0.5 text-xs rounded border transition-colors ${
-                showStockPrice
+              disabled={granularity !== "day"}
+              title={granularity !== "day" ? "LQDT price overlay is available in Day view" : undefined}
+              className={`px-2 py-0.5 text-xs rounded border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                showStockPrice && granularity === "day"
                   ? "bg-red-600 text-white border-red-600"
                   : "bg-white text-gray-600 border-gray-300 hover:border-gray-400"
               }`}
@@ -908,13 +991,14 @@ export function RevenueForecast() {
           <p className="mb-2 text-xs text-red-600">LQDT price unavailable.</p>
         )}
         <DailyForecastChart
-          daily={forecast.daily}
+          daily={chartDaily}
           metric={chartMetric}
           market={chartMarket}
-          showStock={showStockPrice && !stockError}
+          granularity={granularity}
+          showStock={showStockPrice && !stockError && granularity === "day"}
           stockByDate={stockByDate}
           stockTicker={stockState.ticker}
-          todayKey={new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" })}
+          todayKey={todayKey}
           isCurrent={forecast.is_current}
           onSelectDate={setSelectedSalesDate}
         />
@@ -935,6 +1019,10 @@ export function RevenueForecast() {
 
       {selectedSalesDate && (
         <SalesDetailsModal date={selectedSalesDate} market={chartMarket} onClose={() => setSelectedSalesDate(null)} />
+      )}
+
+      {showExport && (
+        <GmvExportModal defaultFrom={exportFrom} defaultTo={exportTo} onClose={() => setShowExport(false)} />
       )}
     </div>
   );

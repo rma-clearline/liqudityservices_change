@@ -107,6 +107,10 @@ const COMMON_HEADERS = {
 type WorkingConfig = { endpoint: string; authMode: AuthMode };
 let workingConfig: WorkingConfig | null = null;
 
+// Last non-OK probe outcome, so fetchSamOpportunities can distinguish a throttled
+// key (429 — daily quota exhausted) from an unauthorized one (404) in its message.
+let lastProbe: { status: number; body: string } = { status: 0, body: "" };
+
 async function tryOne(
   endpoint: string,
   authMode: AuthMode,
@@ -158,14 +162,24 @@ async function samFetch(
         console.log(`[sam] found working config: endpoint=${endpoint} auth=${authMode}`);
         return r.data;
       }
+      lastProbe = { status: r.status, body: r.body };
+      // 429 = quota exhausted, not a config problem — stop probing so we don't
+      // burn the remaining daily allowance on combos that will also 429.
+      if (r.status === 429) {
+        console.warn(`[sam] HTTP 429 (daily quota exhausted): ${r.body.slice(0, 200)}`);
+        return [];
+      }
       const label = `${endpoint.replace("https://api.sam.gov", "")} auth=${authMode}`;
       console.warn(`[sam] ${label} → HTTP ${r.status}: ${r.body.slice(0, 150) || "(empty)"}`);
     }
   }
 
   console.error(
-    "[sam] all 4 URL×auth combinations failed. Likely cause: the SAM_API_KEY is not authorized for the Opportunities API. " +
-      "Generate a new key at sam.gov → Profile → Account Details → API Key, and ensure your account has opportunities access.",
+    "[sam] all 4 URL×auth combinations failed. SAM.gov returns 404 (not 401/403) for an invalid, expired, " +
+      "or unauthorized key — verified live: a request with no key at all also 404s at the gateway, so a 404 here " +
+      "means the SAM_API_KEY is not a valid public key with Opportunities access, NOT that the endpoint is down. " +
+      "Fix: regenerate a key at sam.gov → Profile → Account Details → API Key (personal keys expire after 90 days " +
+      "of inactivity) and confirm the account has Opportunities API access; then set SAM_API_KEY.",
   );
   return [];
 }
@@ -222,9 +236,21 @@ export async function fetchSamOpportunities(daysBack = 90): Promise<{
   // Probe first to find the working endpoint/auth combo.
   await samFetch(apiKey, { postedFrom, postedTo, limit: "1" });
   if (!workingConfig) {
+    if (lastProbe.status === 429) {
+      return {
+        opportunities: [],
+        debug:
+          "throttled — SAM_API_KEY hit its daily quota (HTTP 429). The key is VALID; it just ran out of " +
+          `requests for the day. ${lastProbe.body.slice(0, 160)} Reduce call volume (SAM runs once/day at noon ET) ` +
+          "or request a higher-tier / federal system account for a larger quota.",
+      };
+    }
     return {
       opportunities: [],
-      debug: "probe failed — all endpoint/auth combos returned non-OK (invalid key or endpoint down)",
+      debug:
+        "probe failed — all endpoint/auth combos returned non-OK. SAM masks bad keys as 404, so this almost " +
+        "certainly means SAM_API_KEY is invalid/expired/unauthorized for the Opportunities API (regenerate at " +
+        "sam.gov → Profile → API Key). Not an endpoint outage.",
     };
   }
 

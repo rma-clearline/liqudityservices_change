@@ -78,7 +78,7 @@ type CachedSalesDay = {
 
 const cachedSalesByDate = new Map<string, CachedSalesDay>();
 
-function isDomesticCountry(country: string) {
+export function isDomesticCountry(country: string) {
   const normalized = country.trim().toUpperCase();
   return (
     normalized === "USA" ||
@@ -94,7 +94,7 @@ function saleUrl(raw: Record<string, unknown>) {
   return `https://www.govdeals.com${raw.clickUrl.startsWith("/") ? "" : "/"}${raw.clickUrl}`;
 }
 
-function rowKey(raw: Record<string, unknown>) {
+export function rowKey(raw: Record<string, unknown>) {
   return [
     typeof raw.businessId === "string" ? raw.businessId : "",
     raw.accountId ?? "",
@@ -103,7 +103,7 @@ function rowKey(raw: Record<string, unknown>) {
   ].join(":");
 }
 
-function parseSale(raw: Record<string, unknown>, fx: Awaited<ReturnType<typeof loadFxRates>>): HistoricalSaleRow {
+export function parseSale(raw: Record<string, unknown>, fx: Awaited<ReturnType<typeof loadFxRates>>): HistoricalSaleRow {
   const currencyCode = typeof raw.currencyCode === "string" && raw.currencyCode ? raw.currencyCode : "USD";
   const nativeAmount = safeNumber(raw.currentBid);
   const { usd } = convertToUsd(nativeAmount, currencyCode, fx);

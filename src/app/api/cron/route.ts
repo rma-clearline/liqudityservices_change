@@ -77,9 +77,24 @@ export async function GET(request: Request) {
         pages_fetched: m.pages_fetched,
         is_full_coverage: m.is_full_coverage,
       });
-      const { error: metricsError } = await supabaseAdmin
-        .from("marketplace_metrics")
-        .upsert([metricRow(metrics.allsurplus), metricRow(metrics.govdeals)], { onConflict: "date,platform" });
+      // A fetch failure yields sample_size 0. Persisting that all-zero row would
+      // overwrite the last good snapshot for the day and blank the dashboard's
+      // "latest" marketplace view. Only write platforms that actually returned
+      // listings; if both failed, skip the write and report the run failed.
+      const metricsRows = [metrics.allsurplus, metrics.govdeals]
+        .filter((m) => m.sample_size > 0)
+        .map(metricRow);
+      let metricsError: string | null = null;
+      if (metricsRows.length > 0) {
+        const { error } = await supabaseAdmin
+          .from("marketplace_metrics")
+          .upsert(metricsRows, { onConflict: "date,platform" });
+        metricsError = error?.message ?? null;
+      } else {
+        metricsError =
+          `both platforms returned 0 listings (AD: ${metrics.allsurplus.debug ?? "?"}; ` +
+          `GD: ${metrics.govdeals.debug ?? "?"}) — skipped write to preserve last good snapshot`;
+      }
 
       const sellerRow = (s: SellerInfo, platform: "AD" | "GD") => ({
         date,
@@ -106,7 +121,8 @@ export async function GET(request: Request) {
         sellersStored = sellerErr ? 0 : sellerRows.length;
       }
       return {
-        metricsError: metricsError?.message ?? null,
+        metricsError,
+        metricsWritten: metricsRows.length,
         sellersStored,
         adSample: metrics.allsurplus.sample_size,
         gdSample: metrics.govdeals.sample_size,
@@ -115,8 +131,8 @@ export async function GET(request: Request) {
       };
     },
     (r): SourceSummary => ({
-      status: r.metricsError ? "failed" : "success",
-      rows: (r.metricsError ? 0 : 2) + r.sellersStored,
+      status: r.metricsError && r.metricsWritten === 0 ? "failed" : r.metricsError ? "partial" : "success",
+      rows: r.metricsWritten + r.sellersStored,
       detail: {
         adSample: r.adSample,
         gdSample: r.gdSample,
@@ -182,9 +198,24 @@ export async function GET(request: Request) {
     }),
   );
 
+  // SAM.gov: a single fetch fires ~10 requests (probe + brand-title + NAICS
+  // searches). SAM personal API keys have a small DAILY quota, so running every
+  // 4h (~60 req/day) throttles the key (HTTP 429) and stores nothing — the main
+  // reason sam_opportunities stayed empty. Opportunities change slowly, so run
+  // SAM once per day (the noon ET run, matching the email) unless forced.
+  const runSam =
+    now.getHours() === 12 || searchParams.get("sam") === "1" || searchParams.get("sendEmail") === "1";
   const samTask = logger.track(
     "sam",
     async () => {
+      if (!runSam) {
+        return {
+          stored: 0,
+          debug: "skipped: SAM runs once/day (noon ET) to stay within the API daily quota",
+          error: null,
+          skipped: true,
+        };
+      }
       const samResult = await fetchSamOpportunities(90);
       let stored = 0;
       let error: string | null = null;
@@ -198,10 +229,10 @@ export async function GET(request: Request) {
         error = e?.message ?? null;
         stored = e ? 0 : samResult.opportunities.length;
       }
-      return { stored, debug: samResult.debug, error };
+      return { stored, debug: samResult.debug, error, skipped: false };
     },
     (r): SourceSummary => ({
-      status: r.error ? "failed" : "success",
+      status: r.skipped ? "skipped" : r.error ? "failed" : "success",
       rows: r.stored,
       detail: { debug: r.debug },
       error: r.error,
@@ -215,13 +246,20 @@ export async function GET(request: Request) {
       let stored = 0;
       let error: string | null = null;
       if (stateResult.contracts.length > 0) {
+        // Merge (not ignore-duplicates): state datasets refresh sales/amounts on
+        // existing contracts every quarter, so we MUST update matched rows rather
+        // than drop them. `last_seen_date` advances every run (drives freshness);
+        // `first_seen_date` is preserved on update by a DB trigger (migration 023).
         const { error: e } = await supabaseAdmin
           .from("state_contracts")
-          .upsert(stateResult.contracts.map((c) => ({ ...c, first_seen_date: date })), {
-            onConflict:
-              "state_code,source_dataset_id,contract_id,vendor_normalized,year,quarter,customer_agency,record_type",
-            ignoreDuplicates: true,
-          });
+          .upsert(
+            stateResult.contracts.map((c) => ({ ...c, first_seen_date: date, last_seen_date: date })),
+            {
+              onConflict:
+                "state_code,source_dataset_id,contract_id,vendor_normalized,year,quarter,customer_agency,record_type",
+              ignoreDuplicates: false,
+            },
+          );
         error = e?.message ?? null;
         stored = e ? 0 : stateResult.contracts.length;
       }

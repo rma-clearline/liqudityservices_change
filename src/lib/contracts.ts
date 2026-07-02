@@ -6,12 +6,22 @@ const REQUEST_TIMEOUT_MS = 15_000;
 const PAGE_LIMIT = 100; // USAspending max per page
 const MAX_PAGES = Number(process.env.USASPENDING_MAX_PAGES) || 10;
 
+// LQDT operates under several legal entities / brands. USAspending matches
+// recipient_search_text against name + recipient identifiers, so we search each.
+// NOTE: LQDT is a surplus *seller/agent*, not a federal prime recipient — this
+// lens is sparse by nature (≈6 lifetime prime awards, newest 2020, ~$0 obligated,
+// verified live). It is kept for completeness; the real federal pipeline is
+// SAM.gov opportunities. See future_improvements.md and the Contracts page note.
 const NAME_VARIANTS = [
   "Liquidity Services",
+  "Liquidity Services Operations",
   "GovDeals",
   "Government Liquidation",
   "AllSurplus",
   "Bid4Assets",
+  "GovPlanet",
+  "Network International",
+  "Machinio",
 ];
 
 const AWARD_FIELDS = [
