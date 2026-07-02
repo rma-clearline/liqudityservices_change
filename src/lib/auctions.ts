@@ -113,6 +113,11 @@ function parseNativeUsd(raw: string | undefined) {
   }
 }
 
+// The historical export starts 2025-06-30 — a lone partial day (the rest of
+// June is absent). One day isn't a useful month, so drop everything before July
+// 2025; the series effectively begins at the first full month (2025-07).
+const HISTORICAL_MIN_DATE = process.env.HISTORICAL_MIN_DATE || "2025-07-01";
+
 async function loadHistoricalDailyGmv(): Promise<HistoricalDailyGmvData> {
   if (cachedHistoricalDailyGmv) return cachedHistoricalDailyGmv;
 
@@ -121,7 +126,7 @@ async function loadHistoricalDailyGmv(): Promise<HistoricalDailyGmvData> {
     const raw = await readFile(HISTORICAL_DAILY_GMV_PATH, "utf8");
     for (const line of raw.trim().split(/\r?\n/).slice(1)) {
       const [date, businessId, soldLotsRaw, gmvUsd, , nativeByCurrency] = parseCsvLine(line);
-      if (!date) continue;
+      if (!date || date < HISTORICAL_MIN_DATE) continue;
       const gmv = safeNumber(gmvUsd, Number.NaN);
       if (!Number.isFinite(gmv)) continue;
       const soldLots = safeNumber(soldLotsRaw, 0);
@@ -147,7 +152,7 @@ async function loadHistoricalDailyGmv(): Promise<HistoricalDailyGmvData> {
     const raw = await readFile(HISTORICAL_DAILY_MARKET_GMV_PATH, "utf8");
     for (const line of raw.trim().split(/\r?\n/).slice(1)) {
       const [date, businessId, market, soldLotsRaw, gmvUsd] = parseCsvLine(line);
-      if (!date || businessId !== "ALL") continue;
+      if (!date || date < HISTORICAL_MIN_DATE || businessId !== "ALL") continue;
 
       const gmv = safeNumber(gmvUsd, Number.NaN);
       if (!Number.isFinite(gmv)) continue;

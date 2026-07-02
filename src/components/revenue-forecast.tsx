@@ -540,7 +540,11 @@ function SalesDetailsModal({
           {loaded === 0 && state.loading ? (
             <p className="py-8 text-center text-sm text-gray-500">Loading sales...</p>
           ) : loaded === 0 ? (
-            <p className="py-8 text-center text-sm text-gray-500">No sold auctions found for this day.</p>
+            <p className="py-8 text-center text-sm text-gray-500">
+              {isBeforeArchiveWindow(date)
+                ? "No lot-level detail for this date. Maestro's sold archive only retains roughly the last 12 months, so mid-2025 and earlier appear as aggregate GMV on the chart but have no per-lot rows to list or export."
+                : "No sold auctions found for this day."}
+            </p>
           ) : (
             <div className="overflow-x-auto">
               <table className="min-w-full text-left text-sm">
@@ -611,6 +615,17 @@ function SalesDetailsModal({
 type FetchState = { forecast: Forecast | null; error: string | null; done: boolean };
 
 type ChartMetric = "gmv" | "revenue";
+
+/**
+ * True if `dateKey` is old enough to have likely aged out of Maestro's rolling
+ * ~12-month sold archive. Such dates still have aggregate GMV on the chart (from
+ * the historical export) but no per-lot rows to drill into or export.
+ */
+function isBeforeArchiveWindow(dateKey: string): boolean {
+  const t = new Date(`${dateKey}T00:00:00Z`).getTime();
+  if (Number.isNaN(t)) return false;
+  return t < Date.now() - 345 * 24 * 60 * 60 * 1000;
+}
 
 function realizedValue(point: DailyPoint, metric: ChartMetric, market: SalesMarketFilter, source: SourceFilter) {
   const revenue = metric === "revenue";

@@ -232,11 +232,10 @@ export function GmvExportModal({
   const labelCls = "text-xs font-medium text-gray-600 mb-1 block";
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-4 overflow-y-auto"
-      onClick={onClose}
-    >
-      <div className="mt-10 w-full max-w-2xl rounded-lg bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+    // No backdrop click-to-close: clicking outside must NOT dismiss the panel or
+    // interrupt a running export. Close only via the ✕ button.
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 p-4 overflow-y-auto">
+      <div className="mt-10 w-full max-w-2xl rounded-lg bg-white p-5 shadow-xl">
         <div className="mb-4 flex items-start justify-between gap-4">
           <div>
             <h3 className="text-lg font-semibold">Export GMV data</h3>
