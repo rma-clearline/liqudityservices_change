@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
 import { downloadCsv, toCsv } from "@/lib/format";
 import { etMonthKey, etQuarterKey, etWeekKey } from "@/lib/time";
+import { siteLabel } from "@/lib/sites";
 import { GmvExportModal } from "./gmv-export-modal";
 import {
   ComposedChart,
@@ -579,7 +580,7 @@ function SalesDetailsModal({
                           <span className="font-medium text-gray-900">{row.title || `Asset ${row.asset_id}`}</span>
                         )}
                         <div className="mt-0.5 text-xs text-gray-500">
-                          {row.platform} / account {row.account_id} / asset {row.asset_id}
+                          {siteLabel(row.platform)} / account {row.account_id} / asset {row.asset_id}
                         </div>
                       </td>
                       <td className="max-w-xs py-3 pr-4 text-gray-700">{row.seller || "-"}</td>

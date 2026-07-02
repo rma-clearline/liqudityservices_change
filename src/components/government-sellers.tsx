@@ -9,6 +9,7 @@ import {
   GOV_LEVELS,
   type GovLevel,
 } from "@/lib/gov-seller";
+import { siteLabel } from "@/lib/sites";
 import { ExportButton } from "./export-button";
 
 function fmtDollar(n: number | null | undefined) {
@@ -151,7 +152,7 @@ export function GovernmentSellers({
                     {GOV_LEVEL_LABELS[s.level]}
                   </span>
                 </td>
-                <td className="py-1 pr-4 text-gray-500">{s.platform === "GD" ? "GovDeals" : "AllSurplus"}</td>
+                <td className="py-1 pr-4 text-gray-500">{siteLabel(s.platform)}</td>
                 <td className="py-1 pr-4 text-gray-500 whitespace-nowrap">
                   {[s.state, s.country].filter(Boolean).join(", ") || "—"}
                 </td>

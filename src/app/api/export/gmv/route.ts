@@ -10,6 +10,7 @@ import {
   type ExportType,
 } from "@/lib/sold-export";
 import { toCsv } from "@/lib/format";
+import { siteLabel } from "@/lib/sites";
 import { etTodayKey, quarterBounds } from "@/lib/time";
 
 export const dynamic = "force-dynamic";
@@ -85,7 +86,8 @@ export async function GET(request: Request) {
 
   if (mode === "pivot") {
     const period = parsePeriod(searchParams.get("period"));
-    const pivot = aggregateExport(filteredRows, period);
+    // Show the full site name (AllSurplus/GovDeals/Industrial) rather than the code.
+    const pivot = aggregateExport(filteredRows, period).map((r) => ({ ...r, site: siteLabel(r.site) }));
     const csv = toCsv(pivot, [
       { key: "period", label: "Period" },
       { key: "site", label: "Site" },
@@ -98,7 +100,8 @@ export async function GET(request: Request) {
     return new Response(csv, { headers });
   }
 
-  const csv = toCsv(filteredRows, [
+  const rawRows = filteredRows.map((r) => ({ ...r, site: siteLabel(r.site) }));
+  const csv = toCsv(rawRows, [
     { key: "close_date_et", label: "Close Date (ET)" },
     { key: "close_time_utc", label: "Close (UTC)" },
     { key: "site", label: "Site" },
