@@ -600,6 +600,7 @@ function quarterLabelForDateKey(key: string): string {
 }
 
 type ClosedAuctionForProjection = {
+  asset_id: string | null;
   status: string | null;
   final_price_usd: number | null;
   current_bid_usd: number | null;
@@ -609,6 +610,7 @@ type ClosedAuctionForProjection = {
 };
 
 type OpenAuctionForProjection = {
+  asset_id: string | null;
   current_bid_usd: number | null;
   close_time_utc: string | null;
   category: string | null;
@@ -803,6 +805,60 @@ async function collectDebug(nowIso: string, startIso: string, endIso: string) {
   };
 }
 
+// Supabase/PostgREST caps every response at ~1000 rows. The current quarter can
+// have many thousands of sold rows, so the forecast's per-platform reads must
+// paginate — otherwise realized/projected silently truncate to the first 1000
+// and undercount (the live-quarter bug). A safety cap keeps an ALL-view read
+// bounded even after the table grows large (ordered close_time desc, so the cap
+// keeps the most recent rows — which is exactly what the current quarter needs).
+const AUCTIONS_READ_PAGE = 1000;
+const AUCTIONS_READ_MAX_PAGES = Number(process.env.AUCTIONS_READ_MAX_PAGES) || 60;
+
+async function fetchAllAuctionRows(
+  build: (from: number, to: number) => PromiseLike<{ data: unknown[] | null; error: unknown }>,
+): Promise<unknown[]> {
+  const rows: unknown[] = [];
+  for (let page = 0; page < AUCTIONS_READ_MAX_PAGES; page += 1) {
+    const from = page * AUCTIONS_READ_PAGE;
+    const { data, error } = await build(from, from + AUCTIONS_READ_PAGE - 1);
+    if (error || !data || data.length === 0) break;
+    rows.push(...data);
+    if (data.length < AUCTIONS_READ_PAGE) break;
+  }
+  return rows;
+}
+
+// Cross-listing dedup (Phase-0 stopgap for the live-quarter forecast).
+// The per-site ingester stores a cross-listed asset under BOTH platform=AD and
+// platform=GD (empirically ~57% of the current quarter is cross-listed), so
+// summing per platform double-counts realized/projected GMV (~2x — the bug the
+// chart showed). The live `auctions` table has no true-marketplace column
+// (migration 013 is unapplied), so we dedup by asset_id and let GovDeals (GD)
+// win cross-listings — that is their true marketplace for the overwhelming
+// majority (AllSurplus's own GMV is a small fraction; the raw AD rows are mostly
+// syndicated GovDeals lots). Rows without an asset_id can't be deduped and are
+// kept as-is. Phase 1's deduped Azure store (fetchSoldRange → true businessId,
+// incl. GI) supersedes this approximation and closes the residual ~2% gap
+// (GI-only lots the AD/GD ingester never captured).
+function dedupByAsset<T extends { asset_id: string | null }>(
+  groups: { platform: "AD" | "GD"; rows: T[] }[],
+): { platform: "AD" | "GD"; row: T }[] {
+  const byId = new Map<string, { platform: "AD" | "GD"; row: T }>();
+  const noId: { platform: "AD" | "GD"; row: T }[] = [];
+  for (const group of groups) {
+    for (const row of group.rows) {
+      const id = row.asset_id;
+      if (!id) {
+        noId.push({ platform: group.platform, row });
+        continue;
+      }
+      const existing = byId.get(id);
+      if (!existing || group.platform === "GD") byId.set(id, { platform: group.platform, row });
+    }
+  }
+  return [...byId.values(), ...noId];
+}
+
 export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: string): Promise<RevenueForecast> {
   const now = new Date();
   const nowIso = now.toISOString();
@@ -849,25 +905,33 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   const perPlatform = await Promise.all(
     platforms.map(async (platform) => {
       const historical = sumHistoricalPlatform(historicalDailyGmv, platform, quarterDaySet);
-      const [closedRes, openRes] = await Promise.all([
-        supabase
-          .from("auctions")
-          .select("status, final_price_usd, current_bid_usd, close_time_utc, category, bid_count")
-          .eq("platform", platform)
-          .gte("close_time_utc", startIso)
-          .lt("close_time_utc", endIso)
-          .in("status", ["closed_sold", "closed_nosale"]),
-        supabase
-          .from("auctions")
-          .select("current_bid_usd, close_time_utc, category, bid_count")
-          .eq("platform", platform)
-          .eq("status", "open")
-          .gte("close_time_utc", nowIso)
-          .lt("close_time_utc", endIso),
+      const [closedRaw, openRaw] = await Promise.all([
+        fetchAllAuctionRows((from, to) =>
+          supabase
+            .from("auctions")
+            .select("asset_id, status, final_price_usd, current_bid_usd, close_time_utc, category, bid_count")
+            .eq("platform", platform)
+            .gte("close_time_utc", startIso)
+            .lt("close_time_utc", endIso)
+            .in("status", ["closed_sold", "closed_nosale"])
+            .order("close_time_utc", { ascending: false })
+            .range(from, to),
+        ),
+        fetchAllAuctionRows((from, to) =>
+          supabase
+            .from("auctions")
+            .select("asset_id, current_bid_usd, close_time_utc, category, bid_count")
+            .eq("platform", platform)
+            .eq("status", "open")
+            .gte("close_time_utc", nowIso)
+            .lt("close_time_utc", endIso)
+            .order("close_time_utc", { ascending: false })
+            .range(from, to),
+        ),
       ]);
 
-      const closed = (closedRes.data ?? []) as ClosedAuctionForProjection[];
-      const open = (openRes.data ?? []) as OpenAuctionForProjection[];
+      const closed = closedRaw as ClosedAuctionForProjection[];
+      const open = openRaw as OpenAuctionForProjection[];
       const sold = closed.filter((r) => r.status === "closed_sold");
       const trackedRealizedGmv = sold.reduce((s, r) => s + (r.final_price_usd ?? 0), 0);
       const realizedSource: "historical_export" | "tracked_auctions" =
@@ -912,6 +976,14 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     }),
   );
 
+  // Dedup cross-listed lots across platforms (see dedupByAsset). Realized,
+  // projected, and the per-platform breakdown are all derived from these so the
+  // headline totals and the AllSurplus/GovDeals blocks stay internally
+  // consistent (they sum to the deduped total instead of ~2x it).
+  const dedupSold = dedupByAsset(perPlatform.map((p) => ({ platform: p.platform, rows: p.sold })));
+  const dedupOpen = dedupByAsset(perPlatform.map((p) => ({ platform: p.platform, rows: p.openProjections })));
+  const dedupClosed = dedupByAsset(perPlatform.map((p) => ({ platform: p.platform, rows: p.closed })));
+
   const emptyBySource = (): Record<SourceKey, number> => ({ AD: 0, GD: 0, GI: 0 });
   const dailyMap = new Map<
     string,
@@ -930,30 +1002,29 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
       hasHistoricalRealized: Boolean(realized),
     });
   }
-  for (const p of perPlatform) {
-    for (const row of p.sold) {
-      if (!row.close_time_utc) continue;
-      const key = etDateKey(row.close_time_utc);
-      if (!chartDaySet.has(key)) continue;
-      const bucket = dailyMap.get(key);
-      if (!bucket) continue;
-      if (!bucket.hasHistoricalRealized) {
-        const amount = row.final_price_usd ?? 0;
-        bucket.realized.all += amount;
-        bucket.realized.domestic += amount;
-        if (amount > 0) bucket.realized.soldLots += 1;
-        // Tracked auctions only cover AD/GD (GI is historical-only).
-        bucket.bySource[p.platform] += amount;
-      }
+  for (const { platform, row } of dedupSold) {
+    if (!row.close_time_utc) continue;
+    const key = etDateKey(row.close_time_utc);
+    if (!chartDaySet.has(key)) continue;
+    const bucket = dailyMap.get(key);
+    if (!bucket) continue;
+    if (!bucket.hasHistoricalRealized) {
+      const amount = row.final_price_usd ?? 0;
+      bucket.realized.all += amount;
+      bucket.realized.domestic += amount;
+      if (amount > 0) bucket.realized.soldLots += 1;
+      // Tracked auctions only cover AD/GD (GI is historical-only); cross-listings
+      // attribute to GovDeals via dedupByAsset.
+      bucket.bySource[platform] += amount;
     }
-    for (const row of p.openProjections) {
-      if (!row.close_time_utc) continue;
-      const key = etDateKey(row.close_time_utc);
-      if (!chartDaySet.has(key)) continue;
-      const bucket = dailyMap.get(key);
-      if (!bucket) continue;
-      bucket.projected += row.projected_gmv_usd;
-    }
+  }
+  for (const { row } of dedupOpen) {
+    if (!row.close_time_utc) continue;
+    const key = etDateKey(row.close_time_utc);
+    if (!chartDaySet.has(key)) continue;
+    const bucket = dailyMap.get(key);
+    if (!bucket) continue;
+    bucket.projected += row.projected_gmv_usd;
   }
 
   const daily = chartDays.map((date) => {
@@ -977,22 +1048,61 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     };
   });
 
+  // Per-platform tracked aggregates for the live quarter, computed from the
+  // deduped sets with the SAME predicate the daily fill uses (day in-quarter and
+  // not covered by the historical CSV) so the AllSurplus/GovDeals blocks sum to
+  // the headline total. Without this, rows closing in the ET evening before the
+  // quarter start (fetched by the UTC-bounded query but bucketed to the prior
+  // day) would inflate the blocks past the chart.
+  const trackedDay = (iso: string | null): boolean => {
+    if (!iso) return false;
+    const key = etDateKey(iso);
+    if (!chartDaySet.has(key)) return false;
+    const bucket = dailyMap.get(key);
+    return bucket ? !bucket.hasHistoricalRealized : false;
+  };
+  const dedupAgg = (platform: "AD" | "GD") => {
+    const soldRows = dedupSold.filter((x) => x.platform === platform && trackedDay(x.row.close_time_utc)).map((x) => x.row);
+    const openRows = dedupOpen.filter((x) => x.platform === platform && trackedDay(x.row.close_time_utc)).map((x) => x.row);
+    const closedRows = dedupClosed.filter((x) => x.platform === platform && trackedDay(x.row.close_time_utc));
+    return {
+      realizedGmv: soldRows.reduce((s, r) => s + (r.final_price_usd ?? 0), 0),
+      soldCount: soldRows.filter((r) => (r.final_price_usd ?? 0) > 0).length,
+      closedCount: closedRows.length,
+      projectedOpenGmv: openRows.reduce((s, r) => s + r.projected_gmv_usd, 0),
+      openBid: openRows.reduce((s, r) => s + (r.current_bid_usd ?? 0), 0),
+      openCount: openRows.length,
+    };
+  };
+
   const rows = perPlatform.map((p) => {
-    const totalGmv = p.realizedGmv + p.projectedOpenGmv;
+    const agg = dedupAgg(p.platform);
+    // Closed quarters read realized from the CSV (historical_export) and keep
+    // their raw tracked counts — unchanged behavior. The live quarter reads
+    // tracked auctions, deduped here so the two platform blocks sum to the
+    // headline total instead of ~2x it (cross-listed lots were double-counted).
+    const isHistorical = p.realizedSource === "historical_export";
+    const realizedGmv = isHistorical ? p.realizedGmv : agg.realizedGmv;
+    const auctionsSold = isHistorical ? p.auctionsSold : agg.soldCount;
+    const auctionsClosed = isHistorical ? p.closed.length : agg.closedCount;
+    const openCount = isHistorical ? p.open.length : agg.openCount;
+    const openBid = isHistorical ? p.openBid : agg.openBid;
+    const projectedOpenGmv = isHistorical ? p.projectedOpenGmv : agg.projectedOpenGmv;
+    const totalGmv = realizedGmv + projectedOpenGmv;
     return {
       platform: p.platform,
-      realized_gmv_usd: Math.round(p.realizedGmv),
-      realized_revenue_usd: Math.round(p.realizedGmv * takeRate),
-      auctions_closed: p.closed.length,
-      auctions_sold: p.auctionsSold,
+      realized_gmv_usd: Math.round(realizedGmv),
+      realized_revenue_usd: Math.round(realizedGmv * takeRate),
+      auctions_closed: auctionsClosed,
+      auctions_sold: auctionsSold,
       close_rate: Math.round(p.closeRate * 10000) / 10000,
       avg_hammer_usd: Math.round(p.avgHammer),
       realized_source: p.realizedSource,
       projection_model: p.projectionModel,
-      scheduled_open_auctions: p.open.length,
-      scheduled_open_bid_usd: Math.round(p.openBid),
-      projected_remaining_gmv_usd: Math.round(p.projectedOpenGmv),
-      projected_remaining_revenue_usd: Math.round(p.projectedOpenGmv * takeRate),
+      scheduled_open_auctions: openCount,
+      scheduled_open_bid_usd: Math.round(openBid),
+      projected_remaining_gmv_usd: Math.round(projectedOpenGmv),
+      projected_remaining_revenue_usd: Math.round(projectedOpenGmv * takeRate),
       projected_total_gmv_usd: Math.round(totalGmv),
       projected_total_revenue_usd: Math.round(totalGmv * takeRate),
     };
