@@ -3,6 +3,8 @@ import { supabaseAdmin } from "@/lib/supabase";
 import { scrapeListings } from "@/lib/scraper";
 import { scrapeMarketplaceMetrics, type SellerInfo } from "@/lib/marketplace-metrics";
 import { ingestAuctions } from "@/lib/auctions";
+import { fetchSoldRange } from "@/lib/sold-export";
+import { writeSoldLots, isAzureSqlConfigured } from "@/lib/azure-sql";
 import { fetchNewContracts, fetchContractSummary } from "@/lib/contracts";
 import { fetchSamOpportunities } from "@/lib/sam-opportunities";
 import { fetchAllStateContracts } from "@/lib/state-contracts";
@@ -123,6 +125,48 @@ export async function GET(request: Request) {
     },
   );
 
+  // Durable per-lot capture into Azure SQL (lqdt.sold_lots). Writes the last few
+  // ET days' COMPLETE, deduped feed (via fetchSoldRange — true marketplace, incl.
+  // GI) so the data is preserved before Maestro's ~12-month archive rolls it off.
+  // Idempotent MERGE (row_key), so re-running each 4h just refreshes late-settling
+  // lots. A short trailing window keeps it well within maxDuration.
+  const soldCaptureTask = logger.track(
+    "sold_lots",
+    async () => {
+      if (!isAzureSqlConfigured()) {
+        return { written: 0, from: null, to: null, truncated: false, skipped: true, error: null };
+      }
+      const lookback = Number(process.env.SOLD_CAPTURE_LOOKBACK_DAYS) || 3;
+      const to = date; // ET today (see `now` above)
+      const fromDate = new Date(`${date}T00:00:00Z`);
+      fromDate.setUTCDate(fromDate.getUTCDate() - (lookback - 1));
+      const from = fromDate.toISOString().slice(0, 10);
+      // Bound the whole capture so a cold/paused serverless DB (or a slow Maestro
+      // pull) can't push the shared 60s cron past maxDuration and get the function
+      // killed — which would drop cron_runs logging and the noon email for every
+      // task. On timeout this task is marked failed; the rest of the cron proceeds.
+      const timeoutMs = Number(process.env.SOLD_CAPTURE_TIMEOUT_MS) || 45000;
+      try {
+        return await Promise.race([
+          (async () => {
+            const fetched = await fetchSoldRange(from, to, { maxPages: 400 });
+            const { written } = await writeSoldLots(fetched.rows);
+            return { written, from, to, truncated: fetched.truncated, skipped: false, error: null as string | null };
+          })(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("sold_lots capture timeout")), timeoutMs)),
+        ]);
+      } catch (e) {
+        return { written: 0, from, to, truncated: false, skipped: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+    (r): SourceSummary => ({
+      status: r.skipped ? "skipped" : r.error ? "failed" : "success",
+      rows: r.written,
+      detail: { from: r.from, to: r.to, truncated: r.truncated },
+      error: r.error,
+    }),
+  );
+
   const federalTask = logger.track(
     "federal_contracts",
     async () => {
@@ -241,6 +285,7 @@ export async function GET(request: Request) {
     listingsTask,
     metricsTask,
     auctionsTask,
+    soldCaptureTask,
     federalTask,
     samTask,
     stateTask,

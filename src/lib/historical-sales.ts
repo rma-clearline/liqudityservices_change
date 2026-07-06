@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { convertToUsd, loadFxRates } from "./fx";
 import { buildSoldPayload, extractListings, MAESTRO_KEY, MAESTRO_URL, safeNumber, safeString, SOLD_SEARCH_PATH } from "./maestro";
 import { dateRangeForEtDay, etDateKey } from "./time";
+import { isAzureSqlConfigured, readSoldLots, storeCoversRange } from "./azure-sql";
 
 const FULL_FETCH_PAGE_SIZE = 1000;
 const MAX_FULL_FETCH_PAGES = Number(process.env.HISTORICAL_SALES_MAX_PAGES) || 25;
@@ -172,6 +173,29 @@ async function fetchRawSalesPage(date: string, page: number, pageSize: number) {
 async function fetchAllSalesForDate(date: string): Promise<CachedSalesDay> {
   const cached = cachedSalesByDate.get(date);
   if (cached && Date.now() - cached.fetchedAt < SALES_CACHE_MS) return cached;
+
+  // Prefer the durable Azure store when it actually has this day (fast, and still
+  // has days that have aged out of Maestro's ~12-month archive). SoldExportRow is a
+  // superset of HistoricalSaleRow, so it drops straight in. A day absent from the
+  // store means "not captured" (the marketplace sells daily), so storeCoversRange
+  // returns false and we fall back to the live Maestro feed rather than serve a
+  // fabricated zero-sales day. Also falls back if unconfigured or cold/slow.
+  if (isAzureSqlConfigured()) {
+    try {
+      const covered = await Promise.race([
+        storeCoversRange(date, date),
+        new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("store timeout")), 15_000)),
+      ]);
+      if (covered) {
+        const storeRows = await readSoldLots(date, date);
+        const result = { fetchedAt: Date.now(), totalRaw: storeRows.length, rows: storeRows };
+        cachedSalesByDate.set(date, result);
+        return result;
+      }
+    } catch {
+      // fall through to Maestro
+    }
+  }
 
   const [fx, firstPage] = await Promise.all([
     loadFxRates(),

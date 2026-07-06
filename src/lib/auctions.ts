@@ -14,6 +14,7 @@ import {
   type Platform,
 } from "./maestro";
 import { dateKeyToUtcDate, enumerateDays, enumerateQuarterLabelsBetween, etDateKey, parseQuarterLabel, quarterBounds } from "./time";
+import { getSoldDaily, isAzureSqlConfigured, type SoldDailyRow } from "./azure-sql";
 
 const PAGE_SIZE = Number(process.env.AUCTIONS_PAGE_SIZE) || 50;
 const MAX_PAGES_PER_PLATFORM = Number(process.env.AUCTIONS_MAX_PAGES) || 10;
@@ -1027,6 +1028,65 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     bucket.projected += row.projected_gmv_usd;
   }
 
+  // Repoint the live quarter's realized to the durable Azure store (lqdt.sold_lots):
+  // complete + deduped + includes GI + true market split — unlike the Supabase
+  // `auctions` table, whose daily capture only partially fills recent days (the
+  // 7/2+ gap the chart showed). Historical days stay on the CSV. Falls back to the
+  // tracked-auctions fill above if the store is unconfigured, empty for a day, or
+  // unreachable within the timeout (e.g. the serverless DB is paused).
+  const todayKey = etDateKey(nowIso);
+  const liveDays = chartDays.filter((d) => !historicalDailyGmv.totals.has(d) && d <= todayKey);
+  const soldBySite: Record<SourceKey, number> = { AD: 0, GD: 0, GI: 0 };
+  let soldByDayApplied = false;
+  if (liveDays.length > 0 && isAzureSqlConfigured()) {
+    try {
+      const timeoutMs = Number(process.env.FORECAST_SOLD_TIMEOUT_MS) || 25000;
+      const soldRows = await Promise.race([
+        getSoldDaily(liveDays[0], liveDays[liveDays.length - 1]),
+        new Promise<SoldDailyRow[]>((_, reject) => setTimeout(() => reject(new Error("sold_lots timeout")), timeoutMs)),
+      ]);
+      const perDay = new Map<string, { all: number; domestic: number; intl: number; lots: number } & Record<SourceKey, number>>();
+      for (const r of soldRows) {
+        let b = perDay.get(r.date);
+        if (!b) { b = { all: 0, domestic: 0, intl: 0, lots: 0, AD: 0, GD: 0, GI: 0 }; perDay.set(r.date, b); }
+        b.all += r.gmv;
+        if (r.market === "international") b.intl += r.gmv;
+        else b.domestic += r.gmv;
+        b.lots += r.lots;
+        const site: SourceKey = r.site === "AD" ? "AD" : r.site === "GD" ? "GD" : "GI";
+        b[site] += r.gmv;
+      }
+      // All-or-nothing: only override if the store has EVERY live day. Otherwise the
+      // daily headline would keep the tracked-auctions fill for the missing days
+      // while the per-platform blocks (soldBySite) would not — breaking their
+      // reconciliation. On partial coverage we leave the whole live quarter on the
+      // tracked-auctions fill, which is internally consistent.
+      const liveCovered = liveDays.every((d) => perDay.has(d));
+      if (liveCovered) {
+        for (const [key, bucket] of dailyMap) {
+          if (bucket.hasHistoricalRealized) continue;
+          const s = perDay.get(key);
+          if (!s) continue;
+          bucket.realized.all = s.all;
+          bucket.realized.domestic = s.domestic;
+          bucket.realized.international = s.intl;
+          bucket.realized.soldLots = s.lots;
+          bucket.bySource.AD = s.AD;
+          bucket.bySource.GD = s.GD;
+          bucket.bySource.GI = s.GI;
+        }
+        for (const s of perDay.values()) {
+          soldBySite.AD += s.AD;
+          soldBySite.GD += s.GD;
+          soldBySite.GI += s.GI;
+        }
+        soldByDayApplied = true;
+      }
+    } catch {
+      soldByDayApplied = false; // store unreachable → keep the tracked-auctions fill
+    }
+  }
+
   const daily = chartDays.map((date) => {
     const v = dailyMap.get(date) ?? { realized: emptyHistoricalDailyGmv(), bySource: emptyBySource(), projected: 0 };
     return {
@@ -1082,7 +1142,15 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     // tracked auctions, deduped here so the two platform blocks sum to the
     // headline total instead of ~2x it (cross-listed lots were double-counted).
     const isHistorical = p.realizedSource === "historical_export";
-    const realizedGmv = isHistorical ? p.realizedGmv : agg.realizedGmv;
+    // Live quarter: prefer the durable store's per-site realized (complete) so the
+    // AllSurplus/GovDeals blocks reconcile with the headline (GI, having no block,
+    // stays in the total only — as with historical quarters). Falls back to the
+    // deduped auctions total when the store isn't in play.
+    const realizedGmv = isHistorical
+      ? p.realizedGmv
+      : soldByDayApplied
+        ? soldBySite[p.platform]
+        : agg.realizedGmv;
     const auctionsSold = isHistorical ? p.auctionsSold : agg.soldCount;
     const auctionsClosed = isHistorical ? p.closed.length : agg.closedCount;
     const openCount = isHistorical ? p.open.length : agg.openCount;

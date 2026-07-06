@@ -8,7 +8,9 @@ import {
   type ExportPeriod,
   type ExportSite,
   type ExportType,
+  type SoldExportRow,
 } from "@/lib/sold-export";
+import { isAzureSqlConfigured, readSoldLots, storeCoversRange } from "@/lib/azure-sql";
 import { toCsv } from "@/lib/format";
 import { siteLabel } from "@/lib/sites";
 import { etTodayKey, quarterBounds } from "@/lib/time";
@@ -17,6 +19,42 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+type SoldSource = {
+  rows: SoldExportRow[];
+  total_in_range: number;
+  fetched: number;
+  truncated: boolean;
+  source: "sold_lots" | "maestro";
+};
+
+const STORE_TIMEOUT_MS = Number(process.env.STORE_READ_TIMEOUT_MS) || 25000;
+
+function withTimeout<T>(p: Promise<T>, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(label)), STORE_TIMEOUT_MS)),
+  ]);
+}
+
+// Prefer the durable Azure store, but ONLY for a range it FULLY covers (every ET
+// day present) — otherwise a leading/interior gap would be served as a complete $0
+// result. Fall back to the live Maestro feed when the store is unconfigured, doesn't
+// fully cover the range, or is cold/slow (times out on a paused serverless DB).
+async function loadSoldRows(from: string, to: string): Promise<SoldSource> {
+  if (isAzureSqlConfigured()) {
+    try {
+      if (await withTimeout(storeCoversRange(from, to), "store coverage timeout")) {
+        const rows = await withTimeout(readSoldLots(from, to), "store read timeout");
+        return { rows, total_in_range: rows.length, fetched: rows.length, truncated: false, source: "sold_lots" };
+      }
+    } catch {
+      // store unreachable / slow / partial → fall through to Maestro
+    }
+  }
+  const f = await fetchSoldRange(from, to);
+  return { rows: f.rows, total_in_range: f.total_in_range, fetched: f.fetched, truncated: f.truncated, source: "maestro" };
+}
 
 function parseSite(v: string | null): ExportSite {
   return v === "AD" || v === "GD" || v === "GI" ? v : "all";
@@ -61,9 +99,9 @@ export async function GET(request: Request) {
     maxUsd: num(searchParams.get("maxUsd")),
   };
 
-  let fetched;
+  let fetched: SoldSource;
   try {
-    fetched = await fetchSoldRange(from, to);
+    fetched = await loadSoldRows(from, to);
   } catch (e) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : String(e) },
@@ -82,6 +120,7 @@ export async function GET(request: Request) {
     "X-Export-Truncated": String(fetched.truncated),
     "X-Export-From": from,
     "X-Export-To": to,
+    "X-Export-Source": fetched.source,
   });
 
   if (mode === "pivot") {
