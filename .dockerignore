@@ -1,0 +1,15 @@
+# Build context excludes — keep the image lean and never ship secrets.
+.git
+.github
+.next
+node_modules
+npm-debug.log*
+.env
+.env.*
+!.env.local.example
+.vscode
+.claude
+*.log
+dev-server*.log
+README.md
+GMV_export_debug.md
