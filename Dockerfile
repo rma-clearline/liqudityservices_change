@@ -15,13 +15,25 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 # NEXT_PUBLIC_* are inlined into the client bundle at build time, so they must be
-# present here (passed as build-args by the CI). Server-only secrets are injected
-# at runtime by Container Apps and must NOT be baked in.
+# the REAL values here (passed as build-args by the CI).
 ARG NEXT_PUBLIC_SUPABASE_URL
 ARG NEXT_PUBLIC_SUPABASE_ANON_KEY
+# Server-only secrets are read at RUNTIME (not inlined) and injected by Container
+# Apps. But several modules construct clients at import time (e.g. supabase
+# createClient), which runs during `next build`'s page-data collection and throws
+# on a missing key. Give those a harmless build-time PLACEHOLDER — never used at
+# runtime, never baked into the client bundle (only NEXT_PUBLIC_* are inlined).
 ENV NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL \
     NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY \
-    NEXT_TELEMETRY_DISABLED=1
+    NEXT_TELEMETRY_DISABLED=1 \
+    SUPABASE_SECRET_KEY=build-placeholder \
+    MAESTRO_API_KEY=build-placeholder \
+    MAESTRO_API_URL=https://build-placeholder.local \
+    CRON_SECRET=build-placeholder \
+    RESEND_API_KEY=build-placeholder \
+    RESEND_FROM_EMAIL=build@placeholder.local \
+    NOTIFICATION_EMAIL=build@placeholder.local \
+    SAM_API_KEY=build-placeholder
 RUN npm run build
 
 # --- runner: minimal production image ---
