@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { supabase } from "@/lib/supabase";
+import { ttlCache } from "@/lib/cache";
 
 export const dynamic = "force-dynamic";
 
@@ -44,7 +45,17 @@ type CronRunRow = {
   duration_ms: number | null;
 };
 
+// The freshness provider fetches this on every dashboard page mount (8 Supabase
+// reads). Cache the computed payload briefly so tab-to-tab navigation doesn't
+// re-run them; 30s keeps the freshness/alerts near-live (the underlying tables
+// only change every ~4h, and the UI computes row age client-side).
+const statusCache = ttlCache<Awaited<ReturnType<typeof buildDataStatus>>>(30_000);
+
 export async function GET() {
+  return NextResponse.json(await statusCache.get("data-status", buildDataStatus));
+}
+
+async function buildDataStatus() {
   const [tableEntries, cronRes] = await Promise.all([
     Promise.all(
       TABLE_FRESHNESS.map(async ({ table, column, fallback }) => [table, await latestValue(table, column, fallback)] as const),
@@ -91,7 +102,7 @@ export async function GET() {
     else if (hrs > STALE_HOURS) alerts.push({ level: "warn", message: `${table} is stale (${Math.round(hrs)}h old).` });
   }
 
-  return NextResponse.json({
+  return {
     generated_at: new Date().toISOString(),
     tables,
     alerts,
@@ -101,5 +112,5 @@ export async function GET() {
       last_run_status: lastRun?.status ?? null,
       sources: perSource,
     },
-  });
+  };
 }

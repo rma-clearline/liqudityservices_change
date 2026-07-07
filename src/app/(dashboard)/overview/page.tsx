@@ -1,18 +1,11 @@
-import { supabase } from "@/lib/supabase";
-import type { ListingRow } from "@/lib/supabase";
 import { ExecutiveSummary } from "@/components/executive-summary";
 import { fmtNum } from "@/lib/format";
+import { getLatestListing } from "@/lib/dashboard-data";
 
 export const dynamic = "force-dynamic";
 
 export default async function OverviewPage() {
-  const { data } = await supabase
-    .from("listings")
-    .select("*")
-    .order("date", { ascending: false })
-    .order("timestamp", { ascending: false })
-    .limit(1);
-  const latest = (data?.[0] ?? null) as ListingRow | null;
+  const latest = await getLatestListing();
 
   return (
     <div>

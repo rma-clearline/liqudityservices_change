@@ -1,52 +1,15 @@
-import { supabase } from "@/lib/supabase";
-import type {
-  FederalContractRow,
-  ContractSnapshotRow,
-  SamOpportunityRow,
-  StateContractRow,
-  MarketplaceSellerRow,
-} from "@/lib/supabase";
 import { FederalContracts } from "@/components/federal-contracts";
 import { SamOpportunities } from "@/components/sam-opportunities";
 import { StateContracts } from "@/components/state-contracts";
 import { GovernmentSellers } from "@/components/government-sellers";
 import { SectionHeader } from "@/components/section-header";
+import { getContractsData } from "@/lib/dashboard-data";
 
 export const dynamic = "force-dynamic";
 
-// Latest marketplace_sellers snapshot: find the newest date, then pull all of
-// that day's rows (both platforms) so the government-level mix reflects a single
-// consistent snapshot rather than a mix of dates.
-async function latestSellerSnapshot(): Promise<{ date: string | null; sellers: MarketplaceSellerRow[] }> {
-  const latest = await supabase
-    .from("marketplace_sellers")
-    .select("date")
-    .order("date", { ascending: false })
-    .limit(1);
-  const date = latest.data?.[0]?.date ?? null;
-  if (!date) return { date: null, sellers: [] };
-  const rows = await supabase.from("marketplace_sellers").select("*").eq("date", date);
-  return { date, sellers: rows.data ?? [] };
-}
-
 export default async function ContractsPage() {
-  const [contractsRes, snapshotsRes, samRes, stateRes, sellerSnapshot] = await Promise.all([
-    supabase.from("federal_contracts").select("*").order("start_date", { ascending: false }).limit(20),
-    supabase.from("contract_snapshots").select("*").order("date", { ascending: false }).limit(1),
-    supabase.from("sam_opportunities").select("*").order("posted_date", { ascending: false }).limit(100),
-    supabase
-      .from("state_contracts")
-      .select("*")
-      .order("year", { ascending: false })
-      .order("quarter", { ascending: false })
-      .limit(200),
-    latestSellerSnapshot(),
-  ]);
-
-  const contracts: FederalContractRow[] = contractsRes.data ?? [];
-  const contractSnapshot: ContractSnapshotRow | null = snapshotsRes.data?.[0] ?? null;
-  const samOpportunities: SamOpportunityRow[] = samRes.data ?? [];
-  const stateContracts: StateContractRow[] = stateRes.data ?? [];
+  const { contracts, snapshot: contractSnapshot, sam: samOpportunities, state: stateContracts, sellerSnapshot } =
+    await getContractsData();
 
   return (
     <div className="space-y-10">

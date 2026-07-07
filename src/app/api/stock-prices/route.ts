@@ -5,6 +5,20 @@ export const dynamic = "force-dynamic";
 const DEFAULT_TICKER = "LQDT";
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// Cache successful Yahoo responses per (ticker, from, to) for a few minutes — the
+// series only changes daily, and this avoids hammering Yahoo on every dashboard
+// load. Inline (not the shared helper) so the 400/502 error responses below stay
+// intact; only successes are cached.
+type PricePayload = {
+  ticker: string;
+  name: string | null;
+  currency: string;
+  source: string;
+  prices: Array<{ date: string; close: number }>;
+};
+const priceCache = new Map<string, { at: number; data: PricePayload }>();
+const PRICE_TTL_MS = Number(process.env.STOCK_PRICE_CACHE_MS) || 5 * 60_000;
+
 type YahooChartResponse = {
   chart?: {
     result?: Array<{
@@ -67,6 +81,12 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: "from must be on or before to" }, { status: 400 });
     }
 
+    const cacheKey = `${ticker}|${from}|${to}`;
+    const cachedHit = priceCache.get(cacheKey);
+    if (cachedHit && Date.now() - cachedHit.at < PRICE_TTL_MS) {
+      return NextResponse.json(cachedHit.data);
+    }
+
     const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}`);
     url.searchParams.set("period1", String(epochSeconds(from)));
     url.searchParams.set("period2", String(epochSeconds(to, 1)));
@@ -110,13 +130,15 @@ export async function GET(request: Request) {
       });
     }
 
-    return NextResponse.json({
+    const data: PricePayload = {
       ticker: result?.meta?.symbol ?? ticker,
       name: result?.meta?.longName ?? null,
       currency: result?.meta?.currency ?? "USD",
       source: "Yahoo Finance chart",
       prices,
-    });
+    };
+    priceCache.set(cacheKey, { at: Date.now(), data });
+    return NextResponse.json(data);
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 400 });
   }
