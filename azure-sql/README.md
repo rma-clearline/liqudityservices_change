@@ -55,3 +55,31 @@ as `lqdt_app`, no admin needed). Substitute `<<AZURE_SQL_PASSWORD>>` at run time
   Maestro until fully filled.
 - **Reconciliation (2025-07-06 → today):** 725,089 lots / ~$888M, within −0.2% of the
   reference CSV (difference is the archive floor shifting 4 days + daily growth).
+
+## Scheduled Container Apps Jobs (resource group `cl-tool-rg`, env `cl-aca-env`)
+Container Apps has no built-in cron, so scheduling lives in ACA **Jobs** (created via
+`az containerapp job create --yaml`; multi-arg `command` needs the YAML form). All
+times are **UTC**.
+
+- **`lqdt-cron`** — the app's data pipeline. Cron `0 0,4,8,12,16,20 * * *` (every 4h).
+  Runs `curl -fsS "$APP_URL/api/cron?secret=$CRON_SECRET"` (secret `cron-secret`), which
+  drives the scrapers + the daily `sold_lots` capture. This replaced the old Vercel cron.
+- **`lqdt-keepwarm`** — kills the app cold-start cheaply. Cron `*/4 11-23 * * 1-5`
+  (~every 4 min, ~7am–8pm ET weekdays; window shifts ±1h with DST). Runs
+  `curl -fsS -o /dev/null "$APP_URL/login"` — a **public** page, so it keeps ≥1 replica
+  alive (a request inside the 300s scale-down cooldown prevents scale-to-zero) without a
+  session and without touching the DB. The 0.25-vCPU app fits inside Container Apps' free
+  monthly grant (~200h), so business-hours warmth is effectively free; it still scales to
+  zero overnight/weekends. Deliberately does **not** ping a DB-touching route, so the
+  serverless SQL DB stays paused (keeping it warm would cost ~$50/mo).
+
+Both jobs set `APP_URL=https://lqdt.clearlineflow.com`. Trigger a manual run to test:
+`az containerapp job start -n <job> -g cl-tool-rg`.
+
+## Caching (perceived load speed)
+Dashboard pages are `force-dynamic`; a small shared in-memory TTL cache (`src/lib/cache.ts`)
+fronts the read-only, user-independent hot paths so repeat navigation skips the
+cross-region Supabase round trips: `src/lib/dashboard-data.ts` (listings/contracts/
+marketplace, ~60s), `/api/data-status` (~30s), `/api/forecast` (60s), `/api/stock-prices`
+(~5min). Per-replica, so it pairs with `lqdt-keepwarm`. TTL env overrides:
+`DASHBOARD_CACHE_MS`, `STOCK_PRICE_CACHE_MS`.
