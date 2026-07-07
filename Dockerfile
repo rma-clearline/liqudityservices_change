@@ -33,7 +33,11 @@ ENV NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL \
     RESEND_API_KEY=build-placeholder \
     RESEND_FROM_EMAIL=build@placeholder.local \
     NOTIFICATION_EMAIL=build@placeholder.local \
-    SAM_API_KEY=build-placeholder
+    SAM_API_KEY=build-placeholder \
+    AUTH_SECRET=build-placeholder \
+    ENTRA_TENANT_ID=build-placeholder \
+    ENTRA_CLIENT_ID=build-placeholder \
+    ENTRA_CLIENT_SECRET=build-placeholder
 RUN npm run build
 
 # --- runner: minimal production image ---
