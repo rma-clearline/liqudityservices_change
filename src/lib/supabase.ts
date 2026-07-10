@@ -165,10 +165,11 @@ export type StateContractRow = {
   period_start: string | null;
   period_end: string | null;
   record_type: string | null;
+  source_query: string | null;
   raw_data: Record<string, unknown> | null;
   first_seen_date: string;
-  // Advances on every cron run the row is still matched (drives freshness);
-  // first_seen_date stays at the original insert date. Added in migration 023.
+  // Advances when the source changes this row; source-level freshness is tracked
+  // separately in cron_runs to avoid no-op updates.
   last_seen_date: string | null;
   created_at: string;
 };

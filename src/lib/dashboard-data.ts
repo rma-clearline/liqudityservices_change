@@ -17,7 +17,7 @@ import { ttlCache } from "./cache";
 // per-replica TTL cache is safe. The pages stay `force-dynamic` (the auth layout
 // needs it); only the DATA is cached, so repeat tab navigation skips the
 // cross-region Supabase round trips. Pairs with the business-hours keep-warm.
-const TTL = Number(process.env.DASHBOARD_CACHE_MS) || 60_000;
+const TTL = Number(process.env.DASHBOARD_CACHE_MS) || 15 * 60_000;
 
 // --- Listings (root + overview) ---
 const listingsCache = ttlCache<ListingRow[]>(TTL);
@@ -72,7 +72,11 @@ export function getContractsData(): Promise<ContractsData> {
       supabase.from("sam_opportunities").select("*").order("posted_date", { ascending: false }).limit(100),
       supabase
         .from("state_contracts")
-        .select("*")
+        .select(
+          "id,state_code,source_portal,source_dataset_id,contract_id,vendor_name,vendor_normalized," +
+            "customer_agency,contract_title,amount,year,quarter,period_start,period_end,record_type," +
+            "source_query,first_seen_date,last_seen_date,created_at",
+        )
         .order("year", { ascending: false })
         .order("quarter", { ascending: false })
         .limit(200),
@@ -82,7 +86,7 @@ export function getContractsData(): Promise<ContractsData> {
       contracts: (contractsRes.data ?? []) as FederalContractRow[],
       snapshot: (snapshotsRes.data?.[0] ?? null) as ContractSnapshotRow | null,
       sam: (samRes.data ?? []) as SamOpportunityRow[],
-      state: (stateRes.data ?? []) as StateContractRow[],
+      state: (stateRes.data ?? []) as unknown as StateContractRow[],
       sellerSnapshot,
     };
   });

@@ -46,28 +46,24 @@ type CronRunRow = {
 };
 
 // The freshness provider fetches this on every dashboard page mount (8 Supabase
-// reads). Cache the computed payload briefly so tab-to-tab navigation doesn't
-// re-run them; 30s keeps the freshness/alerts near-live (the underlying tables
+// reads). Cache the computed payload so tab-to-tab navigation doesn't re-run
+// them; five minutes is still near-live relative to the four-hour ingestion
 // only change every ~4h, and the UI computes row age client-side).
-const statusCache = ttlCache<Awaited<ReturnType<typeof buildDataStatus>>>(30_000);
+const statusCache = ttlCache<Awaited<ReturnType<typeof buildDataStatus>>>(5 * 60_000);
 
 export async function GET() {
   return NextResponse.json(await statusCache.get("data-status", buildDataStatus));
 }
 
 async function buildDataStatus() {
-  const [tableEntries, cronRes] = await Promise.all([
-    Promise.all(
-      TABLE_FRESHNESS.map(async ({ table, column, fallback }) => [table, await latestValue(table, column, fallback)] as const),
-    ),
+  const [tables, cronRes] = await Promise.all([
+    loadTableFreshness(),
     supabase
       .from("cron_runs")
       .select("run_id, source, status, rows_ingested, error, started_at, ended_at, duration_ms")
       .order("started_at", { ascending: false })
       .limit(60),
   ]);
-
-  const tables = Object.fromEntries(tableEntries.map(([table, value]) => [table, value]));
 
   // Reduce recent cron_runs to the latest entry per source.
   const cronRows = (cronRes.data ?? []) as CronRunRow[];
@@ -113,4 +109,17 @@ async function buildDataStatus() {
       sources: perSource,
     },
   };
+}
+
+async function loadTableFreshness(): Promise<Record<string, string | null>> {
+  const { data, error } = await supabase.rpc("latest_data_freshness");
+  if (!error && data && typeof data === "object" && !Array.isArray(data)) {
+    return data as Record<string, string | null>;
+  }
+  // Rolling-deploy fallback until migration 025 is present.
+  const entries = await Promise.all(
+    TABLE_FRESHNESS.map(async ({ table, column, fallback }) =>
+      [table, await latestValue(table, column, fallback)] as const),
+  );
+  return Object.fromEntries(entries);
 }

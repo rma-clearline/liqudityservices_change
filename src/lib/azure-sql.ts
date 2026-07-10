@@ -103,7 +103,15 @@ const MERGE_SQL = `
 MERGE lqdt.sold_lots WITH (HOLDLOCK) AS T
 USING (SELECT * FROM lqdt.sold_lots_staging WHERE batch_id = @bid) AS S
   ON T.row_key = S.row_key
-WHEN MATCHED THEN UPDATE SET
+WHEN MATCHED AND EXISTS (
+  SELECT S.asset_id, S.auction_id, S.account_id, S.site, S.platform, S.seller, S.seller_type, S.gov_level,
+         S.title, S.category, S.country, S.state, S.market, S.currency_code, S.sale_amount_native,
+         S.sale_amount_usd, S.bid_count, S.url, S.close_time_utc, S.close_date_et
+  EXCEPT
+  SELECT T.asset_id, T.auction_id, T.account_id, T.site, T.platform, T.seller, T.seller_type, T.gov_level,
+         T.title, T.category, T.country, T.state, T.market, T.currency_code, T.sale_amount_native,
+         T.sale_amount_usd, T.bid_count, T.url, T.close_time_utc, T.close_date_et
+) THEN UPDATE SET
   T.asset_id = S.asset_id, T.auction_id = S.auction_id, T.account_id = S.account_id, T.site = S.site,
   T.platform = S.platform, T.seller = S.seller, T.seller_type = S.seller_type, T.gov_level = S.gov_level,
   T.title = S.title, T.category = S.category, T.country = S.country, T.state = S.state, T.market = S.market,
@@ -197,6 +205,21 @@ async function mergeBatch(pool: sql.ConnectionPool, batchId: string): Promise<vo
       }
       throw e;
     }
+  }
+  try {
+    await pool
+      .request()
+      .input("bid", sql.UniqueIdentifier, batchId)
+      .query(
+        "MERGE lqdt.sold_coverage AS T " +
+          "USING (SELECT DISTINCT close_date_et FROM lqdt.sold_lots_staging WHERE batch_id = @bid) AS S " +
+          "ON T.close_date_et = S.close_date_et " +
+          "WHEN MATCHED THEN UPDATE SET refreshed_at = SYSUTCDATETIME() " +
+          "WHEN NOT MATCHED THEN INSERT (close_date_et) VALUES (S.close_date_et);",
+      );
+  } catch (error) {
+    // Allow a rolling app deploy before migration 002 is applied.
+    if (sqlErrorNumber(error) !== 208) throw error;
   }
   // Clear this batch's staging rows. Best-effort; a rare failed DELETE leaves rows
   // scoped to a dead batch_id (never re-selected) — acceptable vs. failing the write.
@@ -305,8 +328,20 @@ export async function storeCoversRange(fromEt: string, toEt: string): Promise<bo
   const end = Date.parse(`${toEt}T00:00:00Z`);
   if (Number.isNaN(start) || Number.isNaN(end) || end < start) return false;
   const calendarDays = Math.round((end - start) / 86_400_000) + 1;
-  const { days } = await soldCoverage(fromEt, toEt);
-  return days >= calendarDays;
+  const pool = await getPool();
+  try {
+    const result = await pool
+      .request()
+      .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+      .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
+      .query("SELECT COUNT(*) AS days FROM lqdt.sold_coverage WHERE close_date_et BETWEEN @from AND @to");
+    return Number(result.recordset[0]?.days ?? 0) >= calendarDays;
+  } catch (error) {
+    // Backward-compatible until 002_cost_optimizations.sql is deployed.
+    if (sqlErrorNumber(error) !== 208) throw error;
+    const { days } = await soldCoverage(fromEt, toEt);
+    return days >= calendarDays;
+  }
 }
 
 export type SoldDailyRow = {
@@ -351,17 +386,63 @@ export async function getSoldDaily(fromEt: string, toEt: string): Promise<SoldDa
  * onto the durable store for any retained date — and reach data that has since
  * aged out of Maestro's ~12-month archive.
  */
-export async function readSoldLots(fromEt: string, toEt: string): Promise<SoldExportRow[]> {
+export type SoldLotReadFilters = {
+  site?: string;
+  sellerType?: string;
+  govLevel?: string;
+  market?: string;
+  category?: string;
+  state?: string;
+  country?: string;
+  minUsd?: number;
+  maxUsd?: number;
+};
+
+export async function readSoldLots(
+  fromEt: string,
+  toEt: string,
+  filters: SoldLotReadFilters = {},
+): Promise<SoldExportRow[]> {
   const pool = await getPool();
-  const r = await pool
+  const request = pool
     .request()
     .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
-    .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
-    .query(
+    .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`));
+  const where = ["close_date_et BETWEEN @from AND @to"];
+  const exact = [
+    ["site", "site", filters.site],
+    ["sellerType", "seller_type", filters.sellerType],
+    ["govLevel", "gov_level", filters.govLevel],
+    ["market", "market", filters.market],
+  ] as const;
+  for (const [parameter, column, value] of exact) {
+    if (!value) continue;
+    request.input(parameter, sql.NVarChar, value);
+    where.push(`${column} = @${parameter}`);
+  }
+  const contains = [
+    ["category", "category", filters.category],
+    ["state", "state", filters.state],
+    ["country", "country", filters.country],
+  ] as const;
+  for (const [parameter, column, value] of contains) {
+    if (!value) continue;
+    request.input(parameter, sql.NVarChar, `%${value}%`);
+    where.push(`${column} LIKE @${parameter}`);
+  }
+  if (filters.minUsd != null) {
+    request.input("minUsd", sql.Decimal(19, 4), filters.minUsd);
+    where.push("sale_amount_usd >= @minUsd");
+  }
+  if (filters.maxUsd != null) {
+    request.input("maxUsd", sql.Decimal(19, 4), filters.maxUsd);
+    where.push("sale_amount_usd <= @maxUsd");
+  }
+  const r = await request.query(
       "SELECT asset_id, auction_id, account_id, site, platform, seller, seller_type, gov_level, " +
         "title, category, country, state, market, currency_code, sale_amount_native, sale_amount_usd, " +
         "bid_count, url, close_time_utc, CONVERT(char(10), close_date_et, 23) AS close_date_et " +
-        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to",
+        `FROM lqdt.sold_lots WHERE ${where.join(" AND ")}`,
     );
   return r.recordset.map((x): SoldExportRow => {
     const closeIso = x.close_time_utc instanceof Date ? x.close_time_utc.toISOString() : (x.close_time_utc ?? "");

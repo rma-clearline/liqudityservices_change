@@ -35,6 +35,7 @@ function isRecent(c: StateContractRow, cutoff: string): boolean {
 
 function buildSourceUrl(c: StateContractRow): string {
   const base = `https://${c.source_portal}/resource/${c.source_dataset_id}`;
+  if (c.source_query) return `${base}?$q=${encodeURIComponent(c.source_query)}`;
   const raw = (c.raw_data ?? {}) as Record<string, unknown>;
   let q = "";
   // Per-dataset: pick the most-identifying field for $q full-text search

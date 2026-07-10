@@ -30,15 +30,17 @@ If unset, everything transparently falls back to the live Maestro feed.
 ## Data flow
 - **Backfill (one-time):** `GET /api/backfill-sold?from=YYYY-MM-DD&to=YYYY-MM-DD&key=$CRON_SECRET`
   (drive it month-by-month; idempotent, re-runnable; `maxPages` bounds the page budget).
-- **Daily capture:** the cron (`/api/cron`) `sold_lots` task writes the last
-  `SOLD_CAPTURE_LOOKBACK_DAYS` (default 3) ET days each run — bounded by a 45s timeout.
+- **Daily capture:** the four-hour cron only runs the `sold_lots` reconciliation
+  during `DAILY_INGEST_HOURS_ET` (default `11,12`, DST-safe). It writes the last
+  `SOLD_CAPTURE_LOOKBACK_DAYS` (default 3) ET days and skips unchanged matched rows.
+  Pass `?sold=1` or `?daily=1` for a forced manual reconciliation.
 - **Reads:** forecast (live-quarter realized), export, and drill-down prefer the store
   but only for a range it **fully covers** (`storeCoversRange`), else fall back to
   Maestro — so a gap day is never served as a complete `$0` result. Each store read is
   timeout-guarded so a cold/paused DB falls back instead of hanging.
 
 ## Migration / bootstrap
-`azure-sql/001_create_sold_lots.sql` — run once as a SQL admin (it creates the schema,
+Run `azure-sql/001_create_sold_lots.sql`, then `002_cost_optimizations.sql`, as a SQL admin (they create the schema,
 tables, and grants `lqdt_app` ownership of the `lqdt` schema so future migrations run
 as `lqdt_app`, no admin needed). Substitute `<<AZURE_SQL_PASSWORD>>` at run time.
 

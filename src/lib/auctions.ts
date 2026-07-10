@@ -483,7 +483,7 @@ async function ingestSoldAuctions(fx: FxRates, nowIso: string) {
   return { allsurplus, govdeals };
 }
 
-export async function ingestAuctions(): Promise<AuctionsIngestResult> {
+export async function ingestAuctions(options: { includeSold?: boolean } = {}): Promise<AuctionsIngestResult> {
   const fx = await loadFxRates();
   // Persist the day's rates for the audit trail (best-effort; never blocks).
   void persistFxRates(fx);
@@ -496,7 +496,11 @@ export async function ingestAuctions(): Promise<AuctionsIngestResult> {
 
   // Mark recently-sold auctions before sweeping the rest closed, so a lot that
   // sold isn't misfiled as closed_nosale/unknown.
-  const sold = await ingestSoldAuctions(fx, nowIso);
+  // The sold feed is a large, overlapping rolling window. Refresh it once on
+  // the daily reconciliation run; active-auction snapshots can remain frequent.
+  const sold = options.includeSold === false
+    ? { allsurplus: emptyIngestResult(), govdeals: emptyIngestResult() }
+    : await ingestSoldAuctions(fx, nowIso);
 
   const closures = await sweepClosures(nowIso);
 
@@ -583,6 +587,33 @@ export type RevenueForecast = {
     sample_row: Record<string, unknown> | null;
   };
 };
+
+/** Apply a presentation-only take rate without repeating any database reads. */
+export function applyForecastTakeRate(base: RevenueForecast, requestedRate: number): RevenueForecast {
+  const takeRate = Math.max(0, Math.min(1, Number.isFinite(requestedRate) ? requestedRate : 0.2));
+  return {
+    ...base,
+    take_rate: takeRate,
+    platforms: base.platforms.map((platform) => ({
+      ...platform,
+      realized_revenue_usd: Math.round(platform.realized_gmv_usd * takeRate),
+      projected_remaining_revenue_usd: Math.round(platform.projected_remaining_gmv_usd * takeRate),
+      projected_total_revenue_usd: Math.round(platform.projected_total_gmv_usd * takeRate),
+    })),
+    daily: base.daily.map((day) => ({
+      ...day,
+      realized_revenue_usd: Math.round(day.realized_gmv_usd * takeRate),
+      domestic_realized_revenue_usd: Math.round(day.domestic_realized_gmv_usd * takeRate),
+      international_realized_revenue_usd: Math.round(day.international_realized_gmv_usd * takeRate),
+      projected_revenue_usd: Math.round(day.projected_gmv_usd * takeRate),
+      ad_realized_revenue_usd: Math.round(day.ad_realized_gmv_usd * takeRate),
+      gd_realized_revenue_usd: Math.round(day.gd_realized_gmv_usd * takeRate),
+      gi_realized_revenue_usd: Math.round(day.gi_realized_gmv_usd * takeRate),
+    })),
+    projected_total_revenue_usd: Math.round(base.projected_total_gmv_usd * takeRate),
+    realized_total_revenue_usd: Math.round(base.realized_total_gmv_usd * takeRate),
+  };
+}
 
 function earliestHistoricalDate(data: HistoricalDailyGmvData) {
   let earliest: string | null = null;

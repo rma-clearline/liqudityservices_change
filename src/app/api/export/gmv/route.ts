@@ -41,11 +41,24 @@ function withTimeout<T>(p: Promise<T>, label: string): Promise<T> {
 // day present) — otherwise a leading/interior gap would be served as a complete $0
 // result. Fall back to the live Maestro feed when the store is unconfigured, doesn't
 // fully cover the range, or is cold/slow (times out on a paused serverless DB).
-async function loadSoldRows(from: string, to: string): Promise<SoldSource> {
+async function loadSoldRows(from: string, to: string, filters: ExportFilters): Promise<SoldSource> {
   if (isAzureSqlConfigured()) {
     try {
       if (await withTimeout(storeCoversRange(from, to), "store coverage timeout")) {
-        const rows = await withTimeout(readSoldLots(from, to), "store read timeout");
+        const rows = await withTimeout(
+          readSoldLots(from, to, {
+            site: filters.site === "all" ? undefined : filters.site,
+            sellerType: filters.type === "government" || filters.type === "retail" ? filters.type : undefined,
+            govLevel: filters.type === "federal" || filters.type === "state" || filters.type === "local" ? filters.type : undefined,
+            market: filters.market === "all" ? undefined : filters.market,
+            category: filters.category,
+            state: filters.state,
+            country: filters.country,
+            minUsd: filters.minUsd,
+            maxUsd: filters.maxUsd,
+          }),
+          "store read timeout",
+        );
         return { rows, total_in_range: rows.length, fetched: rows.length, truncated: false, source: "sold_lots" };
       }
     } catch {
@@ -85,6 +98,14 @@ export async function GET(request: Request) {
   if (!DATE_RE.test(from)) from = cur.start.toISOString().slice(0, 10);
   if (!DATE_RE.test(to)) to = etTodayKey();
   if (from > to) [from, to] = [to, from];
+  const rangeDays = Math.floor((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000) + 1;
+  const maxRangeDays = Number(process.env.EXPORT_MAX_RANGE_DAYS) || 366;
+  if (rangeDays > maxRangeDays) {
+    return NextResponse.json(
+      { error: `Export range is limited to ${maxRangeDays} days; split larger exports into smaller windows.` },
+      { status: 400 },
+    );
+  }
 
   const filters: ExportFilters = {
     from,
@@ -101,7 +122,7 @@ export async function GET(request: Request) {
 
   let fetched: SoldSource;
   try {
-    fetched = await loadSoldRows(from, to);
+    fetched = await loadSoldRows(from, to, filters);
   } catch (e) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : String(e) },

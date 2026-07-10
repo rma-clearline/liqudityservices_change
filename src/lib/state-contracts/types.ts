@@ -17,6 +17,7 @@ export type StateContract = {
   // Lifecycle stage of the record. Assigned centrally in index.ts by dataset so
   // awards/payments/solicitations aren't blended. Optional on the adapter side.
   record_type?: RecordType;
+  source_query?: string;
   raw_data: Record<string, unknown>;
 };
 

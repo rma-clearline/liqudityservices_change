@@ -20,17 +20,33 @@ export type TtlCache<T> = {
 
 export function ttlCache<T>(ttlMs: number): TtlCache<T> {
   const store = new Map<string, Entry<T>>();
+  const pending = new Map<string, Promise<T>>();
   return {
     async get(key, load) {
       const hit = store.get(key);
       if (hit && Date.now() - hit.at < ttlMs) return hit.val;
-      const val = await load();
-      store.set(key, { at: Date.now(), val });
-      return val;
+      const inFlight = pending.get(key);
+      if (inFlight) return inFlight;
+
+      const request = load()
+        .then((val) => {
+          store.set(key, { at: Date.now(), val });
+          return val;
+        })
+        .finally(() => {
+          pending.delete(key);
+        });
+      pending.set(key, request);
+      return request;
     },
     clear(key) {
-      if (key === undefined) store.clear();
-      else store.delete(key);
+      if (key === undefined) {
+        store.clear();
+        pending.clear();
+      } else {
+        store.delete(key);
+        pending.delete(key);
+      }
     },
   };
 }

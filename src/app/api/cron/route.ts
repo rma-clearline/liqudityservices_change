@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase";
 import { scrapeListings } from "@/lib/scraper";
 import { scrapeMarketplaceMetrics, type SellerInfo } from "@/lib/marketplace-metrics";
-import { ingestAuctions } from "@/lib/auctions";
+import { computeRevenueForecast, ingestAuctions } from "@/lib/auctions";
 import { fetchSoldRange } from "@/lib/sold-export";
 import { writeSoldLots, isAzureSqlConfigured } from "@/lib/azure-sql";
 import { fetchNewContracts, fetchContractSummary } from "@/lib/contracts";
@@ -11,7 +11,8 @@ import { fetchAllStateContracts } from "@/lib/state-contracts";
 import { sendDailySummary } from "@/lib/email";
 import { CronLogger, type SourceSummary } from "@/lib/cron-log";
 
-export const maxDuration = 60;
+// Daily reconciliation also materializes the forecast after ingestion.
+export const maxDuration = 120;
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
@@ -32,6 +33,17 @@ export async function GET(request: Request) {
   const now = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
   const date = now.toISOString().slice(0, 10);
   const timestamp = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  // The scheduler fires at fixed UTC hours, so noon ET shifts with daylight
+  // saving time. Accept either 11 or 12 ET by default; four-hour scheduling
+  // means only one of them can occur on a given day.
+  const dailyHours = (process.env.DAILY_INGEST_HOURS_ET || "11,12")
+    .split(",")
+    .map(Number)
+    .filter((hour) => Number.isInteger(hour) && hour >= 0 && hour <= 23);
+  const isDailyRun = dailyHours.includes(now.getHours());
+  const forceDaily = searchParams.get("daily") === "1" || searchParams.get("sendEmail") === "1";
+  const runSoldCapture = isDailyRun || forceDaily || searchParams.get("sold") === "1";
+  const runStateContracts = isDailyRun || forceDaily || searchParams.get("state") === "1";
 
   const logger = new CronLogger();
 
@@ -112,7 +124,7 @@ export async function GET(request: Request) {
 
   const auctionsTask = logger.track(
     "auctions",
-    () => ingestAuctions(),
+    () => ingestAuctions({ includeSold: runSoldCapture }),
     (r): SourceSummary => {
       const upserted = r.allsurplus.upserted + r.govdeals.upserted + r.sold.allsurplus.upserted + r.sold.govdeals.upserted;
       const error = r.rlsHint ?? r.allsurplus.upsertError ?? r.govdeals.upsertError ?? r.allsurplus.fetchError ?? r.govdeals.fetchError ?? null;
@@ -133,6 +145,9 @@ export async function GET(request: Request) {
   const soldCaptureTask = logger.track(
     "sold_lots",
     async () => {
+      if (!runSoldCapture) {
+        return { written: 0, from: null, to: null, truncated: false, skipped: true, error: null };
+      }
       if (!isAzureSqlConfigured()) {
         return { written: 0, from: null, to: null, truncated: false, skipped: true, error: null };
       }
@@ -211,8 +226,7 @@ export async function GET(request: Request) {
   // 4h (~60 req/day) throttles the key (HTTP 429) and stores nothing — the main
   // reason sam_opportunities stayed empty. Opportunities change slowly, so run
   // SAM once per day (the noon ET run, matching the email) unless forced.
-  const runSam =
-    now.getHours() === 12 || searchParams.get("sam") === "1" || searchParams.get("sendEmail") === "1";
+  const runSam = isDailyRun || forceDaily || searchParams.get("sam") === "1";
   const samTask = logger.track(
     "sam",
     async () => {
@@ -250,31 +264,38 @@ export async function GET(request: Request) {
   const stateTask = logger.track(
     "state_contracts",
     async () => {
+      if (!runStateContracts) {
+        return { stored: 0, perState: {}, error: null, skipped: true };
+      }
       const stateResult = await fetchAllStateContracts();
       let stored = 0;
       let error: string | null = null;
       if (stateResult.contracts.length > 0) {
-        // Merge (not ignore-duplicates): state datasets refresh sales/amounts on
-        // existing contracts every quarter, so we MUST update matched rows rather
-        // than drop them. `last_seen_date` advances every run (drives freshness);
-        // `first_seen_date` is preserved on update by a DB trigger (migration 023).
-        const { error: e } = await supabaseAdmin
-          .from("state_contracts")
-          .upsert(
-            stateResult.contracts.map((c) => ({ ...c, first_seen_date: date, last_seen_date: date })),
-            {
-              onConflict:
-                "state_code,source_dataset_id,contract_id,vendor_normalized,year,quarter,customer_agency,record_type",
-              ignoreDuplicates: false,
-            },
-          );
-        error = e?.message ?? null;
-        stored = e ? 0 : stateResult.contracts.length;
+        // Cost-aware merge: insert new rows and update existing rows only when a
+        // business field changes. Source freshness comes from cron_runs, avoiding
+        // a new PostgreSQL row version for every unchanged contract.
+        const rows = stateResult.contracts.map(({ raw_data, ...contract }) => {
+          void raw_data;
+          return { ...contract, first_seen_date: date, last_seen_date: date };
+        });
+        const rpc = await supabaseAdmin.rpc("upsert_state_contracts_cost_aware", { p_rows: rows });
+        if (!rpc.error) {
+          stored = Number(rpc.data ?? 0);
+        } else {
+          // Rolling-deploy fallback until migration 027 is installed.
+          const fallback = await supabaseAdmin.from("state_contracts").upsert(rows, {
+            onConflict:
+              "state_code,source_dataset_id,contract_id,vendor_normalized,year,quarter,customer_agency,record_type",
+            ignoreDuplicates: false,
+          });
+          error = fallback.error?.message ?? null;
+          stored = fallback.error ? 0 : rows.length;
+        }
       }
-      return { stored, perState: stateResult.perState, error };
+      return { stored, perState: stateResult.perState, error, skipped: false };
     },
     (r): SourceSummary => ({
-      status: r.error ? "failed" : "success",
+      status: r.skipped ? "skipped" : r.error ? "failed" : "success",
       rows: r.stored,
       detail: { perState: r.perState },
       error: r.error,
@@ -291,11 +312,57 @@ export async function GET(request: Request) {
     stateTask,
   ]);
 
-  // Email — only on the noon ET run (cron fires every 4h). ?sendEmail=1 forces.
+  // Materialize the current forecast while Azure SQL is already awake. Normal
+  // dashboard views then read one small Supabase row instead of waking SQL.
+  await logger.track(
+    "forecast_snapshot",
+    async () => {
+      if (!runSoldCapture) return { skipped: true, stored: 0, error: null as string | null };
+      try {
+        const payload = await computeRevenueForecast(1);
+        const { error } = await supabaseAdmin.from("forecast_snapshots").upsert(
+          { quarter: payload.quarter, payload, generated_at: new Date().toISOString() },
+          { onConflict: "quarter" },
+        );
+        return { skipped: false, stored: error ? 0 : 1, error: error?.message ?? null };
+      } catch (error) {
+        return { skipped: false, stored: 0, error: error instanceof Error ? error.message : String(error) };
+      }
+    },
+    (r): SourceSummary => ({
+      status: r.skipped ? "skipped" : r.error ? "failed" : "success",
+      rows: r.stored,
+      error: r.error,
+    }),
+  );
+
+  // Keep operational/history tables bounded. This runs after ingestion so it
+  // cannot contend with the writers above. Migration 024 installs the RPC.
+  await logger.track(
+    "retention",
+    async () => {
+      if (!isDailyRun && !forceDaily && searchParams.get("retention") !== "1") {
+        return { skipped: true, deleted: 0, error: null as string | null };
+      }
+      const { data, error } = await supabaseAdmin.rpc("run_cost_retention");
+      const counts = (data ?? {}) as Record<string, unknown>;
+      const deleted = Object.values(counts).reduce<number>(
+        (sum, value) => sum + (typeof value === "number" ? value : 0),
+        0,
+      );
+      return { skipped: false, deleted, error: error?.message ?? null };
+    },
+    (r): SourceSummary => ({
+      status: r.skipped ? "skipped" : r.error ? "failed" : "success",
+      rows: r.deleted,
+      error: r.error,
+    }),
+  );
+
+  // Email on the DST-safe daily run. ?sendEmail=1 forces.
   const forceEmail = searchParams.get("sendEmail") === "1";
   const skipEmail = searchParams.get("sendEmail") === "0";
-  const isNoonRun = now.getHours() === 12;
-  const shouldEmail = !skipEmail && (forceEmail || isNoonRun);
+  const shouldEmail = !skipEmail && (forceEmail || isDailyRun);
   let emailResult: { success: boolean; error?: string; chartIncluded?: boolean; chartDebug?: string } = {
     success: false,
     error: shouldEmail ? "skipped" : "skipped: not noon ET run",

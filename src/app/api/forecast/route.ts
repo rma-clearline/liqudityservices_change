@@ -1,22 +1,37 @@
 import { NextResponse } from "next/server";
-import { computeRevenueForecast, type RevenueForecast } from "@/lib/auctions";
+import { applyForecastTakeRate, computeRevenueForecast, type RevenueForecast } from "@/lib/auctions";
 import { ttlCache } from "@/lib/cache";
+import { supabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
 
-// The forecast recomputes over the whole auctions table (+ Azure SQL), and is
-// requested by both the executive summary and the forecast section. Cache briefly
-// per (takeRate, quarter) so a dashboard load doesn't compute it twice.
-const forecastCache = ttlCache<RevenueForecast>(60_000);
+// Database work depends on the quarter, not the take rate. Cache a 100%-rate base
+// forecast and apply the requested rate in memory so slider changes are free.
+const forecastCache = ttlCache<RevenueForecast>(Number(process.env.FORECAST_CACHE_MS) || 15 * 60_000);
+
+async function loadBaseForecast(quarter?: string): Promise<RevenueForecast> {
+  const snapshot = await supabase
+    .from("forecast_snapshots")
+    .select("payload")
+    .order("generated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (!snapshot.error && snapshot.data?.payload) {
+    const payload = snapshot.data.payload as unknown as RevenueForecast;
+    if (!quarter || payload.quarter === quarter) return payload;
+  }
+  // Migration-safe fallback and historical-quarter path.
+  return computeRevenueForecast(1, quarter);
+}
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const takeRateParam = searchParams.get("takeRate");
   const parsed = takeRateParam ? Number(takeRateParam) : 0.2;
-  const takeRate = Number.isFinite(parsed) ? parsed : 0.2;
+  const takeRate = Math.max(0, Math.min(1, Number.isFinite(parsed) ? parsed : 0.2));
   const quarter = searchParams.get("quarter")?.trim() || undefined;
 
-  const key = `${takeRate.toFixed(4)}|${quarter ?? "current"}`;
-  const forecast = await forecastCache.get(key, () => computeRevenueForecast(takeRate, quarter));
-  return NextResponse.json(forecast);
+  const key = quarter ?? "current";
+  const base = await forecastCache.get(key, () => loadBaseForecast(quarter));
+  return NextResponse.json(applyForecastTakeRate(base, takeRate));
 }

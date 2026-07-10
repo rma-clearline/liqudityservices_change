@@ -996,6 +996,7 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
 
 export function RevenueForecast() {
   const [takeRate, setTakeRate] = useState(0.2);
+  const [requestedTakeRate, setRequestedTakeRate] = useState(0.2);
   const [quarter, setQuarter] = useState<string | null>(null);
   const [chartMetric, setChartMetric] = useState<ChartMetric>("gmv");
   const [chartMarket, setChartMarket] = useState<SalesMarketFilter>(DEFAULT_CHART_MARKET);
@@ -1015,8 +1016,13 @@ export function RevenueForecast() {
   const [state, setState] = useState<FetchState>({ forecast: null, error: null, done: false });
 
   useEffect(() => {
+    const timer = window.setTimeout(() => setRequestedTakeRate(takeRate), 300);
+    return () => window.clearTimeout(timer);
+  }, [takeRate]);
+
+  useEffect(() => {
     let cancelled = false;
-    const params = new URLSearchParams({ takeRate: String(takeRate) });
+    const params = new URLSearchParams({ takeRate: String(requestedTakeRate) });
     if (quarter) params.set("quarter", quarter);
     fetch(`/api/forecast?${params.toString()}`)
       .then((r) => r.json())
@@ -1029,7 +1035,7 @@ export function RevenueForecast() {
     return () => {
       cancelled = true;
     };
-  }, [takeRate, quarter]);
+  }, [requestedTakeRate, quarter]);
 
   const stockDateRange = useMemo(() => {
     const daily = state.forecast?.daily ?? [];
