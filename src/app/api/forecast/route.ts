@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { applyForecastTakeRate, computeRevenueForecast, type RevenueForecast } from "@/lib/auctions";
 import { ttlCache } from "@/lib/cache";
-import { loadReportedQuarterlyGmv } from "@/lib/reported-gmv";
+import { loadModelEstimates, loadReportedQuarterlyGmv } from "@/lib/reported-gmv";
 import { supabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
@@ -34,9 +34,12 @@ export async function GET(request: Request) {
 
   const key = quarter ?? "current";
   const base = await forecastCache.get(key, () => loadBaseForecast(quarter));
-  // Attach the reported-GMV benchmark here (not in the snapshot): it's full-history,
-  // take-rate-independent, and cheap, so it's always fresh regardless of the selected
-  // quarter or when the cron last regenerated the snapshot.
-  const reported_gmv_by_quarter = await loadReportedQuarterlyGmv();
-  return NextResponse.json({ ...applyForecastTakeRate(base, takeRate), reported_gmv_by_quarter });
+  // Attach the reported-GMV benchmark + model estimates here (not in the snapshot):
+  // full-history, take-rate-independent, and cheap, so they're always fresh regardless
+  // of the selected quarter or when the cron last regenerated the snapshot.
+  const [reported_gmv_by_quarter, model_estimates_by_quarter] = await Promise.all([
+    loadReportedQuarterlyGmv(),
+    loadModelEstimates(),
+  ]);
+  return NextResponse.json({ ...applyForecastTakeRate(base, takeRate), reported_gmv_by_quarter, model_estimates_by_quarter });
 }

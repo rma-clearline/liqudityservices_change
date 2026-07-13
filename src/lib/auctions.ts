@@ -577,6 +577,14 @@ export type RevenueForecast = {
    *  scraped/projected GMV is compared against. Attached by the forecast route from
    *  the committed model export; optional so the core computation is unaffected. */
   reported_gmv_by_quarter?: { quarter: string; reported_gmv_usd: number }[];
+  /** Company guidance + Clearline model GMV estimates per calendar quarter
+   *  (from the same model export). Attached by the forecast route; optional. */
+  model_estimates_by_quarter?: {
+    quarter: string;
+    guidance_low_usd: number | null;
+    guidance_high_usd: number | null;
+    clearline_estimate_usd: number | null;
+  }[];
   debug: {
     now_iso: string;
     total_rows: number;

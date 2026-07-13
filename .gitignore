@@ -43,6 +43,9 @@ next-env.d.ts
 
 # large local data exports (used for one-off store backfills; kept out of git)
 scripts/*.xlsx
-# the financial model workbook (proprietary; the extractor reads it locally and
-# commits only the derived reported-gmv CSV) — never commit the workbook itself
+# the financial model workbook AND everything derived from it (reported GMV,
+# guidance, Clearline estimates) stay out of git — the extractor writes these
+# locally and they reach prod out-of-band, never through the repo
 scripts/*.xlsm
+scripts/reported-gmv-quarterly.csv
+scripts/model-estimates-quarterly.csv

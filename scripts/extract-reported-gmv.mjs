@@ -1,9 +1,11 @@
-// Extract LQDT's total REPORTED GMV (quarterly actuals) from the financial model
-// workbook and write a small committed CSV the app reads at runtime.
+// Extract LQDT's total REPORTED GMV (quarterly actuals), company guidance, and the
+// Clearline model's GMV estimates from the financial model workbook into two small
+// LOCAL CSVs the app reads at runtime.
 //
-// The model workbook (`scripts/LQDT Nums v*.xlsm`) is proprietary and gitignored;
-// only the derived CSV (`scripts/reported-gmv-quarterly.csv`) is committed. Re-run
-// this after each model update:  node scripts/extract-reported-gmv.mjs
+// The model workbook (`scripts/LQDT Nums v*.xlsm`) AND the derived CSVs are all
+// gitignored — nothing model-derived is ever committed. Prod receives the CSVs as
+// Container App secrets via `node scripts/push-model-data.mjs`. Quarterly refresh:
+//   node scripts/extract-reported-gmv.mjs && node scripts/push-model-data.mjs
 //
 // Zero external dependencies: an .xlsm is a ZIP of XML, so we read the ZIP central
 // directory and inflate the few parts we need with Node's built-in zlib. We pull
@@ -21,6 +23,7 @@ import { fileURLToPath } from "node:url";
 
 const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const OUT_CSV = path.join(SCRIPTS_DIR, "reported-gmv-quarterly.csv");
+const OUT_ESTIMATES_CSV = path.join(SCRIPTS_DIR, "model-estimates-quarterly.csv");
 const REPORT_LAG_DAYS = 35; // a quarter isn't "reported" until ~weeks after it ends
 
 // --- tiny ZIP reader (store + deflate only, which is all xlsx uses) ---------
@@ -94,6 +97,55 @@ function numericRowCells(sheetXml, rowNum) {
   return out;
 }
 
+/** Cells of one worksheet row, as { [colIndex]: string } — shared-string cells only
+ *  (resolved via `sst`). Used for the guidance row, whose values are text ranges
+ *  like "425-465" rather than numbers. */
+function textRowCells(sheetXml, rowNum, sst) {
+  const rowRe = new RegExp(`<row[^>]*\\sr="${rowNum}"[^>]*>(.*?)</row>`, "s");
+  const rowMatch = rowRe.exec(sheetXml);
+  if (!rowMatch) return {};
+  const out = {};
+  for (const chunk of rowMatch[1].split(/<c\s/).slice(1)) {
+    const ref = /^r="([A-Z]+)\d+"/.exec(chunk);
+    if (!ref) continue;
+    const attrs = chunk.slice(0, chunk.indexOf(">"));
+    if (!/\st="s"/.test(attrs)) continue;
+    const v = /<v>([^<]*)<\/v>/.exec(chunk);
+    if (!v) continue;
+    const s = sst[Number(v[1])];
+    if (typeof s === "string" && s.trim()) out[colToIndex(ref[1])] = s.trim();
+  }
+  return out;
+}
+
+/** Parse a guidance string ("425-465", "425 – 465", or a single "450") in $M
+ *  into USD { low, high }, or null if it doesn't read as guidance. */
+function parseGuidance(s) {
+  const range = /^\$?\s*(\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*\$?\s*(\d+(?:\.\d+)?)$/i.exec(s);
+  if (range) return { low: Math.round(Number(range[1]) * 1e6), high: Math.round(Number(range[2]) * 1e6) };
+  const single = /^\$?\s*(\d+(?:\.\d+)?)$/.exec(s);
+  if (single) {
+    const v = Math.round(Number(single[1]) * 1e6);
+    return { low: v, high: v };
+  }
+  return null;
+}
+
+/** Row number whose column-A cell equals `label`. Handles both encodings the
+ *  model uses: shared-string labels (t="s") and formula-result labels (t="str"). */
+function findLabelRow(sheetXml, sst, label) {
+  const idx = sst.findIndex((s) => s.trim() === label);
+  if (idx >= 0) {
+    const m = new RegExp(`<c\\s+r="A(\\d+)"[^>]*\\st="s"[^>]*>\\s*<v>${idx}</v>`).exec(sheetXml);
+    if (m) return Number(m[1]);
+  }
+  for (const m of sheetXml.matchAll(/<c\s+r="A(\d+)"[^>]*\st="str"[^>]*>(.*?)<\/c>/gs)) {
+    const v = /<v>([^<]*)<\/v>/.exec(m[2]);
+    if (v && v[1].trim() === label) return Number(m[1]);
+  }
+  return null;
+}
+
 // --- locate the workbook ----------------------------------------------------
 function findWorkbook() {
   const cliArg = process.argv.find((a) => a.toLowerCase().endsWith(".xlsm"));
@@ -131,11 +183,8 @@ function main() {
   const sst = [...sstXml.matchAll(/<si>(.*?)<\/si>/gs)].map((m) =>
     [...m[1].matchAll(/<t[^>]*>([^<]*)<\/t>/g)].map((t) => t[1]).join(""),
   );
-  const totalGmvIdx = sst.findIndex((s) => s.trim() === "Total GMV");
-  if (totalGmvIdx < 0) throw new Error('Label "Total GMV" not found in shared strings');
-  const rowMatch = new RegExp(`<c\\s+r="A(\\d+)"[^>]*\\st="s"[^>]*>\\s*<v>${totalGmvIdx}</v>`).exec(sheetXml);
-  if (!rowMatch) throw new Error('Column-A cell "Total GMV" not found in the Model sheet');
-  const gmvRow = Number(rowMatch[1]);
+  const gmvRow = findLabelRow(sheetXml, sst, "Total GMV");
+  if (!gmvRow) throw new Error('Column-A cell "Total GMV" not found in the Model sheet');
   console.log(`Found "Total GMV" at row ${gmvRow}; date header assumed at row 2.`);
 
   const dateCells = numericRowCells(sheetXml, 2); // colIndex -> Excel serial
@@ -185,6 +234,43 @@ function main() {
     "\n";
   writeFileSync(OUT_CSV, csv);
 
+  // --- model estimates: company guidance + the Clearline model's own forecast ---
+  // Guidance lives on a text row ("Total GMV Guidance", values like "425-465" in $M);
+  // the Clearline estimate is the Total GMV row's decimal-valued (forecast) columns.
+  const estimates = new Map(); // quarter -> { quarter_end, low, high, cl }
+  const estimate = (x) => {
+    const key = quarterKey(x.date);
+    let e = estimates.get(key);
+    if (!e) {
+      e = { quarter: key, quarter_end: ymd(x.date), low: "", high: "", cl: "" };
+      estimates.set(key, e);
+    }
+    return e;
+  };
+  for (const x of best) {
+    if (Number.isInteger(x.gmv)) continue; // integers are reported actuals
+    estimate(x).cl = Math.round(x.gmv * 1000);
+  }
+  const guidanceRow = findLabelRow(sheetXml, sst, "Total GMV Guidance");
+  if (guidanceRow) {
+    const guidanceCells = textRowCells(sheetXml, guidanceRow, sst);
+    for (const x of best) {
+      const parsed = guidanceCells[x.col] ? parseGuidance(guidanceCells[x.col]) : null;
+      if (!parsed) continue;
+      const e = estimate(x);
+      e.low = parsed.low;
+      e.high = parsed.high;
+    }
+  } else {
+    console.warn('Warning: "Total GMV Guidance" row not found — guidance columns left empty.');
+  }
+  const estRows = [...estimates.values()].sort((a, b) => a.quarter_end.localeCompare(b.quarter_end));
+  const estCsv =
+    "quarter,quarter_end,guidance_low_usd,guidance_high_usd,clearline_estimate_usd\n" +
+    estRows.map((r) => `${r.quarter},${r.quarter_end},${r.low},${r.high},${r.cl}`).join("\n") +
+    "\n";
+  writeFileSync(OUT_ESTIMATES_CSV, estCsv);
+
   // --- report + validation anchors ---
   const first = series[0], last = series[series.length - 1];
   console.log(`Wrote ${series.length} quarters -> ${path.relative(process.cwd(), OUT_CSV)}`);
@@ -194,6 +280,12 @@ function main() {
     .reduce((s, r) => s + r.reported_gmv_usd, 0);
   console.log(`FY2025 (Dec24+Mar25+Jun25+Sep25) = $${(fy25 / 1e6).toFixed(1)}M  [model anchor: $1,570.9M]`);
   console.log("Sample:", series.slice(0, 2).concat(series.slice(-2)).map((r) => `${r.quarter}=$${(r.reported_gmv_usd / 1e6).toFixed(1)}M`).join(", "));
+  console.log(`Wrote ${estRows.length} estimate rows -> ${path.relative(process.cwd(), OUT_ESTIMATES_CSV)}`);
+  for (const r of estRows.slice(0, 4)) {
+    const g = r.low !== "" ? `guidance $${(r.low / 1e6).toFixed(0)}M-$${(r.high / 1e6).toFixed(0)}M` : "no guidance";
+    const c = r.cl !== "" ? `Clearline $${(r.cl / 1e6).toFixed(1)}M` : "no Clearline est.";
+    console.log(`  ${r.quarter} (${r.quarter_end}): ${g}, ${c}`);
+  }
 }
 
 main();
