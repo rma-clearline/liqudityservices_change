@@ -99,3 +99,10 @@ cross-region Supabase round trips: `src/lib/dashboard-data.ts` (listings/contrac
 marketplace, ~60s), `/api/data-status` (~30s), `/api/forecast` (60s), `/api/stock-prices`
 (~5min). Per-replica, so it pairs with `lqdt-keepwarm`. TTL env overrides:
 `DASHBOARD_CACHE_MS`, `STOCK_PRICE_CACHE_MS`.
+
+The forecast page's **"Quarterly revenue by category"** chart (`/api/gmv-by-category`) caches
+the one expensive step — the Azure SQL `GROUP BY` — keyed by date range (`CATEGORY_CACHE_MS`,
+default 15 min). The route returns the top-15 categories (long tail pre-folded into "Other")
+and the client folds further to its chosen Top-N (6/8/10) **in memory**, so period and Top-N
+toggles reuse the cached rows and never re-hit the DB (previously every toggle re-ran the live
+query). First hit per 15-min window is sub-second; every repeat/toggle is instant.

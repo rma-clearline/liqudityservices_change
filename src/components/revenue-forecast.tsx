@@ -937,6 +937,35 @@ const OTHER_COLOR = "#898781";
 const TOPN_OPTIONS = [6, 8, 10] as const;
 const DEFAULT_TOPN = 8;
 
+/** Fold a full period×category matrix down to the top-N categories by total GMV,
+ *  bucketing the remainder into "Other". Mirrors the server's `categoryByPeriod`
+ *  ranking (GMV desc → same color assignment). Done client-side so Top-N changes
+ *  reuse the already-fetched series and never re-query the API/DB. */
+function foldTopCategories(
+  categories: string[],
+  data: Array<Record<string, number | string>>,
+  topN: number,
+): { categories: string[]; data: Array<Record<string, number | string>> } {
+  const real = categories.filter((c) => c !== "Other");
+  const totals = new Map<string, number>(real.map((c) => [c, 0]));
+  for (const row of data) for (const c of real) totals.set(c, (totals.get(c) ?? 0) + Number(row[c] ?? 0));
+  const top = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, topN).map((e) => e[0]);
+  const topSet = new Set(top);
+  const outCats = [...top, "Other"];
+  const outData = data.map((row) => {
+    const out: Record<string, number | string> = { period: row.period };
+    let other = Number(row["Other"] ?? 0);
+    for (const c of real) {
+      const v = Number(row[c] ?? 0);
+      if (topSet.has(c)) out[c] = v;
+      else other += v;
+    }
+    out["Other"] = other;
+    return out;
+  });
+  return { categories: outCats, data: outData };
+}
+
 /** Stacked quarterly revenue (GMV × take rate) by category, from the durable store. */
 function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string; takeRate: number }) {
   const [topN, setTopN] = useState<number>(DEFAULT_TOPN);
@@ -948,10 +977,12 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
     truncated: boolean;
   }>({ loading: true, error: null, categories: [], data: [], truncated: false });
 
+  // Fetch the full composition once per range. Top-N is applied in memory below,
+  // so toggling it never re-requests (hence no `topN` in the dependency list).
   useEffect(() => {
     let cancelled = false;
     setState((s) => ({ ...s, loading: true, error: null }));
-    fetch(`/api/gmv-by-category?from=${from}&to=${to}&period=quarter&topN=${topN}`)
+    fetch(`/api/gmv-by-category?from=${from}&to=${to}&period=quarter`)
       .then(async (r) => {
         const d = await r.json();
         if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
@@ -968,7 +999,12 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
     return () => {
       cancelled = true;
     };
-  }, [from, to, topN]);
+  }, [from, to]);
+
+  const folded = useMemo(
+    () => foldTopCategories(state.categories, state.data, topN),
+    [state.categories, state.data, topN],
+  );
 
   const control = (
     <div className="mb-2 flex items-center gap-2">
@@ -997,12 +1033,12 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
     body = <p className="py-8 text-center text-sm text-gray-500">Loading category breakdown…</p>;
   } else if (state.error) {
     body = <p className="py-4 text-sm text-red-600">Category breakdown unavailable: {state.error}</p>;
-  } else if (state.data.length === 0) {
+  } else if (folded.data.length === 0) {
     body = <p className="py-4 text-sm text-gray-500">No category data in range.</p>;
   } else {
-    const data = state.data.map((row) => {
+    const data = folded.data.map((row) => {
       const out: Record<string, number | string> = { period: row.period };
-      for (const c of state.categories) out[c] = Math.round(Number(row[c] ?? 0) * takeRate);
+      for (const c of folded.categories) out[c] = Math.round(Number(row[c] ?? 0) * takeRate);
       return out;
     });
     body = (
@@ -1017,7 +1053,7 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
             />
             <Tooltip formatter={(v) => (typeof v === "number" ? "$" + v.toLocaleString() : v)} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-            {state.categories.map((c, i) => (
+            {folded.categories.map((c, i) => (
               // Fixed-order assignment (no cycling): rank i -> slot i; "Other" -> gray.
               <Bar key={c} dataKey={c} stackId="cat" fill={c === "Other" ? OTHER_COLOR : (CATEGORY_COLORS[i] ?? OTHER_COLOR)} />
             ))}
