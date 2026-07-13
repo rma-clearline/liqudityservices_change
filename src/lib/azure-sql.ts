@@ -409,6 +409,94 @@ export async function getCategoryDaily(fromEt: string, toEt: string): Promise<Ca
   }));
 }
 
+// --- analyst estimate overrides (guidance / Clearline) ----------------------
+//
+// Small keyed table holding per-quarter overrides entered from the QTD page.
+// Lives in Azure SQL (not Supabase). One-time bootstrap: run
+// azure-sql/003_model_estimates.sql as an admin — lqdt_app owns the lqdt schema
+// but lacked database-level CREATE TABLE, so the in-code ensure() below only
+// works after 003's GRANT (or once the table exists, where it no-ops). Until
+// then saves fail with a clear error and reads degrade to the model-file values.
+
+export type ModelEstimateOverrideRow = {
+  quarter: string; // calendar "YYYYQn"
+  guidance_low_usd: number | null;
+  guidance_high_usd: number | null;
+  clearline_estimate_usd: number | null;
+  updated_by: string | null;
+  updated_at: string | null; // ISO 8601
+};
+
+let estimatesTableEnsured = false;
+
+/** Create lqdt.model_estimates on first use (idempotent, once per process). */
+async function ensureModelEstimatesTable(pool: sql.ConnectionPool): Promise<void> {
+  if (estimatesTableEnsured) return;
+  await pool
+    .request()
+    .batch(
+      "IF OBJECT_ID('lqdt.model_estimates', 'U') IS NULL " +
+        "CREATE TABLE lqdt.model_estimates (" +
+        "quarter char(6) NOT NULL PRIMARY KEY, " +
+        "guidance_low_usd bigint NULL, " +
+        "guidance_high_usd bigint NULL, " +
+        "clearline_estimate_usd bigint NULL, " +
+        "updated_by nvarchar(256) NULL, " +
+        "updated_at datetime2(0) NOT NULL DEFAULT sysutcdatetime())",
+    );
+  estimatesTableEnsured = true;
+}
+
+export async function getModelEstimateOverrides(): Promise<ModelEstimateOverrideRow[]> {
+  const pool = await getPool();
+  await ensureModelEstimatesTable(pool);
+  const r = await pool
+    .request()
+    .query(
+      "SELECT quarter, guidance_low_usd, guidance_high_usd, clearline_estimate_usd, updated_by, " +
+        "CONVERT(varchar(33), updated_at, 127) AS updated_at FROM lqdt.model_estimates",
+    );
+  return r.recordset.map((x) => ({
+    quarter: String(x.quarter ?? "").trim(),
+    guidance_low_usd: x.guidance_low_usd == null ? null : Number(x.guidance_low_usd),
+    guidance_high_usd: x.guidance_high_usd == null ? null : Number(x.guidance_high_usd),
+    clearline_estimate_usd: x.clearline_estimate_usd == null ? null : Number(x.clearline_estimate_usd),
+    updated_by: x.updated_by == null ? null : String(x.updated_by),
+    updated_at: x.updated_at == null ? null : String(x.updated_at),
+  }));
+}
+
+export async function upsertModelEstimateOverride(row: {
+  quarter: string;
+  guidance_low_usd: number | null;
+  guidance_high_usd: number | null;
+  clearline_estimate_usd: number | null;
+  updated_by: string;
+}): Promise<void> {
+  const pool = await getPool();
+  await ensureModelEstimatesTable(pool);
+  await pool
+    .request()
+    .input("quarter", sql.Char(6), row.quarter)
+    .input("low", sql.BigInt, row.guidance_low_usd)
+    .input("high", sql.BigInt, row.guidance_high_usd)
+    .input("cl", sql.BigInt, row.clearline_estimate_usd)
+    .input("by", sql.NVarChar(256), clip(row.updated_by, 256))
+    .query(
+      "MERGE lqdt.model_estimates AS t USING (SELECT @quarter AS quarter) AS s ON t.quarter = s.quarter " +
+        "WHEN MATCHED THEN UPDATE SET guidance_low_usd = @low, guidance_high_usd = @high, " +
+        "clearline_estimate_usd = @cl, updated_by = @by, updated_at = sysutcdatetime() " +
+        "WHEN NOT MATCHED THEN INSERT (quarter, guidance_low_usd, guidance_high_usd, clearline_estimate_usd, updated_by) " +
+        "VALUES (@quarter, @low, @high, @cl, @by);",
+    );
+}
+
+export async function deleteModelEstimateOverride(quarter: string): Promise<void> {
+  const pool = await getPool();
+  await ensureModelEstimatesTable(pool);
+  await pool.request().input("quarter", sql.Char(6), quarter).query("DELETE FROM lqdt.model_estimates WHERE quarter = @quarter");
+}
+
 /**
  * Read raw per-lot rows from the store as SoldExportRow[] (the shape the export /
  * drill-down already consume). Lets those readers move off the live Maestro feed

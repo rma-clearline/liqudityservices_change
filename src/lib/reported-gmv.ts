@@ -12,7 +12,7 @@
 
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { supabaseAdmin } from "@/lib/supabase";
+import { getModelEstimateOverrides, isAzureSqlConfigured } from "@/lib/azure-sql";
 
 export type ReportedQuarterGmv = { quarter: string; reported_gmv_usd: number };
 
@@ -107,33 +107,32 @@ export async function loadModelEstimates(): Promise<ModelQuarterEstimate[]> {
 }
 
 /**
- * Model-file estimates merged with analyst overrides from the `model_estimates`
- * table (service-role read — the table has no public policy). A DB row REPLACES
- * that quarter's file values wholesale, so an analyst can also blank a field.
- * Queried per call (tiny table) so saves show up immediately; DB errors (e.g.
- * migration 029 not applied yet) degrade to file-only.
+ * Model-file estimates merged with analyst overrides from `lqdt.model_estimates`
+ * (Azure SQL — the app owns the schema and bootstraps the table itself). A DB row
+ * REPLACES that quarter's file values wholesale, so an analyst can also blank a
+ * field. Queried per call (tiny table, warm S2) so saves show up immediately; DB
+ * errors degrade to file-only.
  */
 export async function loadModelEstimatesMerged(): Promise<ModelQuarterEstimate[]> {
   const file = await loadModelEstimates();
   const map = new Map<string, ModelQuarterEstimate>(file.map((e) => [e.quarter, { ...e, source: "model" as const }]));
-  try {
-    const res = await supabaseAdmin
-      .from("model_estimates")
-      .select("quarter, guidance_low_usd, guidance_high_usd, clearline_estimate_usd, updated_by, updated_at");
-    for (const row of res.data ?? []) {
-      if (!/^\d{4}Q[1-4]$/.test(row.quarter ?? "")) continue;
-      map.set(row.quarter, {
-        quarter: row.quarter,
-        guidance_low_usd: row.guidance_low_usd ?? null,
-        guidance_high_usd: row.guidance_high_usd ?? null,
-        clearline_estimate_usd: row.clearline_estimate_usd ?? null,
-        source: "manual",
-        updated_by: row.updated_by ?? null,
-        updated_at: row.updated_at ?? null,
-      });
+  if (isAzureSqlConfigured()) {
+    try {
+      for (const row of await getModelEstimateOverrides()) {
+        if (!/^\d{4}Q[1-4]$/.test(row.quarter)) continue;
+        map.set(row.quarter, {
+          quarter: row.quarter,
+          guidance_low_usd: row.guidance_low_usd,
+          guidance_high_usd: row.guidance_high_usd,
+          clearline_estimate_usd: row.clearline_estimate_usd,
+          source: "manual",
+          updated_by: row.updated_by,
+          updated_at: row.updated_at,
+        });
+      }
+    } catch {
+      // DB unreachable -> model-file values only.
     }
-  } catch {
-    // Table missing/unreachable -> model-file values only.
   }
   return [...map.values()].sort((a, b) => a.quarter.localeCompare(b.quarter));
 }
