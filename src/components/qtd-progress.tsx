@@ -103,6 +103,8 @@ type ChartRow = {
   "Open auctions": number | null;
   "Run rate": number | null;
   "Cumulative Y/Y": number | null;
+  /** True when the row's projection values are Y/Y percentages, not dollars. */
+  _yoyMode: boolean;
   _dailyCur: number | null;
   _dailyLy: number | null;
 };
@@ -250,6 +252,10 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
         term: "Run rate",
         def: "QTD daily average × days in the quarter. Crude (ignores seasonality) but always available; the fallback when prior-year data doesn't exist.",
       },
+      {
+        term: "Projections in Y/Y % mode",
+        def: "The same paths drawn as implied cumulative Y/Y: projected cumulative ÷ LY cumulative at the same day − 1, converging at each method's implied full-quarter Y/Y. Prior-yr shape is flat by construction (it applies LY's shape at the current pace), so it reads as the extrapolated full-quarter Y/Y line.",
+      },
     ],
   },
   {
@@ -337,7 +343,8 @@ function QtdTooltip({ active, payload }: TooltipContentProps<ValueType, NameType
       </p>
       {lines.map((p) => (
         <p key={String(p.dataKey)} style={{ color: p.color }}>
-          {String(p.name)}: {p.dataKey === "Cumulative Y/Y" ? fmtPct(Number(p.value) / 100) : fmtM(Number(p.value))}
+          {String(p.name)}:{" "}
+          {p.dataKey === "Cumulative Y/Y" || row._yoyMode ? fmtPct(Number(p.value) / 100) : fmtM(Number(p.value))}
         </p>
       ))}
       {row._dailyCur != null && <p className="mt-1 text-gray-500">Day GMV: {fmtM(row._dailyCur)}</p>}
@@ -505,22 +512,30 @@ export function QtdProgress() {
   const scale = scaled ? 1 / captureRate : 1;
 
   const { dayKeys, D, d } = view;
+  const yoyMode = metric === "yoy";
   const rows: ChartRow[] = dayKeys.map((date, i) => {
     const inData = i < d;
     const lyVal = view.lyCum ? view.lyAt(i) : null;
     const anchor = i === d - 1; // projections start at the last data day
+    // In $ mode a projection plots its (scaled) cumulative path; in Y/Y mode it
+    // plots the IMPLIED cumulative Y/Y (projected cum ÷ LY cum − 1, %) — converging
+    // at the method's implied full-quarter Y/Y. Scale cancels in the ratio.
+    const proj = (raw: number | null): number | null => {
+      if (raw == null) return null;
+      if (!yoyMode) return raw * scale;
+      return lyVal != null && lyVal > 0 ? (raw / lyVal - 1) * 100 : null;
+    };
     return {
       day: i + 1,
       date,
       Current: inData ? view.curCum[i] * scale : null,
       "Last year": lyVal != null ? lyVal * scale : null,
-      "Prior-yr shape":
-        view.shapeAvailable && projections.has("shape") && (anchor || i >= d) ? view.shapeAt(i) * scale : null,
-      "Open auctions":
-        view.auctionsAvailable && projections.has("auctions") && (anchor || i >= d) ? view.auctionPath[i] * scale : null,
-      "Run rate": !view.complete && projections.has("runrate") && (anchor || i >= d) ? view.runRateAt(i) * scale : null,
+      "Prior-yr shape": proj(view.shapeAvailable && projections.has("shape") && (anchor || i >= d) ? view.shapeAt(i) : null),
+      "Open auctions": proj(view.auctionsAvailable && projections.has("auctions") && (anchor || i >= d) ? view.auctionPath[i] : null),
+      "Run rate": proj(!view.complete && projections.has("runrate") && (anchor || i >= d) ? view.runRateAt(i) : null),
       "Cumulative Y/Y":
-        metric === "yoy" && inData && view.lyCum && view.lyAt(i) > 0 ? (view.curCum[i] / view.lyAt(i) - 1) * 100 : null,
+        yoyMode && inData && view.lyCum && view.lyAt(i) > 0 ? (view.curCum[i] / view.lyAt(i) - 1) * 100 : null,
+      _yoyMode: yoyMode,
       _dailyCur: inData ? (view.curCum[i] - (i > 0 ? view.curCum[i - 1] : 0)) : null,
       _dailyLy: view.lyCum && i < (view.lyCum.length ?? 0) ? view.lyCum[i] - (i > 0 ? view.lyCum[i - 1] : 0) : null,
     };
@@ -1085,6 +1100,17 @@ export function QtdProgress() {
             <>
               <ReferenceLine y={0} stroke="#9ca3af" />
               <Line type="monotone" dataKey="Cumulative Y/Y" stroke="#2563eb" strokeWidth={2.5} dot={false} />
+              {/* Projections as implied cumulative Y/Y (projected cum ÷ LY cum − 1).
+                  Prior-yr shape is flat by construction — the extrapolated-FQE line. */}
+              {view.shapeAvailable && projections.has("shape") && (
+                <Line type="monotone" dataKey="Prior-yr shape" stroke="#7c3aed" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
+              )}
+              {view.auctionsAvailable && projections.has("auctions") && (
+                <Line type="monotone" dataKey="Open auctions" stroke="#0e8fa8" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
+              )}
+              {!view.complete && projections.has("runrate") && (
+                <Line type="monotone" dataKey="Run rate" stroke="#6b7280" strokeWidth={1} strokeDasharray="3 3" dot={false} connectNulls />
+              )}
             </>
           )}
         </ComposedChart>
