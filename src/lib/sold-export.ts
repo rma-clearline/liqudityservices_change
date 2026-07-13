@@ -276,11 +276,15 @@ export type CategoryByPeriod = {
   data: Array<Record<string, number | string>>; // [{ period, [category]: gmv, ... }]
 };
 
+/** Minimal row shape category composition needs — satisfied by both a full
+ *  SoldExportRow (Maestro path) and the store's pre-aggregated daily-category rows. */
+export type CategoryInputRow = { category: string | null; close_date_et: string; sale_amount_usd: number | null };
+
 /**
  * GMV by (period × category), keeping the top-N categories (by total GMV) and
  * bucketing the rest as "Other" — shaped for a stacked bar chart.
  */
-export function categoryByPeriod(rows: SoldExportRow[], period: ExportPeriod, topN = 8): CategoryByPeriod {
+export function categoryByPeriod(rows: CategoryInputRow[], period: ExportPeriod, topN = 8): CategoryByPeriod {
   const catTotals = new Map<string, number>();
   for (const r of rows) {
     const c = r.category || "Uncategorized";

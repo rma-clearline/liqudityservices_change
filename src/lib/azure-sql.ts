@@ -380,6 +380,35 @@ export async function getSoldDaily(fromEt: string, toEt: string): Promise<SoldDa
   }));
 }
 
+export type CategoryDailyRow = { date: string; category: string; gmv: number };
+
+/**
+ * Per-day / per-category realized GMV from the store, for the revenue-by-category
+ * chart. Complete + deduped (incl. GI) and fast: one indexed GROUP BY over the
+ * range replaces /api/gmv-by-category's old full-range Maestro pull, which timed
+ * out on wide windows. The caller buckets days into the requested period and keeps
+ * the top-N categories. Only lots with a positive USD price count.
+ */
+export async function getCategoryDaily(fromEt: string, toEt: string): Promise<CategoryDailyRow[]> {
+  const pool = await getPool();
+  const r = await pool
+    .request()
+    .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+    .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
+    .query(
+      "SELECT CONVERT(char(10), close_date_et, 23) AS d, " +
+        "COALESCE(NULLIF(LTRIM(RTRIM(category)), ''), 'Uncategorized') AS category, " +
+        "COALESCE(SUM(sale_amount_usd), 0) AS gmv " +
+        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to AND sale_amount_usd > 0 " +
+        "GROUP BY close_date_et, COALESCE(NULLIF(LTRIM(RTRIM(category)), ''), 'Uncategorized')",
+    );
+  return r.recordset.map((x) => ({
+    date: x.d,
+    category: String(x.category ?? "Uncategorized"),
+    gmv: Number(x.gmv ?? 0),
+  }));
+}
+
 /**
  * Read raw per-lot rows from the store as SoldExportRow[] (the shape the export /
  * drill-down already consume). Lets those readers move off the live Maestro feed
