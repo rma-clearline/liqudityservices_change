@@ -1061,14 +1061,23 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
 
   // Repoint the live quarter's realized to the durable Azure store (lqdt.sold_lots):
   // complete + deduped + includes GI + true market split — unlike the Supabase
-  // `auctions` table, whose daily capture only partially fills recent days (the
-  // 7/2+ gap the chart showed). Historical days stay on the CSV. Falls back to the
-  // tracked-auctions fill above if the store is unconfigured, empty for a day, or
-  // unreachable within the timeout (e.g. the serverless DB is paused).
+  // `auctions` table, whose daily sold capture only partially fills recent days.
+  // Historical days stay on the CSV.
+  //
+  // Per-day blend: apply the store's complete figures for every day it covers and
+  // leave the tracked-auctions fill in place for any day it's missing (typically
+  // just today, whose auctions are still closing and which isn't captured until the
+  // next daily cron). This was previously all-or-nothing — a single missing day
+  // discarded the store for the WHOLE live quarter and reverted every day to the
+  // sparse tracked feed, collapsing recent daily GMV to ~0 (the bug this fixes).
+  // `storeDays` records the covered days so the per-platform blocks below reconcile
+  // with the blended daily headline (store realized on covered days + tracked
+  // realized on the rest). Falls back to the tracked-auctions fill if the store is
+  // unconfigured or unreachable within the timeout (e.g. the serverless DB paused).
   const todayKey = etDateKey(nowIso);
   const liveDays = chartDays.filter((d) => !historicalDailyGmv.totals.has(d) && d <= todayKey);
   const soldBySite: Record<SourceKey, number> = { AD: 0, GD: 0, GI: 0 };
-  let soldByDayApplied = false;
+  const storeDays = new Set<string>();
   if (liveDays.length > 0 && isAzureSqlConfigured()) {
     try {
       const timeoutMs = Number(process.env.FORECAST_SOLD_TIMEOUT_MS) || 25000;
@@ -1087,34 +1096,26 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
         const site: SourceKey = r.site === "AD" ? "AD" : r.site === "GD" ? "GD" : "GI";
         b[site] += r.gmv;
       }
-      // All-or-nothing: only override if the store has EVERY live day. Otherwise the
-      // daily headline would keep the tracked-auctions fill for the missing days
-      // while the per-platform blocks (soldBySite) would not — breaking their
-      // reconciliation. On partial coverage we leave the whole live quarter on the
-      // tracked-auctions fill, which is internally consistent.
-      const liveCovered = liveDays.every((d) => perDay.has(d));
-      if (liveCovered) {
-        for (const [key, bucket] of dailyMap) {
-          if (bucket.hasHistoricalRealized) continue;
-          const s = perDay.get(key);
-          if (!s) continue;
-          bucket.realized.all = s.all;
-          bucket.realized.domestic = s.domestic;
-          bucket.realized.international = s.intl;
-          bucket.realized.soldLots = s.lots;
-          bucket.bySource.AD = s.AD;
-          bucket.bySource.GD = s.GD;
-          bucket.bySource.GI = s.GI;
-        }
-        for (const s of perDay.values()) {
-          soldBySite.AD += s.AD;
-          soldBySite.GD += s.GD;
-          soldBySite.GI += s.GI;
-        }
-        soldByDayApplied = true;
+      for (const [key, bucket] of dailyMap) {
+        if (bucket.hasHistoricalRealized) continue; // historical days stay on the CSV
+        const s = perDay.get(key);
+        if (!s) continue; // uncovered live day (e.g. today) → keep the tracked-auctions fill
+        bucket.realized.all = s.all;
+        bucket.realized.domestic = s.domestic;
+        bucket.realized.international = s.intl;
+        bucket.realized.soldLots = s.lots;
+        bucket.bySource.AD = s.AD;
+        bucket.bySource.GD = s.GD;
+        bucket.bySource.GI = s.GI;
+        soldBySite.AD += s.AD;
+        soldBySite.GD += s.GD;
+        soldBySite.GI += s.GI;
+        storeDays.add(key);
       }
     } catch {
-      soldByDayApplied = false; // store unreachable → keep the tracked-auctions fill
+      // Store unreachable → keep the tracked-auctions fill for all live days.
+      storeDays.clear();
+      soldBySite.AD = soldBySite.GD = soldBySite.GI = 0;
     }
   }
 
@@ -1152,10 +1153,15 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     const bucket = dailyMap.get(key);
     return bucket ? !bucket.hasHistoricalRealized : false;
   };
-  const dedupAgg = (platform: "AD" | "GD") => {
-    const soldRows = dedupSold.filter((x) => x.platform === platform && trackedDay(x.row.close_time_utc)).map((x) => x.row);
-    const openRows = dedupOpen.filter((x) => x.platform === platform && trackedDay(x.row.close_time_utc)).map((x) => x.row);
-    const closedRows = dedupClosed.filter((x) => x.platform === platform && trackedDay(x.row.close_time_utc));
+  // Live days the store did NOT cover — these keep their tracked-auctions realized,
+  // which is added to the per-platform blocks so they reconcile with the blended
+  // daily headline (store realized on covered days + tracked realized on the rest).
+  const trackedUncoveredDay = (iso: string | null): boolean =>
+    trackedDay(iso) && !storeDays.has(etDateKey(iso as string));
+  const dedupAgg = (platform: "AD" | "GD", dayPred: (iso: string | null) => boolean = trackedDay) => {
+    const soldRows = dedupSold.filter((x) => x.platform === platform && dayPred(x.row.close_time_utc)).map((x) => x.row);
+    const openRows = dedupOpen.filter((x) => x.platform === platform && dayPred(x.row.close_time_utc)).map((x) => x.row);
+    const closedRows = dedupClosed.filter((x) => x.platform === platform && dayPred(x.row.close_time_utc));
     return {
       realizedGmv: soldRows.reduce((s, r) => s + (r.final_price_usd ?? 0), 0),
       soldCount: soldRows.filter((r) => (r.final_price_usd ?? 0) > 0).length,
@@ -1173,15 +1179,16 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     // tracked auctions, deduped here so the two platform blocks sum to the
     // headline total instead of ~2x it (cross-listed lots were double-counted).
     const isHistorical = p.realizedSource === "historical_export";
-    // Live quarter: prefer the durable store's per-site realized (complete) so the
-    // AllSurplus/GovDeals blocks reconcile with the headline (GI, having no block,
-    // stays in the total only — as with historical quarters). Falls back to the
-    // deduped auctions total when the store isn't in play.
+    // Live quarter realized = durable store's per-site realized on the days it
+    // covers + tracked auctions on the days it doesn't (per-day blend), so the
+    // AllSurplus/GovDeals blocks reconcile with the blended daily headline (GI,
+    // having no block, stays in the total only — as with historical quarters).
+    // When the store isn't in play, storeDays is empty → this is exactly the
+    // deduped tracked-auctions total. Counts/open/projection stay on the tracked
+    // model (the store carries realized GMV only).
     const realizedGmv = isHistorical
       ? p.realizedGmv
-      : soldByDayApplied
-        ? soldBySite[p.platform]
-        : agg.realizedGmv;
+      : soldBySite[p.platform] + dedupAgg(p.platform, trackedUncoveredDay).realizedGmv;
     const auctionsSold = isHistorical ? p.auctionsSold : agg.soldCount;
     const auctionsClosed = isHistorical ? p.closed.length : agg.closedCount;
     const openCount = isHistorical ? p.open.length : agg.openCount;
