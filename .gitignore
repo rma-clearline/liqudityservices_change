@@ -40,3 +40,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# large local data exports (used for one-off store backfills; kept out of git)
+scripts/*.xlsx
