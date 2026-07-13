@@ -22,6 +22,7 @@ import {
   type TooltipContentProps,
 } from "recharts";
 import type { NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
+import { downloadCsv } from "@/lib/format";
 import { enumerateQuarterLabelsBetween, etQuarterKey, formatQuarterLabel, parseQuarterLabel } from "@/lib/time";
 
 type DailyPoint = { date: string; realized_gmv_usd: number; projected_gmv_usd: number };
@@ -531,6 +532,70 @@ export function QtdProgress() {
   const t7dYoyPrev = t7dCols[t7dCols.length - 2]?.yoy ?? null;
   const t7dWowPp = t7dYoyNow != null && t7dYoyPrev != null ? (t7dYoyNow - t7dYoyPrev) * 100 : null;
 
+  // One-click Excel-friendly export: three labeled blocks (summary, key metrics,
+  // full daily progression for the selected quarter). Dollars are raw integers and
+  // Y/Y are "%" strings so Excel parses both natively for pasting into the model.
+  const exportCsv = () => {
+    const esc = (v: unknown) => {
+      const t = v == null ? "" : String(v);
+      return /[",\n\r]/.test(t) ? `"${t.replaceAll('"', '""')}"` : t;
+    };
+    const rowOf = (...cells: unknown[]) => cells.map(esc).join(",");
+    const pctS = (v: number | null | undefined) => (v == null ? "" : `${(v * 100).toFixed(1)}%`);
+    const lines: string[] = [];
+
+    lines.push(rowOf("LQDT QTD progress export"));
+    lines.push(rowOf("Generated (ET)", todayKey));
+    lines.push(rowOf("Quarter", `${selected} / ${formatQuarterLabel(selected, "fq")}`));
+    lines.push(rowOf("Period", view.startKey, view.endKey));
+    lines.push(rowOf("Data through", view.dataThrough, `day ${view.d} of ${view.D}`));
+    lines.push(rowOf("Capture rate", `${(captureRate * 100).toFixed(1)}%`, captureInput.trim() ? "manual override" : "auto (last 3 reported qtrs)"));
+    lines.push(rowOf("QTD GMV captured (USD)", Math.round(view.qtd)));
+    lines.push(rowOf("QTD GMV scaled (USD)", Math.round(view.qtd / captureRate)));
+    lines.push(rowOf("QTD Y/Y", pctS(view.yoy)));
+    lines.push(rowOf(view.complete ? "Full quarter actual, scaled (USD)" : `FQ estimate (${view.primaryMethod}), scaled (USD)`, Math.round(scaledFqe)));
+    if (guidanceLow != null && guidanceHigh != null) {
+      lines.push(rowOf("Guidance low/high (USD)", Math.round(guidanceLow), Math.round(guidanceHigh), guidanceMid ? `${pctS(scaledFqe / guidanceMid - 1)} vs mid` : ""));
+    }
+    if (clearline != null) lines.push(rowOf("Clearline estimate (USD)", Math.round(clearline), `${pctS(scaledFqe / clearline - 1)} vs CL`));
+    if (view.reported != null) lines.push(rowOf("Reported actual (USD)", view.reported));
+    lines.push("");
+
+    lines.push(rowOf("Key metrics"));
+    lines.push(rowOf("group", "period", "value_usd", "basis", "yoy"));
+    for (const c of monthCols) lines.push(rowOf("month", c.top, Math.round(c.nominal), "captured", pctS(c.yoy)));
+    for (const c of quarterCols) lines.push(rowOf("quarter", `${c.top} ${c.sub ?? ""}`.trim(), Math.round(c.nominal), "captured", pctS(c.yoy)));
+    for (const c of modelCols) lines.push(rowOf("model", `${c.top} ${c.sub ?? ""}`.trim(), Math.round(c.nominal), "total company", pctS(c.yoy)));
+    for (const c of t7dCols) lines.push(rowOf("t7d week ending", c.top, Math.round(c.nominal), "captured", pctS(c.yoy)));
+    lines.push("");
+
+    lines.push(rowOf(`Daily progression ${selected} / ${formatQuarterLabel(selected, "fq")} (captured USD)`));
+    lines.push(rowOf("day", "date", "daily_gmv_usd", "cum_gmv_usd", "ly_date", "ly_daily_gmv_usd", "ly_cum_gmv_usd", "cum_yoy", "proj_prior_shape_cum_usd", "proj_open_auctions_cum_usd", "proj_run_rate_cum_usd"));
+    const lyDayKeys = quarterDayKeys(priorYearQuarter(selected));
+    for (let i = 0; i < view.D; i++) {
+      const inData = i < view.d;
+      const lyInRange = view.lyCum != null && i < view.lyCum.length;
+      const lyDaily = lyInRange ? view.lyCum![i] - (i > 0 ? view.lyCum![i - 1] : 0) : null;
+      lines.push(
+        rowOf(
+          i + 1,
+          view.dayKeys[i],
+          inData ? Math.round(view.curCum[i] - (i > 0 ? view.curCum[i - 1] : 0)) : "",
+          inData ? Math.round(view.curCum[i]) : "",
+          lyDayKeys[i] ?? "",
+          lyDaily != null ? Math.round(lyDaily) : "",
+          view.lyCum ? Math.round(view.lyAt(i)) : "",
+          inData && view.lyCum && view.lyAt(i) > 0 ? pctS(view.curCum[i] / view.lyAt(i) - 1) : "",
+          view.shapeAvailable && i >= view.d - 1 ? Math.round(view.shapeAt(i)) : "",
+          view.auctionsAvailable && i >= view.d - 1 ? Math.round(view.auctionPath[i]) : "",
+          !view.complete && i >= view.d - 1 ? Math.round(view.runRateAt(i)) : "",
+        ),
+      );
+    }
+
+    downloadCsv(`lqdt-qtd-${selected}-through-${view.dataThrough}.csv`, lines.join("\n") + "\n");
+  };
+
   return (
     <div className="space-y-4">
       {/* Controls */}
@@ -597,6 +662,13 @@ export function QtdProgress() {
             (auto {(model.autoCapture * 100).toFixed(1)}% from {model.captureQuarters.length} reported qtrs)
           </span>
         </label>
+        <button
+          onClick={exportCsv}
+          className="ml-auto rounded border border-gray-300 bg-white px-3 py-1 text-sm font-medium text-gray-700 hover:bg-gray-50"
+          title="Download summary, key metrics, and the daily progression as an Excel-friendly CSV"
+        >
+          Export to Excel (CSV)
+        </button>
       </div>
 
       {/* Provenance line — data-through / days-into-period / period dates */}
