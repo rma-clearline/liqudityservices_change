@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type MouseEvent, type ReactNode } from "react";
 import { downloadCsv, toCsv } from "@/lib/format";
 import { etMonthKey, etQuarterKey, etWeekKey } from "@/lib/time";
 import { siteLabel } from "@/lib/sites";
@@ -922,12 +922,24 @@ function GmvGrowthTable({ daily }: { daily: DailyPoint[] }) {
   );
 }
 
+// Categorical palette — validated with the dataviz skill's validate_palette.js
+// (light surface, 10 slots: PASS; worst adjacent CVD ΔE 24.2). Assigned in FIXED
+// order by GMV rank, never cycled: the chart shows at most CATEGORY_COLORS.length
+// real categories and folds the rest into "Other". "Other" is the remainder, not an
+// entity, so it takes a recessive gray — never a categorical hue.
 const CATEGORY_COLORS = [
-  "#2563eb", "#16a34a", "#dc2626", "#d97706", "#7c3aed", "#0891b2", "#db2777", "#65a30d", "#94a3b8",
+  "#2a78d6", "#1baf7a", "#eda100", "#008300", "#4a3aa7",
+  "#e34948", "#e87ba4", "#eb6834", "#0e8fa8", "#66a80f",
 ];
+const OTHER_COLOR = "#898781";
+// Cap options at the palette size (distinct, CVD-safe hues run out beyond ~10 —
+// the long tail stays in "Other", inspectable via the hover tooltip).
+const TOPN_OPTIONS = [6, 8, 10] as const;
+const DEFAULT_TOPN = 8;
 
-/** Stacked quarterly revenue (GMV × take rate) by category, from the sold archive. */
+/** Stacked quarterly revenue (GMV × take rate) by category, from the durable store. */
 function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string; takeRate: number }) {
+  const [topN, setTopN] = useState<number>(DEFAULT_TOPN);
   const [state, setState] = useState<{
     loading: boolean;
     error: string | null;
@@ -938,7 +950,8 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`/api/gmv-by-category?from=${from}&to=${to}&period=quarter`)
+    setState((s) => ({ ...s, loading: true, error: null }));
+    fetch(`/api/gmv-by-category?from=${from}&to=${to}&period=quarter&topN=${topN}`)
       .then(async (r) => {
         const d = await r.json();
         if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
@@ -955,41 +968,74 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
     return () => {
       cancelled = true;
     };
-  }, [from, to]);
+  }, [from, to, topN]);
 
+  const control = (
+    <div className="mb-2 flex items-center gap-2">
+      <span className="text-xs text-gray-500">Top</span>
+      <div className="flex gap-1">
+        {TOPN_OPTIONS.map((n) => (
+          <button
+            key={n}
+            onClick={() => setTopN(n)}
+            className={`px-2 py-0.5 text-xs rounded border transition-colors ${
+              topN === n
+                ? "bg-gray-900 text-white border-gray-900"
+                : "bg-white text-gray-600 border-gray-300 hover:border-gray-400"
+            }`}
+          >
+            {n}
+          </button>
+        ))}
+      </div>
+      <span className="text-xs text-gray-400">categories by GMV + Other</span>
+    </div>
+  );
+
+  let body: ReactNode;
   if (state.loading) {
-    return <p className="py-8 text-center text-sm text-gray-500">Loading category breakdown… (querying the sold archive can take ~10s)</p>;
+    body = <p className="py-8 text-center text-sm text-gray-500">Loading category breakdown…</p>;
+  } else if (state.error) {
+    body = <p className="py-4 text-sm text-red-600">Category breakdown unavailable: {state.error}</p>;
+  } else if (state.data.length === 0) {
+    body = <p className="py-4 text-sm text-gray-500">No category data in range.</p>;
+  } else {
+    const data = state.data.map((row) => {
+      const out: Record<string, number | string> = { period: row.period };
+      for (const c of state.categories) out[c] = Math.round(Number(row[c] ?? 0) * takeRate);
+      return out;
+    });
+    body = (
+      <>
+        <ResponsiveContainer width="100%" height={340}>
+          <BarChart data={data} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="period" tick={{ fontSize: 11 }} />
+            <YAxis
+              tickFormatter={(v: number) => (v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : (v / 1000).toFixed(0) + "k")}
+              tick={{ fontSize: 11 }}
+            />
+            <Tooltip formatter={(v) => (typeof v === "number" ? "$" + v.toLocaleString() : v)} />
+            <Legend wrapperStyle={{ fontSize: 11 }} />
+            {state.categories.map((c, i) => (
+              // Fixed-order assignment (no cycling): rank i -> slot i; "Other" -> gray.
+              <Bar key={c} dataKey={c} stackId="cat" fill={c === "Other" ? OTHER_COLOR : (CATEGORY_COLORS[i] ?? OTHER_COLOR)} />
+            ))}
+          </BarChart>
+        </ResponsiveContainer>
+        <p className="mt-1 text-xs text-gray-400">
+          Revenue = category GMV × {(takeRate * 100).toFixed(0)}% take rate. Top {topN} categories by GMV; the rest grouped as
+          Other (hover any segment for its exact category and value).
+          {state.truncated ? " Value-ranked sample (top lots by value) — captures most GMV, not every tail lot." : ""}
+        </p>
+      </>
+    );
   }
-  if (state.error) return <p className="py-4 text-sm text-red-600">Category breakdown unavailable: {state.error}</p>;
-  if (state.data.length === 0) return <p className="py-4 text-sm text-gray-500">No category data in range.</p>;
-
-  const data = state.data.map((row) => {
-    const out: Record<string, number | string> = { period: row.period };
-    for (const c of state.categories) out[c] = Math.round(Number(row[c] ?? 0) * takeRate);
-    return out;
-  });
 
   return (
     <div>
-      <ResponsiveContainer width="100%" height={340}>
-        <BarChart data={data} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
-          <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey="period" tick={{ fontSize: 11 }} />
-          <YAxis
-            tickFormatter={(v: number) => (v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : (v / 1000).toFixed(0) + "k")}
-            tick={{ fontSize: 11 }}
-          />
-          <Tooltip formatter={(v) => (typeof v === "number" ? "$" + v.toLocaleString() : v)} />
-          <Legend wrapperStyle={{ fontSize: 11 }} />
-          {state.categories.map((c, i) => (
-            <Bar key={c} dataKey={c} stackId="cat" fill={CATEGORY_COLORS[i % CATEGORY_COLORS.length]} />
-          ))}
-        </BarChart>
-      </ResponsiveContainer>
-      <p className="mt-1 text-xs text-gray-400">
-        Revenue = category GMV × {(takeRate * 100).toFixed(0)}% take rate, from the sold archive.
-        {state.truncated ? " Value-ranked sample (top lots by value) — captures most GMV, not every tail lot." : ""}
-      </p>
+      {control}
+      {body}
     </div>
   );
 }
