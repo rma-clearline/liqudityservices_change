@@ -1113,6 +1113,10 @@ export function RevenueForecast() {
   });
   const [selectedSalesDate, setSelectedSalesDate] = useState<string | null>(null);
   const [state, setState] = useState<FetchState>({ forecast: null, error: null, done: false });
+  // Set the moment a quarter is picked (a historical quarter isn't materialized,
+  // so the live compute can take a few seconds); drives the loading overlay so the
+  // section doesn't just look frozen on the old quarter's data.
+  const [switching, setSwitching] = useState(false);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setRequestedTakeRate(takeRate), 300);
@@ -1126,10 +1130,16 @@ export function RevenueForecast() {
     fetch(`/api/forecast?${params.toString()}`)
       .then((r) => r.json())
       .then((data) => {
-        if (!cancelled) setState({ forecast: data, error: null, done: true });
+        if (!cancelled) {
+          setState({ forecast: data, error: null, done: true });
+          setSwitching(false);
+        }
       })
       .catch((e) => {
-        if (!cancelled) setState((prev) => ({ forecast: prev.forecast, error: e instanceof Error ? e.message : String(e), done: true }));
+        if (!cancelled) {
+          setState((prev) => ({ forecast: prev.forecast, error: e instanceof Error ? e.message : String(e), done: true }));
+          setSwitching(false);
+        }
       });
     return () => {
       cancelled = true;
@@ -1232,16 +1242,33 @@ export function RevenueForecast() {
   const earliestDataDate = forecast.earliest_data_date || dailyStart || todayKey;
   const exportFrom = earliestDataDate;
   const exportTo = todayKey;
+  const switchingLabel =
+    quarter === "ALL" ? "all quarters" : quarter ? formatQuarterLabel(quarter) : "the current quarter";
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 relative">
+      {switching && (
+        <div className="absolute inset-0 z-30 flex items-start justify-center bg-white/70 backdrop-blur-[1px]">
+          <div className="mt-16 flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-4 py-2.5 text-sm text-gray-700 shadow-lg">
+            <svg className="h-4 w-4 animate-spin text-blue-600" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z" />
+            </svg>
+            Loading {switchingLabel}…
+          </div>
+        </div>
+      )}
       <div className="flex items-center gap-4 flex-wrap">
         <label className="text-sm text-gray-600 flex items-center gap-2">
           Quarter
           <select
             value={forecast.quarter}
-            onChange={(e) => setQuarter(e.target.value)}
-            className="border rounded px-2 py-0.5 text-sm text-gray-900"
+            onChange={(e) => {
+              setSwitching(true);
+              setQuarter(e.target.value);
+            }}
+            disabled={switching}
+            className="border rounded px-2 py-0.5 text-sm text-gray-900 disabled:opacity-60"
           >
             <option value="ALL">All (full history)</option>
             {[...forecast.available_quarters].reverse().map((q, i) => (
