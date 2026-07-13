@@ -36,6 +36,9 @@ type QtdData = {
     guidance_low_usd: number | null;
     guidance_high_usd: number | null;
     clearline_estimate_usd: number | null;
+    source?: "model" | "manual";
+    updated_by?: string | null;
+    updated_at?: string | null;
   }[];
 };
 
@@ -264,11 +267,11 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
     items: [
       {
         term: "Guidance low / high",
-        def: "Company GMV guidance for the quarter, from the model workbook's 'Total GMV Guidance' row (stated in $M). 'vs mid' compares the scaled FQ estimate to the midpoint.",
+        def: "Company GMV guidance for the quarter, from the model workbook's 'Total GMV Guidance' row (stated in $M) — or an analyst override entered via the ✎ Estimates button (which wins for that quarter). 'vs mid' compares the scaled FQ estimate to the midpoint.",
       },
       {
         term: "Clearline estimate",
-        def: "The Clearline model's own Total GMV forecast for the quarter (the model's forecast columns, $000 → USD). Refreshed via the extract + push scripts after each model update.",
+        def: "The Clearline model's own Total GMV forecast for the quarter (the model's forecast columns, $000 → USD). Refreshed via the extract + push scripts after each model update, or overridden per quarter via ✎ Estimates (manual overrides are attributed and revertible).",
       },
       {
         term: "Reported actual",
@@ -360,6 +363,14 @@ export function QtdProgress() {
   const [scaled, setScaled] = useState(false);
   const [captureInput, setCaptureInput] = useState(""); // "" = auto
   const [projections, setProjections] = useState<Set<ProjectionKey>>(new Set(["shape", "auctions", "runrate"]));
+  // Guidance / Clearline edit panel ("" = blank field; values entered in $M).
+  const [editOpen, setEditOpen] = useState(false);
+  const [editLow, setEditLow] = useState("");
+  const [editHigh, setEditHigh] = useState("");
+  const [editCl, setEditCl] = useState("");
+  const [editBusy, setEditBusy] = useState(false);
+  const [editErr, setEditErr] = useState<string | null>(null);
+  const [reload, setReload] = useState(0); // bump to refetch after a save
 
   useEffect(() => {
     let cancelled = false;
@@ -378,7 +389,7 @@ export function QtdProgress() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reload]);
 
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
   const currentQuarter = etQuarterKey(todayKey);
@@ -722,6 +733,50 @@ export function QtdProgress() {
     downloadCsv(`lqdt-qtd-${selected}-through-${view.dataThrough}.csv`, lines.join("\n") + "\n");
   };
 
+  // --- guidance / Clearline edit panel -------------------------------------
+  const openEditor = () => {
+    const e = view.estimate;
+    setEditLow(e?.guidance_low_usd ? String(e.guidance_low_usd / 1e6) : "");
+    setEditHigh(e?.guidance_high_usd ? String(e.guidance_high_usd / 1e6) : "");
+    setEditCl(e?.clearline_estimate_usd ? String(Math.round((e.clearline_estimate_usd / 1e6) * 10) / 10) : "");
+    setEditErr(null);
+    setEditOpen(true);
+  };
+
+  const saveEstimates = async (clear: boolean) => {
+    setEditBusy(true);
+    setEditErr(null);
+    try {
+      const toUsd = (s: string) => {
+        if (s.trim() === "") return null;
+        const n = Number(s);
+        if (!Number.isFinite(n) || n <= 0) throw new Error("Values must be positive numbers, in $M (e.g. 454.6).");
+        return Math.round(n * 1e6);
+      };
+      const payload = clear
+        ? { quarter: selected, clear: true }
+        : {
+            quarter: selected,
+            guidance_low_usd: toUsd(editLow),
+            guidance_high_usd: toUsd(editHigh),
+            clearline_estimate_usd: toUsd(editCl),
+          };
+      const r = await fetch("/api/model-estimates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setEditOpen(false);
+      setReload((n) => n + 1); // refetch so the chart/tables pick up the new values
+    } catch (e) {
+      setEditErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       {/* Controls */}
@@ -788,14 +843,90 @@ export function QtdProgress() {
             (auto {(model.autoCapture * 100).toFixed(1)}% from {model.captureQuarters.length} reported qtrs)
           </span>
         </label>
-        <button
-          onClick={exportCsv}
-          className="ml-auto rounded border border-gray-300 bg-white px-3 py-1 text-sm font-medium text-gray-700 hover:bg-gray-50"
-          title="Download summary, key metrics, and the daily progression as an Excel-friendly CSV"
-        >
-          Export to Excel (CSV)
-        </button>
+        <div className="ml-auto flex gap-2">
+          <button
+            onClick={() => (editOpen ? setEditOpen(false) : openEditor())}
+            className="rounded border border-gray-300 bg-white px-3 py-1 text-sm font-medium text-gray-700 hover:bg-gray-50"
+            title="Enter or update company guidance and the Clearline estimate for the selected quarter"
+          >
+            ✎ Estimates
+          </button>
+          <button
+            onClick={exportCsv}
+            className="rounded border border-gray-300 bg-white px-3 py-1 text-sm font-medium text-gray-700 hover:bg-gray-50"
+            title="Download summary, key metrics, and the daily progression as an Excel-friendly CSV"
+          >
+            Export to Excel (CSV)
+          </button>
+        </div>
       </div>
+
+      {/* Guidance / Clearline editor — overrides the model-file values per quarter */}
+      {editOpen && (
+        <div className="space-y-2 rounded-lg border bg-gray-50 p-3">
+          <p className="text-xs font-semibold text-gray-700">
+            Guidance / Clearline estimate for {formatQuarterLabel(selected)}{" "}
+            <span className="font-normal text-gray-400">(values in $M, total company)</span>
+          </p>
+          <div className="flex flex-wrap items-end gap-3">
+            {(
+              [
+                { label: "Guidance low", value: editLow, set: setEditLow, ph: "e.g. 425" },
+                { label: "Guidance high", value: editHigh, set: setEditHigh, ph: "e.g. 465" },
+                { label: "Clearline estimate", value: editCl, set: setEditCl, ph: "e.g. 454.6" },
+              ] as const
+            ).map((f) => (
+              <label key={f.label} className="text-xs text-gray-600">
+                {f.label}
+                <input
+                  type="number"
+                  min="1"
+                  step="0.1"
+                  value={f.value}
+                  onChange={(e) => f.set(e.target.value)}
+                  placeholder={f.ph}
+                  className="mt-0.5 block w-28 rounded border px-2 py-1 text-sm text-gray-900"
+                />
+              </label>
+            ))}
+            <button
+              onClick={() => saveEstimates(false)}
+              disabled={editBusy}
+              className="rounded bg-gray-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-gray-700 disabled:opacity-50"
+            >
+              {editBusy ? "Saving…" : "Save"}
+            </button>
+            {view.estimate?.source === "manual" && (
+              <button
+                onClick={() => saveEstimates(true)}
+                disabled={editBusy}
+                className="rounded border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                title="Remove the manual override and restore this quarter's model-workbook values"
+              >
+                Revert to model
+              </button>
+            )}
+            <button
+              onClick={() => setEditOpen(false)}
+              disabled={editBusy}
+              className="rounded border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+          {editErr && <p className="text-xs text-red-600">{editErr}</p>}
+          <p className="text-[11px] text-gray-400">
+            Current source:{" "}
+            {view.estimate
+              ? view.estimate.source === "manual"
+                ? `manual override${view.estimate.updated_by ? ` — ${view.estimate.updated_by}` : ""}${view.estimate.updated_at ? `, ${view.estimate.updated_at.slice(0, 10)}` : ""}`
+                : "model workbook export"
+              : "none yet"}
+            . Saving overrides the model values for this quarter (shared with all analysts, live immediately);
+            blank fields clear that value. Guidance needs both low and high.
+          </p>
+        </div>
+      )}
 
       {/* Provenance line — data-through / days-into-period / period dates */}
       <p className="text-xs text-gray-500">

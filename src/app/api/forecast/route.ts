@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { applyForecastTakeRate, computeRevenueForecast, type RevenueForecast } from "@/lib/auctions";
 import { ttlCache } from "@/lib/cache";
-import { loadModelEstimates, loadReportedQuarterlyGmv } from "@/lib/reported-gmv";
+import { loadModelEstimatesMerged, loadReportedQuarterlyGmv } from "@/lib/reported-gmv";
 import { supabase } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
@@ -39,7 +39,7 @@ export async function GET(request: Request) {
   // of the selected quarter or when the cron last regenerated the snapshot.
   const [reported_gmv_by_quarter, model_estimates_by_quarter] = await Promise.all([
     loadReportedQuarterlyGmv(),
-    loadModelEstimates(),
+    loadModelEstimatesMerged(),
   ]);
   return NextResponse.json({ ...applyForecastTakeRate(base, takeRate), reported_gmv_by_quarter, model_estimates_by_quarter });
 }

@@ -578,12 +578,16 @@ export type RevenueForecast = {
    *  the committed model export; optional so the core computation is unaffected. */
   reported_gmv_by_quarter?: { quarter: string; reported_gmv_usd: number }[];
   /** Company guidance + Clearline model GMV estimates per calendar quarter
-   *  (from the same model export). Attached by the forecast route; optional. */
+   *  (model export merged with analyst overrides from the `model_estimates`
+   *  table). Attached by the forecast route; optional. */
   model_estimates_by_quarter?: {
     quarter: string;
     guidance_low_usd: number | null;
     guidance_high_usd: number | null;
     clearline_estimate_usd: number | null;
+    source?: "model" | "manual";
+    updated_by?: string | null;
+    updated_at?: string | null;
   }[];
   debug: {
     now_iso: string;
