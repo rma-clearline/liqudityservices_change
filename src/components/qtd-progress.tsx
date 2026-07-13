@@ -66,6 +66,22 @@ function quarterDayKeys(label: string): string[] {
 
 const priorYearQuarter = (label: string) => `${Number(label.slice(0, 4)) - 1}${label.slice(4)}`;
 
+const addDaysKey = (key: string, n: number) => {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+};
+const monthShift = (ym: string, delta: number) => {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1 + delta, 1)).toISOString().slice(0, 7);
+};
+const lastDayOfMonth = (ym: string) => {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(Date.UTC(y, m, 0)).getUTCDate();
+};
+const MONTHS_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const monthLabel = (ym: string) => `${MONTHS_ABBR[Number(ym.slice(5, 7)) - 1]}-${ym.slice(2, 4)}`;
+const shortDate = (key: string) => `${Number(key.slice(5, 7))}/${Number(key.slice(8, 10))}`;
+
 function cumulate(dayKeys: string[], byDate: Map<string, number>): number[] {
   let run = 0;
   return dayKeys.map((k) => {
@@ -93,6 +109,98 @@ function StatCard({ label, value, sub, strong }: { label: string; value: ReactNo
       <p className="text-xs text-gray-500 mb-0.5">{label}</p>
       <p className={`tabular-nums ${strong ? "text-xl font-bold text-gray-900" : "text-lg font-semibold text-gray-800"}`}>{value}</p>
       {sub && <div className="mt-0.5 text-xs text-gray-500">{sub}</div>}
+    </div>
+  );
+}
+
+/** One column of the Yipit-style key-metrics tables. `nominal` is captured-basis
+ *  unless `total` (guidance/Clearline/reported — total-company $, never scaled).
+ *  `lyReported`: LY reported total, enabling a scaled-vs-reported Y/Y fallback. */
+type MCol = {
+  key: string;
+  top: string;
+  sub?: string;
+  nominal: number;
+  yoy: number | null;
+  lyReported?: number | null;
+  hl?: boolean;
+  total?: boolean;
+};
+
+function MetricsTable({
+  groups,
+  scale,
+  scaled,
+}: {
+  groups: { name: string; cols: MCol[] }[];
+  scale: number;
+  scaled: boolean;
+}) {
+  const shown = groups.filter((g) => g.cols.length > 0);
+  if (shown.length === 0) return null;
+  const cell = "px-2.5 py-1 text-right tabular-nums whitespace-nowrap";
+  return (
+    <div className="overflow-x-auto rounded-lg border">
+      <table className="w-full border-collapse text-xs">
+        <thead>
+          <tr className="border-b border-gray-200 text-left">
+            <th className="px-2.5 py-1 text-gray-400 font-medium">(USDmm)</th>
+            {shown.map((g) => (
+              <th key={g.name} colSpan={g.cols.length} className="border-l px-2.5 py-1 font-semibold text-gray-600">
+                {g.name}
+              </th>
+            ))}
+          </tr>
+          <tr className="border-b-2 border-gray-300">
+            <th />
+            {shown.flatMap((g) =>
+              g.cols.map((c, i) => (
+                <th key={c.key} className={`${cell} font-semibold text-gray-700 ${i === 0 ? "border-l" : ""} ${c.hl ? "bg-blue-50" : ""}`}>
+                  {c.top}
+                  {c.sub && <span className="block text-[10px] font-normal text-gray-400">{c.sub}</span>}
+                </th>
+              )),
+            )}
+          </tr>
+        </thead>
+        <tbody>
+          <tr className="border-b border-gray-100">
+            <td className="px-2.5 py-1 text-gray-500">Nominal</td>
+            {shown.flatMap((g) =>
+              g.cols.map((c, i) => (
+                <td key={c.key} className={`${cell} font-semibold text-gray-900 ${i === 0 ? "border-l" : ""} ${c.hl ? "bg-blue-50" : ""}`}>
+                  {((c.total ? c.nominal : c.nominal * scale) / 1e6).toFixed(1)}
+                </td>
+              )),
+            )}
+          </tr>
+          <tr>
+            <td className="px-2.5 py-1 text-gray-500">Y/Y Growth</td>
+            {shown.flatMap((g) =>
+              g.cols.map((c, i) => {
+                // Captured-vs-captured Y/Y when LY daily data exists; in scaled mode
+                // fall back to scaled-vs-LY-REPORTED (marked *).
+                const direct = c.yoy;
+                const derived =
+                  direct == null && scaled && !c.total && c.lyReported ? (c.nominal * scale) / c.lyReported - 1 : null;
+                const v = direct ?? derived;
+                return (
+                  <td key={c.key} className={`${cell} ${i === 0 ? "border-l" : ""} ${c.hl ? "bg-blue-50" : ""}`}>
+                    {v == null ? (
+                      <span className="text-gray-300">—</span>
+                    ) : (
+                      <span className={v >= 0 ? "text-green-600" : "text-red-600"}>
+                        {fmtPct(v)}
+                        {derived != null && <span className="text-gray-400">*</span>}
+                      </span>
+                    )}
+                  </td>
+                );
+              }),
+            )}
+          </tr>
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -306,6 +414,123 @@ export function QtdProgress() {
   const quarterOptions = model.quarters;
   const lastCompleted = quarterOptions.find((q) => q !== currentQuarter);
 
+  // --- Yipit-style key metrics (always pinned to the LATEST data, independent of
+  // the chart's quarter selector) -------------------------------------------------
+  const realized = model.realizedByDate;
+  const last = model.lastDataDate;
+  const sumRange = (from: string, to: string) => {
+    let s = 0;
+    for (let k = from; k <= to; k = addDaysKey(k, 1)) s += realized.get(k) ?? 0;
+    return s;
+  };
+  const coveredFrom = (from: string) => from >= model.earliest;
+  const yoyOf = (cur: number, lyFrom: string, lyTo: string) => {
+    if (!coveredFrom(lyFrom)) return null;
+    const lySum = sumRange(lyFrom, lyTo);
+    return lySum > 0 ? cur / lySum - 1 : null;
+  };
+
+  // Months: last two complete months + MTD (LY month aligned to same day-of-month).
+  const mtdYm = last.slice(0, 7);
+  const lastDom = Number(last.slice(8, 10));
+  const monthCols: MCol[] = [];
+  for (const delta of [-2, -1]) {
+    const ym = monthShift(mtdYm, delta);
+    const start = `${ym}-01`;
+    if (!coveredFrom(start)) continue;
+    const end = `${ym}-${String(lastDayOfMonth(ym)).padStart(2, "0")}`;
+    const lyYm = `${Number(ym.slice(0, 4)) - 1}${ym.slice(4)}`;
+    const nominal = sumRange(start, end);
+    monthCols.push({
+      key: ym,
+      top: monthLabel(ym),
+      nominal,
+      yoy: yoyOf(nominal, `${lyYm}-01`, `${lyYm}-${String(lastDayOfMonth(lyYm)).padStart(2, "0")}`),
+    });
+  }
+  {
+    const lyYm = `${Number(mtdYm.slice(0, 4)) - 1}${mtdYm.slice(4)}`;
+    const nominal = sumRange(`${mtdYm}-01`, last);
+    monthCols.push({
+      key: "mtd",
+      top: `MTD ${shortDate(last)}`,
+      nominal,
+      yoy: yoyOf(nominal, `${lyYm}-01`, `${lyYm}-${String(Math.min(lastDom, lastDayOfMonth(lyYm))).padStart(2, "0")}`),
+      hl: true,
+    });
+  }
+
+  // Quarters: last completed + QTD (LY aligned by day-of-quarter, like the chart).
+  const nowQ = etQuarterKey(last);
+  const nowQKeys = quarterDayKeys(nowQ);
+  const dNow = nowQKeys.filter((k) => k <= last).length;
+  const prevQ = etQuarterKey(addDaysKey(nowQKeys[0], -1));
+  const quarterCols: MCol[] = [];
+  {
+    const pKeys = quarterDayKeys(prevQ);
+    if (pKeys.length && coveredFrom(pKeys[0])) {
+      const nominal = sumRange(pKeys[0], pKeys[pKeys.length - 1]);
+      const lyKeys = quarterDayKeys(priorYearQuarter(prevQ));
+      quarterCols.push({
+        key: prevQ,
+        top: formatQuarterLabel(prevQ, "cy"),
+        sub: `(${formatQuarterLabel(prevQ, "fq")})`,
+        nominal,
+        yoy: lyKeys.length ? yoyOf(nominal, lyKeys[0], lyKeys[lyKeys.length - 1]) : null,
+        lyReported: model.reported.get(priorYearQuarter(prevQ)) ?? null,
+      });
+    }
+    const nominal = sumRange(nowQKeys[0], last);
+    const lyKeys = quarterDayKeys(priorYearQuarter(nowQ)).slice(0, dNow);
+    quarterCols.push({
+      key: "qtd",
+      top: `QTD ${shortDate(last)}`,
+      sub: `(${formatQuarterLabel(nowQ, "fq")})`,
+      nominal,
+      yoy: lyKeys.length ? yoyOf(nominal, lyKeys[0], lyKeys[lyKeys.length - 1]) : null,
+      hl: true,
+    });
+  }
+
+  // Model group (total-company $ — comparable in scaled mode only, like the chart).
+  const modelCols: MCol[] = [];
+  if (scaled) {
+    for (const q of [prevQ, nowQ]) {
+      const e = model.estimates.get(q);
+      const lyRep = model.reported.get(priorYearQuarter(q));
+      const mid = e?.guidance_low_usd && e?.guidance_high_usd ? (e.guidance_low_usd + e.guidance_high_usd) / 2 : null;
+      if (mid) {
+        modelCols.push({
+          key: `g-${q}`, top: "Guide mid", sub: `(${formatQuarterLabel(q, "fq")})`, nominal: mid,
+          yoy: lyRep ? mid / lyRep - 1 : null, total: true,
+        });
+      }
+      if (e?.clearline_estimate_usd) {
+        modelCols.push({
+          key: `cl-${q}`, top: "Clearline", sub: `(${formatQuarterLabel(q, "fq")})`, nominal: e.clearline_estimate_usd,
+          yoy: lyRep ? e.clearline_estimate_usd / lyRep - 1 : null, total: true,
+        });
+      }
+    }
+  }
+
+  // Trailing 7 days, one column per week-ending; Y/Y is 52-week (weekday-aligned).
+  const t7dCols: MCol[] = [];
+  for (const off of [28, 21, 14, 7, 0]) {
+    const end = addDaysKey(last, -off);
+    const start = addDaysKey(end, -6);
+    if (!coveredFrom(start)) continue;
+    const nominal = sumRange(start, end);
+    t7dCols.push({
+      key: `t7d-${end}`, top: shortDate(end), nominal,
+      yoy: yoyOf(nominal, addDaysKey(start, -364), addDaysKey(end, -364)),
+      hl: off === 0,
+    });
+  }
+  const t7dYoyNow = t7dCols[t7dCols.length - 1]?.yoy ?? null;
+  const t7dYoyPrev = t7dCols[t7dCols.length - 2]?.yoy ?? null;
+  const t7dWowPp = t7dYoyNow != null && t7dYoyPrev != null ? (t7dYoyNow - t7dYoyPrev) * 100 : null;
+
   return (
     <div className="space-y-4">
       {/* Controls */}
@@ -383,7 +608,7 @@ export function QtdProgress() {
       </p>
 
       {/* Stat cards */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
         <StatCard
           label={`QTD GMV (${scaled ? "scaled to total" : "captured"})`}
           value={fmtM(view.qtd * scale)}
@@ -421,6 +646,21 @@ export function QtdProgress() {
           strong
         />
         <StatCard
+          label="T7D Y/Y"
+          value={
+            t7dYoyNow == null ? (
+              "—"
+            ) : (
+              <span className={t7dYoyNow >= 0 ? "text-green-600" : "text-red-600"}>{fmtPct(t7dYoyNow)}</span>
+            )
+          }
+          sub={
+            t7dWowPp == null
+              ? "trailing 7 days vs 52 weeks ago"
+              : `${t7dWowPp >= 0 ? "↗" : "↘"} ${Math.abs(t7dWowPp).toFixed(1)} pp WoW`
+          }
+        />
+        <StatCard
           label="Last 7 days"
           value={
             view.wow == null ? (
@@ -436,6 +676,35 @@ export function QtdProgress() {
           sub="change in the full-quarter estimate vs one week ago"
         />
       </div>
+
+      {/* Key metrics tables (Yipit-style) — pinned to the latest data */}
+      <div className="grid gap-3 xl:grid-cols-[3fr_2fr]">
+        <div>
+          <p className="mb-1 text-xs font-semibold text-gray-600">
+            Key metrics <span className="font-normal text-gray-400">({scaled ? `scaled @ ${(captureRate * 100).toFixed(1)}%` : "as captured"})</span>
+          </p>
+          <MetricsTable
+            groups={[
+              { name: "Months", cols: monthCols },
+              { name: "Quarters", cols: quarterCols },
+              { name: "Model (total co.)", cols: modelCols },
+            ]}
+            scale={scale}
+            scaled={scaled}
+          />
+        </div>
+        <div>
+          <p className="mb-1 text-xs font-semibold text-gray-600">
+            T7D <span className="font-normal text-gray-400">(trailing 7 days, week ending)</span>
+          </p>
+          <MetricsTable groups={[{ name: "Trailing 7 days", cols: t7dCols }]} scale={scale} scaled={scaled} />
+        </div>
+      </div>
+      <p className="text-xs text-gray-400 -mt-1">
+        Y/Y shows &ldquo;—&rdquo; where prior-year daily data doesn&rsquo;t exist yet (begins {model.earliest}).
+        T7D Y/Y compares to 52 weeks ago (weekday-aligned). *Scaled QTD/quarter vs LY <em>reported</em> total.
+        {!scaled && " Switch to Scaled to total to compare against guidance / the Clearline model."}
+      </p>
 
       {/* Projection toggles */}
       {!view.complete && (
