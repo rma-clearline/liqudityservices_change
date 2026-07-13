@@ -64,8 +64,22 @@ Container Apps has no built-in cron, so scheduling lives in ACA **Jobs** (create
 times are **UTC**.
 
 - **`lqdt-cron`** — the app's data pipeline. Cron `0 0,4,8,12,16,20 * * *` (every 4h).
-  Runs `curl -fsS "$APP_URL/api/cron?secret=$CRON_SECRET"` (secret `cron-secret`), which
-  drives the scrapers + the daily `sold_lots` capture. This replaced the old Vercel cron.
+  Runs `curl -fsS "$APP_URL/api/cron?secret=$CRON_SECRET"` (secret `cron-secret`). The
+  scrapers run on every fire, but the once-daily work (`sold_lots` reconciliation, SAM,
+  state contracts, retention, forecast snapshot, email) only on the **noon-ET** fire
+  (16:00 UTC = noon EDT / 11am EST; gated by `DAILY_INGEST_HOURS_ET=11,12`). Replaced the
+  old Vercel cron.
+- **`lqdt-sold-capture`** — intraday `sold_lots` refreshes so the *current* day's GMV
+  shows up same-day instead of waiting for the next noon reconciliation. Cron
+  `0 3,21 * * *` → **~5pm ET** (21:00 UTC — "halfway", ~66% of the day's GMV closed) and
+  **~11pm ET** (03:00 UTC — "end", ~99% closed). Runs
+  `curl -fsS "$APP_URL/api/cron?sold=1&secret=$CRON_SECRET"`; `sold=1` captures sold lots +
+  refreshes the forecast snapshot only, skipping the once-daily email/SAM/state/retention
+  (so it never burns the SAM daily quota or re-sends email). Auction closings cluster in
+  the evening ET (lot surge 7–10pm; only ~25% of GMV has closed by noon), which is why the
+  noon fire alone left the current day near-empty until the next day. Two intraday fires +
+  noon cover the day; reverting to every-4h capture is unnecessary cost. Times drift ±1h
+  with DST (fixed-UTC cron), but `sold=1` isn't hour-gated so the drift is harmless.
 - **`lqdt-keepwarm`** — kills the app cold-start cheaply. Cron `*/4 11-23 * * 1-5`
   (~every 4 min, ~7am–8pm ET weekdays; window shifts ±1h with DST). Runs
   `curl -fsS -o /dev/null "$APP_URL/login"` — a **public** page, so it keeps ≥1 replica
@@ -75,7 +89,7 @@ times are **UTC**.
   zero overnight/weekends. Deliberately does **not** ping a DB-touching route, so the
   serverless SQL DB stays paused (keeping it warm would cost ~$50/mo).
 
-Both jobs set `APP_URL=https://lqdt.clearlineflow.com`. Trigger a manual run to test:
+All three jobs set `APP_URL` to the app's ingress URL. Trigger a manual run to test:
 `az containerapp job start -n <job> -g cl-tool-rg`.
 
 ## Caching (perceived load speed)
