@@ -142,46 +142,27 @@ function MetricsTable({
 }) {
   const shown = groups.filter((g) => g.cols.length > 0);
   if (shown.length === 0) return null;
-  const cell = "px-2.5 py-1 text-right tabular-nums whitespace-nowrap";
   return (
-    <div className="overflow-x-auto rounded-lg border">
+    <div className="rounded-lg border">
       <table className="w-full border-collapse text-xs">
         <thead>
-          <tr className="border-b border-gray-200 text-left">
-            <th className="px-2.5 py-1 text-gray-400 font-medium">(USDmm)</th>
-            {shown.map((g) => (
-              <th key={g.name} colSpan={g.cols.length} className="border-l px-2.5 py-1 font-semibold text-gray-600">
-                {g.name}
-              </th>
-            ))}
-          </tr>
-          <tr className="border-b-2 border-gray-300">
-            <th />
-            {shown.flatMap((g) =>
-              g.cols.map((c, i) => (
-                <th key={c.key} className={`${cell} font-semibold text-gray-700 ${i === 0 ? "border-l" : ""} ${c.hl ? "bg-blue-50" : ""}`}>
-                  {c.top}
-                  {c.sub && <span className="block text-[10px] font-normal text-gray-400">{c.sub}</span>}
-                </th>
-              )),
-            )}
+          <tr className="border-b-2 border-gray-300 text-left">
+            <th className="px-2.5 py-1 font-semibold text-gray-600">Period</th>
+            <th className="px-2.5 py-1 text-right font-semibold text-gray-600">USDmm</th>
+            <th className="px-2.5 py-1 text-right font-semibold text-gray-600">Y/Y</th>
           </tr>
         </thead>
         <tbody>
-          <tr className="border-b border-gray-100">
-            <td className="px-2.5 py-1 text-gray-500">Nominal</td>
-            {shown.flatMap((g) =>
-              g.cols.map((c, i) => (
-                <td key={c.key} className={`${cell} font-semibold text-gray-900 ${i === 0 ? "border-l" : ""} ${c.hl ? "bg-blue-50" : ""}`}>
-                  {((c.total ? c.nominal : c.nominal * scale) / 1e6).toFixed(1)}
-                </td>
-              )),
-            )}
-          </tr>
-          <tr>
-            <td className="px-2.5 py-1 text-gray-500">Y/Y Growth</td>
-            {shown.flatMap((g) =>
-              g.cols.map((c, i) => {
+          {shown.map((g) => (
+            <Fragment key={g.name}>
+              {shown.length > 1 && (
+                <tr className="border-b bg-gray-50/60">
+                  <td colSpan={3} className="px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                    {g.name}
+                  </td>
+                </tr>
+              )}
+              {g.cols.map((c) => {
                 // Captured-vs-captured Y/Y when LY daily data exists; in scaled mode
                 // fall back to scaled-vs-LY-REPORTED (marked *).
                 const direct = c.yoy;
@@ -189,20 +170,29 @@ function MetricsTable({
                   direct == null && scaled && !c.total && c.lyReported ? (c.nominal * scale) / c.lyReported - 1 : null;
                 const v = direct ?? derived;
                 return (
-                  <td key={c.key} className={`${cell} ${i === 0 ? "border-l" : ""} ${c.hl ? "bg-blue-50" : ""}`}>
-                    {v == null ? (
-                      <span className="text-gray-300">—</span>
-                    ) : (
-                      <span className={v >= 0 ? "text-green-600" : "text-red-600"}>
-                        {fmtPct(v)}
-                        {derived != null && <span className="text-gray-400">*</span>}
-                      </span>
-                    )}
-                  </td>
+                  <tr key={c.key} className={`border-b border-gray-100 ${c.hl ? "bg-blue-50" : ""}`}>
+                    <td className="whitespace-nowrap px-2.5 py-1 font-medium text-gray-700">
+                      {c.top}
+                      {c.sub && <span className="ml-1 text-[10px] font-normal text-gray-400">{c.sub}</span>}
+                    </td>
+                    <td className="px-2.5 py-1 text-right tabular-nums font-semibold text-gray-900">
+                      {((c.total ? c.nominal : c.nominal * scale) / 1e6).toFixed(1)}
+                    </td>
+                    <td className="px-2.5 py-1 text-right tabular-nums">
+                      {v == null ? (
+                        <span className="text-gray-300">—</span>
+                      ) : (
+                        <span className={v >= 0 ? "text-green-600" : "text-red-600"}>
+                          {fmtPct(v)}
+                          {derived != null && <span className="text-gray-400">*</span>}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
                 );
-              }),
-            )}
-          </tr>
+              })}
+            </Fragment>
+          ))}
         </tbody>
       </table>
     </div>
@@ -568,11 +558,11 @@ export function QtdProgress() {
     return lySum > 0 ? cur / lySum - 1 : null;
   };
 
-  // Months: last two complete months + MTD (LY month aligned to same day-of-month).
+  // Months: rolling year of complete months + MTD (LY month aligned to same day-of-month).
   const mtdYm = last.slice(0, 7);
   const lastDom = Number(last.slice(8, 10));
   const monthCols: MCol[] = [];
-  for (const delta of [-2, -1]) {
+  for (let delta = -12; delta <= -1; delta++) {
     const ym = monthShift(mtdYm, delta);
     const start = `${ym}-01`;
     if (!coveredFrom(start)) continue;
@@ -598,26 +588,30 @@ export function QtdProgress() {
     });
   }
 
-  // Quarters: last completed + QTD (LY aligned by day-of-quarter, like the chart).
+  // Quarters: every fully-covered quarter (last 8) + QTD, LY aligned by
+  // day-of-quarter (like the chart). Historical quarters without captured LY data
+  // still get the scaled-vs-LY-REPORTED Y/Y fallback via lyReported.
   const nowQ = etQuarterKey(last);
   const nowQKeys = quarterDayKeys(nowQ);
   const dNow = nowQKeys.filter((k) => k <= last).length;
   const prevQ = etQuarterKey(addDaysKey(nowQKeys[0], -1));
   const quarterCols: MCol[] = [];
+  const completedQs = [...model.quarters].reverse().filter((q) => q !== nowQ).slice(-8); // chronological
+  for (const q of completedQs) {
+    const pKeys = quarterDayKeys(q);
+    if (!pKeys.length || !coveredFrom(pKeys[0]) || pKeys[pKeys.length - 1] > last) continue;
+    const nominal = sumRange(pKeys[0], pKeys[pKeys.length - 1]);
+    const lyKeys = quarterDayKeys(priorYearQuarter(q));
+    quarterCols.push({
+      key: q,
+      top: formatQuarterLabel(q, "cy"),
+      sub: `(${formatQuarterLabel(q, "fq")})`,
+      nominal,
+      yoy: lyKeys.length ? yoyOf(nominal, lyKeys[0], lyKeys[lyKeys.length - 1]) : null,
+      lyReported: model.reported.get(priorYearQuarter(q)) ?? null,
+    });
+  }
   {
-    const pKeys = quarterDayKeys(prevQ);
-    if (pKeys.length && coveredFrom(pKeys[0])) {
-      const nominal = sumRange(pKeys[0], pKeys[pKeys.length - 1]);
-      const lyKeys = quarterDayKeys(priorYearQuarter(prevQ));
-      quarterCols.push({
-        key: prevQ,
-        top: formatQuarterLabel(prevQ, "cy"),
-        sub: `(${formatQuarterLabel(prevQ, "fq")})`,
-        nominal,
-        yoy: lyKeys.length ? yoyOf(nominal, lyKeys[0], lyKeys[lyKeys.length - 1]) : null,
-        lyReported: model.reported.get(priorYearQuarter(prevQ)) ?? null,
-      });
-    }
     const nominal = sumRange(nowQKeys[0], last);
     const lyKeys = quarterDayKeys(priorYearQuarter(nowQ)).slice(0, dNow);
     quarterCols.push({
@@ -652,9 +646,9 @@ export function QtdProgress() {
     }
   }
 
-  // Trailing 7 days, one column per week-ending; Y/Y is 52-week (weekday-aligned).
+  // Trailing 7 days, one row per week-ending; Y/Y is 52-week (weekday-aligned).
   const t7dCols: MCol[] = [];
-  for (const off of [28, 21, 14, 7, 0]) {
+  for (const off of [49, 42, 35, 28, 21, 14, 7, 0]) {
     const end = addDaysKey(last, -off);
     const start = addDaysKey(end, -6);
     if (!coveredFrom(start)) continue;
@@ -1096,15 +1090,19 @@ export function QtdProgress() {
         </ComposedChart>
       </ResponsiveContainer>
 
-      {/* Key metrics tables (Yipit-style) — pinned to the latest data */}
-      <div className="grid gap-3 xl:grid-cols-[3fr_2fr]">
+      {/* Key metrics tables (Yipit-style, vertical) — pinned to the latest data */}
+      <p className="-mb-2 text-xs font-semibold text-gray-600">
+        Key metrics <span className="font-normal text-gray-400">({scaled ? `scaled @ ${(captureRate * 100).toFixed(1)}%` : "as captured"})</span>
+      </p>
+      <div className="grid items-start gap-3 md:grid-cols-2 xl:grid-cols-3">
         <div>
-          <p className="mb-1 text-xs font-semibold text-gray-600">
-            Key metrics <span className="font-normal text-gray-400">({scaled ? `scaled @ ${(captureRate * 100).toFixed(1)}%` : "as captured"})</span>
-          </p>
+          <p className="mb-1 text-xs font-medium text-gray-500">Months</p>
+          <MetricsTable groups={[{ name: "Months", cols: monthCols }]} scale={scale} scaled={scaled} />
+        </div>
+        <div>
+          <p className="mb-1 text-xs font-medium text-gray-500">Quarters{modelCols.length > 0 ? " & model" : ""}</p>
           <MetricsTable
             groups={[
-              { name: "Months", cols: monthCols },
               { name: "Quarters", cols: quarterCols },
               { name: "Model (total co.)", cols: modelCols },
             ]}
@@ -1113,9 +1111,7 @@ export function QtdProgress() {
           />
         </div>
         <div>
-          <p className="mb-1 text-xs font-semibold text-gray-600">
-            T7D <span className="font-normal text-gray-400">(trailing 7 days, week ending)</span>
-          </p>
+          <p className="mb-1 text-xs font-medium text-gray-500">T7D (trailing 7 days, week ending)</p>
           <MetricsTable groups={[{ name: "Trailing 7 days", cols: t7dCols }]} scale={scale} scaled={scaled} />
         </div>
       </div>
