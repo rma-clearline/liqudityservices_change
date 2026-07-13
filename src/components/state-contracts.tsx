@@ -1,6 +1,7 @@
 "use client";
 
 import type { StateContractRow } from "@/lib/supabase";
+import { formatQuarterLabel } from "@/lib/time";
 import { ExportButton } from "./export-button";
 
 function fmtDollar(n: number | null | undefined) {
@@ -8,6 +9,22 @@ function fmtDollar(n: number | null | undefined) {
   if (n >= 1_000_000) return "$" + (n / 1_000_000).toFixed(2) + "M";
   if (n >= 1_000) return "$" + (n / 1_000).toFixed(0) + "k";
   return "$" + n.toFixed(0);
+}
+
+/**
+ * Dual-label a government record's (year, quarter) as CQ (calendar) / (FQ = LQDT
+ * fiscal) when it cleanly reads as a calendar quarter — i.e. a bare 1-4 (optionally
+ * "Q"-prefixed) with a 4-digit year. Government sources report on their OWN fiscal
+ * calendars and most leave quarter blank / non-quarterly (accounting periods,
+ * etc.), so those pass through as the raw value rather than being mis-mapped.
+ */
+function formatGovQuarter(year: string, quarter: string): string {
+  const raw = (quarter ?? "").trim();
+  if (!raw) return "—";
+  const qm = /^(?:q|quarter)?\s*([1-4])$/i.exec(raw);
+  const ym = /(\d{4})/.exec(year ?? "");
+  if (qm && ym) return formatQuarterLabel(`${ym[1]}Q${qm[1]}`);
+  return raw;
 }
 
 const VENDOR_LABEL: Record<string, string> = {
@@ -121,7 +138,8 @@ export function StateContracts({ contracts }: { contracts: StateContractRow[] })
 
       <p className="text-xs text-gray-400">
         <span className="inline-block w-3 h-3 align-middle mr-1 bg-amber-50 border border-amber-200 rounded-sm" />
-        Highlighted rows are from the current or past 6 months.
+        Highlighted rows are from the current or past 6 months. Year/Qtr are each government source&rsquo;s own reported values;
+        where a quarter reads as a calendar quarter it&rsquo;s shown as CQ (calendar) / (FQ = LQDT fiscal, FY ends Sep 30).
       </p>
 
       {Object.entries(byState)
@@ -157,7 +175,7 @@ export function StateContracts({ contracts }: { contracts: StateContractRow[] })
                         <td className="py-1 pr-4 truncate max-w-[200px]">{c.contract_title ?? "—"}</td>
                         <td className="py-1 pr-4 truncate max-w-[180px] text-gray-500">{c.customer_agency || "—"}</td>
                         <td className="py-1 pr-4 tabular-nums">{c.year || "—"}</td>
-                        <td className="py-1 pr-4 tabular-nums">{c.quarter || "—"}</td>
+                        <td className="py-1 pr-4 tabular-nums whitespace-nowrap">{formatGovQuarter(c.year, c.quarter)}</td>
                         <td className="py-1 pr-4 text-right tabular-nums">{fmtDollar(c.amount)}</td>
                         <td className="py-1">
                           <a

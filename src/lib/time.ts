@@ -130,6 +130,49 @@ export function etQuarterKey(dateKey: string): string {
   return `${year}Q${q}`;
 }
 
+// --- LQDT fiscal-quarter display -------------------------------------------
+//
+// The internal quarter keys ("YYYYQn") the app buckets/queries by are always
+// CALENDAR quarters. LQDT itself reports on a fiscal year that ENDS Sep 30
+// (FQ4 ends 9/30), i.e. FY{n} runs Oct 1 {n-1} -> Sep 30 {n}. So a calendar
+// quarter maps to an LQDT fiscal quarter one step ahead, and Oct-Dec rolls into
+// the NEXT fiscal year:
+//   CY Q1 (Jan-Mar) -> FQ2      CY Q2 (Apr-Jun) -> FQ3
+//   CY Q3 (Jul-Sep) -> FQ4      CY Q4 (Oct-Dec) -> FQ1 of FY+1
+// These helpers are DISPLAY-ONLY — they never feed data keys, API params, or
+// snapshot PKs (which stay calendar "YYYYQn").
+
+/** Map a calendar quarter (year, 1-4) to LQDT's fiscal { fy, fq } (FY ends 9/30). */
+export function lqdtFiscalQuarter(calYear: number, calQuarter: number): { fy: number; fq: number } {
+  const fq = (calQuarter % 4) + 1; // Q1->2, Q2->3, Q3->4, Q4->1
+  const fy = calQuarter === 4 ? calYear + 1 : calYear;
+  return { fy, fq };
+}
+
+const QUARTER_KEY_RE = /^(\d{4})Q([1-4])$/;
+
+/**
+ * Format a calendar "YYYYQn" quarter key for display, disambiguating the
+ * calendar quarter from LQDT's fiscal quarter. Non-quarter strings (month keys
+ * "YYYY-MM", "ALL", date ranges) pass through unchanged so callers can format a
+ * mixed period column safely.
+ *   "2026Q3" -> "26CQ3 / (26FQ4)"   (dual, default)
+ *   "2026Q3" -> "26CQ3"             (variant "cy")
+ *   "2026Q3" -> "26FQ4"             (variant "fq")
+ */
+export function formatQuarterLabel(key: string, variant: "dual" | "cy" | "fq" = "dual"): string {
+  const m = QUARTER_KEY_RE.exec(key.trim());
+  if (!m) return key;
+  const cy = Number(m[1]);
+  const cq = Number(m[2]);
+  const { fy, fq } = lqdtFiscalQuarter(cy, cq);
+  const cyLabel = `${String(cy).slice(-2)}CQ${cq}`;
+  const fqLabel = `${String(fy).slice(-2)}FQ${fq}`;
+  if (variant === "cy") return cyLabel;
+  if (variant === "fq") return fqLabel;
+  return `${cyLabel} / (${fqLabel})`;
+}
+
 export function formatPartsInEt(date: Date) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: ET_TIME_ZONE,

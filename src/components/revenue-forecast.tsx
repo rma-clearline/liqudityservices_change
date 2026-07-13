@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState, type MouseEvent, type ReactNode } from "react";
 import { downloadCsv, toCsv } from "@/lib/format";
-import { etMonthKey, etQuarterKey, etWeekKey } from "@/lib/time";
+import { etMonthKey, etQuarterKey, etWeekKey, formatQuarterLabel } from "@/lib/time";
 import { siteLabel } from "@/lib/sites";
 import { GmvExportModal } from "./gmv-export-modal";
 import {
@@ -887,7 +887,7 @@ function PeriodTable({ title, seqLabel, rows }: { title: string; seqLabel: strin
           {rows.map((r) => (
             <tr key={r.period} className="border-b border-gray-100">
               <td className="py-1 pr-4 whitespace-nowrap">
-                {r.period}
+                {formatQuarterLabel(r.period)}
                 {r.partial && <span className="ml-1 text-xs text-amber-600">(partial)</span>}
               </td>
               <td className="py-1 pr-4 text-right tabular-nums">{fmtDollar(r.gmv)}</td>
@@ -936,6 +936,23 @@ const OTHER_COLOR = "#898781";
 // the long tail stays in "Other", inspectable via the hover tooltip).
 const TOPN_OPTIONS = [6, 8, 10] as const;
 const DEFAULT_TOPN = 8;
+
+/** Two-line category-chart X-axis tick: calendar quarter over LQDT fiscal quarter,
+ *  so a stacked-bar period reads e.g. "26CQ3" above "26FQ4" without crowding. */
+function QuarterAxisTick(props: { x?: number; y?: number; payload?: { value?: string } }) {
+  const { x = 0, y = 0, payload } = props;
+  const v = payload?.value ?? "";
+  return (
+    <g transform={`translate(${x},${y})`}>
+      <text x={0} y={0} dy={12} textAnchor="middle" fontSize={11} fill="#374151">
+        {formatQuarterLabel(v, "cy")}
+      </text>
+      <text x={0} y={0} dy={25} textAnchor="middle" fontSize={10} fill="#9ca3af">
+        {formatQuarterLabel(v, "fq")}
+      </text>
+    </g>
+  );
+}
 
 /** Fold a full period×category matrix down to the top-N categories by total GMV,
  *  bucketing the remainder into "Other". Mirrors the server's `categoryByPeriod`
@@ -1046,7 +1063,7 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
         <ResponsiveContainer width="100%" height={340}>
           <BarChart data={data} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
             <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="period" tick={{ fontSize: 11 }} />
+            <XAxis dataKey="period" tick={<QuarterAxisTick />} height={40} interval={0} />
             <YAxis
               tickFormatter={(v: number) => (v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : (v / 1000).toFixed(0) + "k")}
               tick={{ fontSize: 11 }}
@@ -1061,7 +1078,7 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
         </ResponsiveContainer>
         <p className="mt-1 text-xs text-gray-400">
           Revenue = category GMV × {(takeRate * 100).toFixed(0)}% take rate. Top {topN} categories by GMV; the rest grouped as
-          Other (hover any segment for its exact category and value).
+          Other (hover any segment for its exact category and value). X-axis: CQ (calendar quarter) / FQ (LQDT fiscal, FY ends Sep 30).
           {state.truncated ? " Value-ranked sample (top lots by value) — captures most GMV, not every tail lot." : ""}
         </p>
       </>
@@ -1189,15 +1206,16 @@ export function RevenueForecast() {
   const ad = forecast.platforms.find((p) => p.platform === "AD");
   const gd = forecast.platforms.find((p) => p.platform === "GD");
   const isAll = forecast.quarter === "ALL";
+  const quarterLabel = formatQuarterLabel(forecast.quarter);
   const totalGmvLabel = isAll
     ? "Total GMV (all data)"
-    : `${forecast.is_current ? "Projected" : "Realized"} ${forecast.quarter} GMV`;
+    : `${forecast.is_current ? "Projected" : "Realized"} ${quarterLabel} GMV`;
   const totalRevLabel = isAll
     ? "Total Revenue (all data)"
-    : `${forecast.is_current ? "Projected" : "Realized"} ${forecast.quarter} Revenue`;
+    : `${forecast.is_current ? "Projected" : "Realized"} ${quarterLabel} Revenue`;
   const dailyStart = forecast.daily[0]?.date;
   const dailyEnd = forecast.daily[forecast.daily.length - 1]?.date;
-  const dailyRange = dailyStart && dailyEnd ? `${dailyStart} to ${dailyEnd}` : forecast.quarter;
+  const dailyRange = dailyStart && dailyEnd ? `${dailyStart} to ${dailyEnd}` : quarterLabel;
   const chartMarketLabel = chartMarket === "all" ? "" : `${CHART_MARKET_OPTIONS.find((option) => option.value === chartMarket)?.label ?? ""} `;
   const chartSliceLabel =
     chartSource !== "all"
@@ -1228,7 +1246,7 @@ export function RevenueForecast() {
             <option value="ALL">All (full history)</option>
             {[...forecast.available_quarters].reverse().map((q, i) => (
               <option key={q} value={q}>
-                {q}{i === 0 ? " (current)" : ""}
+                {formatQuarterLabel(q)}{i === 0 ? " (current)" : ""}
               </option>
             ))}
           </select>
@@ -1238,6 +1256,9 @@ export function RevenueForecast() {
             !forecast.is_current && <span className="text-xs text-gray-400">closed quarter — realized only</span>
           )}
         </label>
+        <span className="text-xs text-gray-400 basis-full">
+          Quarters shown as <strong className="font-medium text-gray-500">CQ</strong> (calendar) / (<strong className="font-medium text-gray-500">FQ</strong> = LQDT fiscal, FY ends Sep 30).
+        </span>
         <label className="text-sm text-gray-600 flex items-center gap-2">
           Take rate
           <input
@@ -1282,7 +1303,7 @@ export function RevenueForecast() {
         </label>
         {qtd ? (
           <span className="text-gray-700">
-            <strong>{etQuarterKey(qtdDate)}</strong> realized through {qtdDate}:{" "}
+            <strong>{formatQuarterLabel(etQuarterKey(qtdDate))}</strong> realized through {qtdDate}:{" "}
             <strong className="text-gray-900">{fmtDollar(qtd.revenue)}</strong> revenue ·{" "}
             {fmtDollar(qtd.gmv)} GMV <span className="text-gray-400">({qtd.days} days in)</span>
           </span>
