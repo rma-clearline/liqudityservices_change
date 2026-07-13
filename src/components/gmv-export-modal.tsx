@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { downloadCsv, toCsv } from "@/lib/format";
+import { formatQuarterLabel } from "@/lib/time";
 
 const SITES = [
   { v: "all", l: "All sites" },
@@ -206,7 +207,11 @@ export function GmvExportModal({
               a.site.localeCompare(b.site) ||
               a.type.localeCompare(b.type) ||
               a.market.localeCompare(b.market),
-          );
+          )
+          // Sort on the raw calendar key (chronological), then relabel quarter
+          // periods to LQDT fiscal only (e.g. "2026Q3" -> "26FQ4"). Day/week/month
+          // keys pass through unchanged.
+          .map((r) => ({ ...r, period: formatQuarterLabel(r.period, "fq") }));
         outCsv = toCsv(rows, PIVOT_COLUMNS);
       }
 
@@ -347,7 +352,8 @@ export function GmvExportModal({
         {error && <p className="mt-3 rounded bg-red-50 p-2 text-xs text-red-600">Error: {error}</p>}
         <p className="mt-3 text-[11px] leading-relaxed text-gray-400">
           Source: Maestro sold archive (realized hammer, USD via daily FX). Each month is fetched completely (every page),
-          so totals reconcile with the GMV chart. Pivot columns: Period · Site · Type · Market · GMV · Lots.
+          so totals reconcile with the GMV chart. Pivot columns: Period · Site · Type · Market · GMV · Lots
+          (quarter periods are labeled as LQDT fiscal quarters, e.g. 26FQ4 — FY ends Sep 30).
         </p>
       </div>
     </div>
