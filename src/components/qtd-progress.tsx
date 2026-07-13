@@ -8,7 +8,7 @@
 // All math is client-side on the /api/forecast?quarter=ALL payload (full daily
 // history + current-quarter open-auction projection + reported/estimate series).
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   ComposedChart,
   Line,
@@ -200,6 +200,132 @@ function MetricsTable({
               }),
             )}
           </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// Definitions & methodology for every number on the page — rendered at the bottom
+// so analysts can audit exactly how each figure is derived.
+const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] = [
+  {
+    group: "Headline figures",
+    items: [
+      {
+        term: "QTD GMV (captured)",
+        def: "Sum of scraped daily sold GMV (per-lot hammer prices from the durable auction store, deduped, USD via daily FX) from the fiscal quarter's first day through the data-through date.",
+      },
+      {
+        term: "Scaled to total",
+        def: "Captured GMV ÷ capture rate — an estimate of LQDT's total-company GMV. All projections, deltas, and the model columns follow this basis when the toggle is on.",
+      },
+      {
+        term: "Capture rate",
+        def: "How much of LQDT's total reported GMV the scrape captures. Auto = average of (captured full-quarter GMV ÷ LQDT reported GMV) over the last 3 reported quarters; the input overrides it.",
+      },
+      {
+        term: "QTD Y/Y",
+        def: "Cumulative captured QTD ÷ last year's same fiscal quarter aligned by day-of-quarter (day 13 vs day 13), minus 1. Calendar dates differ; day alignment keeps the comparison at the same depth into the quarter.",
+      },
+      {
+        term: "Data through / Day N of M",
+        def: "Latest Eastern-time day with captured sold data, and how many of the fiscal period's days that covers. Intraday capture runs ~5pm and ~11pm ET, so 'today' fills in same-evening.",
+      },
+      {
+        term: "T7D Y/Y",
+        def: "Trailing-7-day captured GMV vs the same 7 days 52 weeks ago (a 364-day shift, which preserves the weekday mix — auction closings cluster by weekday). WoW = change vs the prior week's T7D Y/Y.",
+      },
+      {
+        term: "Last 7 days (FQE change)",
+        def: "The full-quarter estimate recomputed with the last 7 days of data excluded, compared to the current estimate — shows whether the past week's activity pushed the quarter's trajectory up or down (±1% = unchanged).",
+      },
+    ],
+  },
+  {
+    group: "Projections (dashed lines from the last data day)",
+    items: [
+      {
+        term: "Prior-yr shape (primary)",
+        def: "QTD ÷ (LY cumulative through the same day ÷ LY full quarter). Applies last year's rest-of-quarter daily distribution at the current Y/Y pace — the Yipit-style RoQ method; handles seasonality/lumpiness. Needs LY daily data.",
+      },
+      {
+        term: "Open auctions",
+        def: "QTD + the app's per-day projected GMV from currently scheduled open auctions. Grounded in actual scheduled supply but only extends as far as auctions are scheduled (~2 weeks) — NOT a full-quarter estimate.",
+      },
+      {
+        term: "Run rate",
+        def: "QTD daily average × days in the quarter. Crude (ignores seasonality) but always available; the fallback when prior-year data doesn't exist.",
+      },
+    ],
+  },
+  {
+    group: "Benchmarks (total-company $, shown in Scaled mode)",
+    items: [
+      {
+        term: "Guidance low / high",
+        def: "Company GMV guidance for the quarter, from the model workbook's 'Total GMV Guidance' row (stated in $M). 'vs mid' compares the scaled FQ estimate to the midpoint.",
+      },
+      {
+        term: "Clearline estimate",
+        def: "The Clearline model's own Total GMV forecast for the quarter (the model's forecast columns, $000 → USD). Refreshed via the extract + push scripts after each model update.",
+      },
+      {
+        term: "Reported actual",
+        def: "LQDT's reported total-company GMV once the quarter is reported (sum of all reported segments, from the model). Appears as a chart line for backtesting the scaled estimate.",
+      },
+    ],
+  },
+  {
+    group: "Tables",
+    items: [
+      {
+        term: "Months / MTD",
+        def: "Calendar-month captured sums; MTD runs through the data-through day and its Y/Y compares to the same day-of-month range last year.",
+      },
+      {
+        term: "Quarters / QTD",
+        def: "Last completed fiscal quarter (full) and the current QTD; Y/Y aligned by day-of-quarter. A * marks Y/Y computed as scaled value vs LY REPORTED total (used when captured prior-year data doesn't exist yet).",
+      },
+      {
+        term: "Model (total co.) columns",
+        def: "Guidance midpoint and Clearline estimate with their implied Y/Y vs LY reported GMV — same basis as the scaled numbers, never scaled themselves.",
+      },
+      {
+        term: "T7D table",
+        def: "Trailing-7-day captured GMV for each of the last five week-ending dates; Y/Y per the 364-day rule above.",
+      },
+      {
+        term: "CQ / FQ labels",
+        def: "CQ = calendar quarter; FQ = LQDT fiscal quarter (fiscal year ends Sep 30, so CY Q3 = FQ4 and CY Q4 = FQ1 of the next fiscal year).",
+      },
+    ],
+  },
+];
+
+function DefinitionsBox() {
+  return (
+    <div className="rounded-lg border">
+      <p className="border-b bg-gray-50 px-3 py-2 text-xs font-semibold text-gray-700">
+        Definitions &amp; methodology — how each number is derived
+      </p>
+      <table className="w-full border-collapse text-xs">
+        <tbody>
+          {DEFINITIONS.map((g) => (
+            <Fragment key={g.group}>
+              <tr className="border-b bg-gray-50/60">
+                <td colSpan={2} className="px-3 py-1 font-semibold uppercase tracking-wide text-[10px] text-gray-500">
+                  {g.group}
+                </td>
+              </tr>
+              {g.items.map((it) => (
+                <tr key={it.term} className="border-b border-gray-100 align-top">
+                  <td className="w-48 px-3 py-1.5 font-medium text-gray-700 whitespace-nowrap">{it.term}</td>
+                  <td className="px-3 py-1.5 text-gray-500">{it.def}</td>
+                </tr>
+              ))}
+            </Fragment>
+          ))}
         </tbody>
       </table>
     </div>
@@ -749,35 +875,6 @@ export function QtdProgress() {
         />
       </div>
 
-      {/* Key metrics tables (Yipit-style) — pinned to the latest data */}
-      <div className="grid gap-3 xl:grid-cols-[3fr_2fr]">
-        <div>
-          <p className="mb-1 text-xs font-semibold text-gray-600">
-            Key metrics <span className="font-normal text-gray-400">({scaled ? `scaled @ ${(captureRate * 100).toFixed(1)}%` : "as captured"})</span>
-          </p>
-          <MetricsTable
-            groups={[
-              { name: "Months", cols: monthCols },
-              { name: "Quarters", cols: quarterCols },
-              { name: "Model (total co.)", cols: modelCols },
-            ]}
-            scale={scale}
-            scaled={scaled}
-          />
-        </div>
-        <div>
-          <p className="mb-1 text-xs font-semibold text-gray-600">
-            T7D <span className="font-normal text-gray-400">(trailing 7 days, week ending)</span>
-          </p>
-          <MetricsTable groups={[{ name: "Trailing 7 days", cols: t7dCols }]} scale={scale} scaled={scaled} />
-        </div>
-      </div>
-      <p className="text-xs text-gray-400 -mt-1">
-        Y/Y shows &ldquo;—&rdquo; where prior-year daily data doesn&rsquo;t exist yet (begins {model.earliest}).
-        T7D Y/Y compares to 52 weeks ago (weekday-aligned). *Scaled QTD/quarter vs LY <em>reported</em> total.
-        {!scaled && " Switch to Scaled to total to compare against guidance / the Clearline model."}
-      </p>
-
       {/* Projection toggles */}
       {!view.complete && (
         <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
@@ -868,15 +965,36 @@ export function QtdProgress() {
         </ComposedChart>
       </ResponsiveContainer>
 
-      <p className="text-xs text-gray-400">
-        Cumulative scraped GMV, day-aligned to {formatQuarterLabel(selected)}. &ldquo;Last year&rdquo; is the same fiscal
-        quarter one year earlier (full quarter shown for the landing point). Projections are dashed from the last data day:
-        prior-yr shape applies last year&rsquo;s rest-of-quarter distribution at the current Y/Y pace; open auctions uses the
-        scheduled-auction model (covers only the scheduled horizon, ~2 weeks — not a full-quarter estimate); run rate
-        extrapolates the QTD daily average. Guidance / Clearline / reported lines are
-        total-company figures and appear in <em>Scaled to total</em> mode only. Quarters labeled CQ (calendar) / (FQ = LQDT
-        fiscal, FY ends Sep 30).
+      {/* Key metrics tables (Yipit-style) — pinned to the latest data */}
+      <div className="grid gap-3 xl:grid-cols-[3fr_2fr]">
+        <div>
+          <p className="mb-1 text-xs font-semibold text-gray-600">
+            Key metrics <span className="font-normal text-gray-400">({scaled ? `scaled @ ${(captureRate * 100).toFixed(1)}%` : "as captured"})</span>
+          </p>
+          <MetricsTable
+            groups={[
+              { name: "Months", cols: monthCols },
+              { name: "Quarters", cols: quarterCols },
+              { name: "Model (total co.)", cols: modelCols },
+            ]}
+            scale={scale}
+            scaled={scaled}
+          />
+        </div>
+        <div>
+          <p className="mb-1 text-xs font-semibold text-gray-600">
+            T7D <span className="font-normal text-gray-400">(trailing 7 days, week ending)</span>
+          </p>
+          <MetricsTable groups={[{ name: "Trailing 7 days", cols: t7dCols }]} scale={scale} scaled={scaled} />
+        </div>
+      </div>
+      <p className="text-xs text-gray-400 -mt-1">
+        Y/Y shows &ldquo;—&rdquo; where prior-year daily data doesn&rsquo;t exist yet (begins {model.earliest}).
+        *Scaled QTD/quarter vs LY <em>reported</em> total.
+        {!scaled && " Switch to Scaled to total to compare against guidance / the Clearline model."}
       </p>
+
+      <DefinitionsBox />
     </div>
   );
 }
