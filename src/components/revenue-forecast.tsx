@@ -69,6 +69,8 @@ type Forecast = {
   realized_total_gmv_usd: number;
   realized_total_revenue_usd: number;
   earliest_data_date: string;
+  /** LQDT total-company reported GMV by calendar quarter (benchmark overlay). */
+  reported_gmv_by_quarter?: { quarter: string; reported_gmv_usd: number }[];
 };
 
 type StockPoint = {
@@ -645,18 +647,18 @@ function realizedValue(point: DailyPoint, metric: ChartMetric, market: SalesMark
   return point.realized_gmv_usd;
 }
 
-type Granularity = "day" | "week" | "month";
+type Granularity = "day" | "week" | "month" | "quarter";
 
-const GRANULARITY_LABEL: Record<Granularity, string> = { day: "Daily", week: "Weekly", month: "Monthly" };
+const GRANULARITY_LABEL: Record<Granularity, string> = { day: "Daily", week: "Weekly", month: "Monthly", quarter: "Quarterly" };
 
 /**
- * Re-bucket the daily forecast series into weekly (ISO week-start) or monthly
- * buckets by summing every GMV/revenue field. The API always returns daily
- * points, so this is a pure client-side view transform.
+ * Re-bucket the daily forecast series into weekly (ISO week-start), monthly, or
+ * quarterly (calendar "YYYYQn") buckets by summing every GMV/revenue field. The
+ * API always returns daily points, so this is a pure client-side view transform.
  */
 function bucketDaily(daily: DailyPoint[], granularity: Granularity): DailyPoint[] {
   if (granularity === "day") return daily;
-  const keyFn = granularity === "week" ? etWeekKey : etMonthKey;
+  const keyFn = granularity === "week" ? etWeekKey : granularity === "quarter" ? etQuarterKey : etMonthKey;
   const map = new Map<string, DailyPoint>();
   for (const d of daily) {
     const key = keyFn(d.date);
@@ -711,6 +713,7 @@ function DailyForecastChart({
   todayKey,
   isCurrent,
   onSelectDate,
+  reportedByQuarter,
 }: {
   daily: DailyPoint[];
   metric: ChartMetric;
@@ -723,18 +726,39 @@ function DailyForecastChart({
   todayKey: string;
   isCurrent: boolean;
   onSelectDate: (date: string) => void;
+  reportedByQuarter?: Map<string, number>;
 }) {
   // Projected (future open auctions) only has meaning for the unfiltered total —
   // it isn't split by market or source — so show it only when both are "All".
   const showProjected = market === "all" && source === "all";
-  const data = daily.map((d) => ({
-    date: d.date,
-    Realized: realizedValue(d, metric, market, source),
-    Projected: showProjected ? (metric === "gmv" ? d.projected_gmv_usd : d.projected_revenue_usd) : 0,
-    Stock: showStock ? stockByDate[d.date] ?? null : null,
-  }));
-  const hasAny = data.some((d) => d.Realized > 0 || d.Projected > 0);
+  const isQuarter = granularity === "quarter";
+  // Reported (total-company) GMV is a quarterly, GMV-only benchmark. In quarter view
+  // extend the domain to the union of scraped buckets and reported quarters so the
+  // reported line shows its full history even where the scrape has no data yet.
+  const reported = reportedByQuarter ?? new Map<string, number>();
+  const showReported = isQuarter && metric === "gmv" && reported.size > 0;
+  const byKey = new Map(daily.map((d) => [d.date, d]));
+  // Extend to the full reported history only in a multi-quarter (All) view; a single
+  // selected quarter keeps its own bucket (with its reported point) rather than
+  // sprouting the whole 2018→ reported line beside one bar.
+  const keys =
+    isQuarter && daily.length > 1
+      ? [...new Set([...daily.map((d) => d.date), ...reported.keys()])].sort((a, b) => a.localeCompare(b))
+      : daily.map((d) => d.date);
+  const data = keys.map((key) => {
+    const d = byKey.get(key);
+    return {
+      date: key,
+      Realized: d ? realizedValue(d, metric, market, source) : 0,
+      Projected: showProjected && d ? (metric === "gmv" ? d.projected_gmv_usd : d.projected_revenue_usd) : 0,
+      Stock: showStock && d ? stockByDate[key] ?? null : null,
+      Reported: showReported ? reported.get(key) ?? null : null,
+    };
+  });
+  const hasAny = data.some((d) => d.Realized > 0 || d.Projected > 0 || (d.Reported ?? 0) > 0);
   const hasStock = showStock && data.some((d) => d.Stock != null);
+  // Thin quarter ticks so the two-line CQ/FQ labels don't overlap (~14 max).
+  const quarterInterval = Math.max(0, Math.ceil(data.length / 14) - 1);
   if (!hasAny) {
     return <p className="text-gray-500 text-sm py-8 text-center">No daily data yet - auctions table fills after the next cron run.</p>;
   }
@@ -766,7 +790,11 @@ function DailyForecastChart({
       <ResponsiveContainer width="100%" height={340}>
         <ComposedChart data={data} margin={{ top: 10, right: hasStock ? 22 : 16, bottom: 5, left: 20 }}>
           <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey="date" tick={{ fontSize: 10 }} tickFormatter={(v: string) => v.slice(5)} interval="preserveStartEnd" />
+          {isQuarter ? (
+            <XAxis dataKey="date" tick={<QuarterAxisTick />} height={40} interval={quarterInterval} />
+          ) : (
+            <XAxis dataKey="date" tick={{ fontSize: 10 }} tickFormatter={(v: string) => v.slice(5)} interval="preserveStartEnd" />
+          )}
           <YAxis
             yAxisId="money"
             tickFormatter={(v: number) => (v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : (v / 1000).toFixed(0) + "k")}
@@ -795,6 +823,18 @@ function DailyForecastChart({
           )}
           <Bar yAxisId="money" dataKey="Realized" stackId="a" fill="#2563eb" cursor="pointer" />
           {showProjected && <Bar yAxisId="money" dataKey="Projected" stackId="a" fill="#93c5fd" cursor="pointer" />}
+          {showReported && (
+            <Line
+              yAxisId="money"
+              type="monotone"
+              dataKey="Reported"
+              name="Reported GMV (LQDT total)"
+              stroke="#15803d"
+              strokeWidth={2}
+              dot={{ r: 2 }}
+              connectNulls
+            />
+          )}
           {hasStock && (
             <Line
               yAxisId="stock"
@@ -868,7 +908,19 @@ function GrowthPct({ v }: { v: number | null }) {
   );
 }
 
-function PeriodTable({ title, seqLabel, rows }: { title: string; seqLabel: string; rows: PeriodRow[] }) {
+function PeriodTable({
+  title,
+  seqLabel,
+  rows,
+  reported,
+}: {
+  title: string;
+  seqLabel: string;
+  rows: PeriodRow[];
+  // When provided (quarterly only), adds Reported (LQDT total-company GMV) and
+  // Scraped % (scraped realized ÷ reported) columns keyed by period.
+  reported?: Map<string, number>;
+}) {
   if (rows.length === 0) return null;
   return (
     <div className="overflow-x-auto">
@@ -879,23 +931,34 @@ function PeriodTable({ title, seqLabel, rows }: { title: string; seqLabel: strin
             <th className="py-1 pr-4">Period</th>
             <th className="py-1 pr-4 text-right">GMV</th>
             <th className="py-1 pr-4 text-right">Revenue</th>
+            {reported && <th className="py-1 pr-4 text-right">Reported</th>}
+            {reported && <th className="py-1 pr-4 text-right">Scraped %</th>}
             <th className="py-1 pr-4 text-right">{seqLabel}</th>
             <th className="py-1 text-right">Y/Y</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((r) => (
-            <tr key={r.period} className="border-b border-gray-100">
-              <td className="py-1 pr-4 whitespace-nowrap">
-                {formatQuarterLabel(r.period)}
-                {r.partial && <span className="ml-1 text-xs text-amber-600">(partial)</span>}
-              </td>
-              <td className="py-1 pr-4 text-right tabular-nums">{fmtDollar(r.gmv)}</td>
-              <td className="py-1 pr-4 text-right tabular-nums text-gray-500">{fmtDollar(r.revenue)}</td>
-              <td className="py-1 pr-4 text-right tabular-nums"><GrowthPct v={r.seq} /></td>
-              <td className="py-1 text-right tabular-nums"><GrowthPct v={r.yoy} /></td>
-            </tr>
-          ))}
+          {rows.map((r) => {
+            const rep = reported?.get(r.period);
+            return (
+              <tr key={r.period} className="border-b border-gray-100">
+                <td className="py-1 pr-4 whitespace-nowrap">
+                  {formatQuarterLabel(r.period)}
+                  {r.partial && <span className="ml-1 text-xs text-amber-600">(partial)</span>}
+                </td>
+                <td className="py-1 pr-4 text-right tabular-nums">{fmtDollar(r.gmv)}</td>
+                <td className="py-1 pr-4 text-right tabular-nums text-gray-500">{fmtDollar(r.revenue)}</td>
+                {reported && <td className="py-1 pr-4 text-right tabular-nums">{rep ? fmtDollar(rep) : "—"}</td>}
+                {reported && (
+                  <td className="py-1 pr-4 text-right tabular-nums text-gray-500">
+                    {rep ? ((r.gmv / rep) * 100).toFixed(1) + "%" : "—"}
+                  </td>
+                )}
+                <td className="py-1 pr-4 text-right tabular-nums"><GrowthPct v={r.seq} /></td>
+                <td className="py-1 text-right tabular-nums"><GrowthPct v={r.yoy} /></td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -903,7 +966,7 @@ function PeriodTable({ title, seqLabel, rows }: { title: string; seqLabel: strin
 }
 
 /** Monthly + quarterly realized GMV with sequential (MoM/QoQ) and Y/Y growth. */
-function GmvGrowthTable({ daily }: { daily: DailyPoint[] }) {
+function GmvGrowthTable({ daily, reportedByQuarter }: { daily: DailyPoint[]; reportedByQuarter?: Map<string, number> }) {
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
   const monthly = buildPeriodRows(daily, etMonthKey, etMonthKey(todayKey));
   const quarterly = buildPeriodRows(daily, etQuarterKey, etQuarterKey(todayKey));
@@ -912,11 +975,12 @@ function GmvGrowthTable({ daily }: { daily: DailyPoint[] }) {
     <div className="space-y-3">
       <p className="text-xs text-gray-400">
         Realized GMV/revenue by period (this view — select &ldquo;All (full history)&rdquo; for the complete series). Δ is sequential
-        growth; Y/Y shows &ldquo;—&rdquo; until a prior-year period exists (~2 years of data).
+        growth; Y/Y shows &ldquo;—&rdquo; until a prior-year period exists (~2 years of data). The quarterly table also shows LQDT&rsquo;s
+        reported total-company GMV and the scraped capture rate (scraped realized ÷ reported).
       </p>
       <div className="grid gap-6 lg:grid-cols-2">
         <PeriodTable title="Monthly" seqLabel="MoM" rows={monthly} />
-        <PeriodTable title="Quarterly" seqLabel="QoQ" rows={quarterly} />
+        <PeriodTable title="Quarterly" seqLabel="QoQ" rows={quarterly} reported={reportedByQuarter} />
       </div>
     </div>
   );
@@ -1234,6 +1298,7 @@ export function RevenueForecast() {
   // Cheap derived values (≤ ~458 rows); computed inline since this is past the
   // component's early returns where hooks can't be called.
   const chartDaily = bucketDaily(forecast.daily, granularity);
+  const reportedByQuarter = new Map((forecast.reported_gmv_by_quarter ?? []).map((r) => [r.quarter, r.reported_gmv_usd]));
   const qtd = qtdRealizedAsOf(forecast.daily, qtdDate);
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
   // Export/QTD date bounds: the actual GMV data range (earliest data day →
@@ -1350,7 +1415,7 @@ export function RevenueForecast() {
           <h3 className="text-sm font-semibold text-gray-700">{GRANULARITY_LABEL[granularity]} {chartSliceLabel}{chartMetric === "gmv" ? "GMV" : "Revenue"} - {dailyRange}</h3>
           <div className="flex flex-wrap gap-2">
             <div className="flex gap-1">
-              {(["day", "week", "month"] as Granularity[]).map((g) => (
+              {(["day", "week", "month", "quarter"] as Granularity[]).map((g) => (
                 <button
                   key={g}
                   onClick={() => setGranularity(g)}
@@ -1360,7 +1425,7 @@ export function RevenueForecast() {
                       : "bg-white text-gray-600 border-gray-300 hover:border-gray-400"
                   }`}
                 >
-                  {g === "day" ? "Day" : g === "week" ? "Week" : "Month"}
+                  {g === "day" ? "Day" : g === "week" ? "Week" : g === "month" ? "Month" : "Quarter"}
                 </button>
               ))}
             </div>
@@ -1447,10 +1512,11 @@ export function RevenueForecast() {
           todayKey={todayKey}
           isCurrent={forecast.is_current}
           onSelectDate={setSelectedSalesDate}
+          reportedByQuarter={reportedByQuarter}
         />
       </div>
 
-      <GmvGrowthTable daily={forecast.daily} />
+      <GmvGrowthTable daily={forecast.daily} reportedByQuarter={reportedByQuarter} />
 
       <div>
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2">

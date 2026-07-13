@@ -573,6 +573,10 @@ export type RevenueForecast = {
   /** Realized-only totals (exclude the current-quarter projection). */
   realized_total_gmv_usd: number;
   realized_total_revenue_usd: number;
+  /** LQDT's total-company REPORTED GMV by calendar quarter — the benchmark the
+   *  scraped/projected GMV is compared against. Attached by the forecast route from
+   *  the committed model export; optional so the core computation is unaffected. */
+  reported_gmv_by_quarter?: { quarter: string; reported_gmv_usd: number }[];
   debug: {
     now_iso: string;
     total_rows: number;

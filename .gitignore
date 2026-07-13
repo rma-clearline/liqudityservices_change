@@ -43,3 +43,6 @@ next-env.d.ts
 
 # large local data exports (used for one-off store backfills; kept out of git)
 scripts/*.xlsx
+# the financial model workbook (proprietary; the extractor reads it locally and
+# commits only the derived reported-gmv CSV) — never commit the workbook itself
+scripts/*.xlsm
