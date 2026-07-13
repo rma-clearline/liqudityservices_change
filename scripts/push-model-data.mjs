@@ -27,9 +27,11 @@ const FILES = [
 ];
 
 function az(args) {
-  // az is az.cmd on Windows — run through the shell; our values are pure base64
-  // (single safe tokens), so no quoting hazards.
-  return execFileSync("az", args, { shell: true, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
+  // az is az.cmd (a batch file) on Windows, so this must run through the shell —
+  // and cmd.exe treats "=" as an argument delimiter, so any arg containing "=" must
+  // be double-quoted or the name=value pairs get split before az ever sees them.
+  const quoted = args.map((a) => (a.includes("=") ? `"${a}"` : a));
+  return execFileSync("az", quoted, { shell: true, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
 }
 
 const pairs = [];
