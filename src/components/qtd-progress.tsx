@@ -17,6 +17,7 @@ import {
   CartesianGrid,
   Tooltip,
   Legend,
+  ReferenceArea,
   ReferenceLine,
   ResponsiveContainer,
   type TooltipContentProps,
@@ -1050,7 +1051,7 @@ export function QtdProgress() {
       )}
 
       {/* Chart */}
-      <ResponsiveContainer width="100%" height={380}>
+      <ResponsiveContainer width="100%" height={metric === "dollars" && scaled ? 460 : 380}>
         <ComposedChart data={rows} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis
@@ -1083,17 +1084,35 @@ export function QtdProgress() {
               {!view.complete && projections.has("runrate") && (
                 <Line type="monotone" dataKey="Run rate" stroke="#6b7280" strokeWidth={1} strokeDasharray="3 3" dot={false} connectNulls />
               )}
-              {scaled && guidanceLow != null && (
-                <ReferenceLine y={guidanceLow} stroke="#15803d" strokeDasharray="4 2" label={{ value: `Guidance low ${fmtM(guidanceLow)}`, position: "insideBottomLeft", fontSize: 10, fill: "#15803d" }} />
-              )}
-              {scaled && guidanceHigh != null && (
-                <ReferenceLine y={guidanceHigh} stroke="#15803d" strokeDasharray="4 2" label={{ value: `Guidance high ${fmtM(guidanceHigh)}`, position: "insideTopLeft", fontSize: 10, fill: "#15803d" }} />
+              {/* Benchmarks sit within a few % of each other — a single shaded guidance
+                  BAND with one label (right), Clearline labeled left, and reported
+                  centered keeps lines and labels from colliding. */}
+              {scaled && guidanceLow != null && guidanceHigh != null && (
+                <ReferenceArea
+                  y1={guidanceLow}
+                  y2={guidanceHigh}
+                  fill="#15803d"
+                  fillOpacity={0.07}
+                  stroke="#15803d"
+                  strokeOpacity={0.4}
+                  strokeDasharray="4 2"
+                  label={{ value: `Guidance ${fmtM(guidanceLow)}–${fmtM(guidanceHigh)}`, position: "insideTopRight", fontSize: 10, fill: "#15803d" }}
+                />
               )}
               {scaled && clearline != null && (
-                <ReferenceLine y={clearline} stroke="#d97706" strokeDasharray="5 3" label={{ value: `Clearline ${fmtM(clearline)}`, position: "insideTopRight", fontSize: 10, fill: "#d97706" }} />
+                <ReferenceLine
+                  y={clearline}
+                  stroke="#d97706"
+                  strokeDasharray="5 3"
+                  label={{ value: `Clearline ${fmtM(clearline)}`, position: "insideLeft", fontSize: 10, fill: "#d97706", dy: -7 }}
+                />
               )}
               {scaled && view.reported != null && (
-                <ReferenceLine y={view.reported} stroke="#dc2626" label={{ value: `Reported actual ${fmtM(view.reported)}`, position: "insideRight", fontSize: 10, fill: "#dc2626" }} />
+                <ReferenceLine
+                  y={view.reported}
+                  stroke="#dc2626"
+                  label={{ value: `Reported actual ${fmtM(view.reported)}`, position: "center", fontSize: 10, fill: "#dc2626", dy: -7 }}
+                />
               )}
             </>
           ) : (
