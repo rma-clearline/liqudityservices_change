@@ -409,43 +409,80 @@ export async function getCategoryDaily(fromEt: string, toEt: string): Promise<Ca
   }));
 }
 
-export type SoldGroupDailyRow = {
+export type SoldBucket = "gov_veh" | "gov_other" | "ret_veh" | "ret_other" | "heavy" | "intl" | "ad_dtc";
+
+export type SoldBucketDailyRow = {
   date: string; // YYYY-MM-DD (ET)
-  group: "gov" | "retail" | "intl";
+  bucket: SoldBucket;
   gmv: number; // realized USD
   lots: number; // sold lots with a positive price
-  bids: number; // total bids across the group's lots
+  bids: number; // total bids across the bucket's lots
 };
 
+// Take-rate buckets: economically distinct fee regimes the QTD page fits revenue
+// coefficients against. Pattern lists (case-insensitive LIKE) rather than exact
+// category names — the taxonomy has ~190 categories with a long tail of truck/
+// equipment variants. Precedence: site first (GI/AD are their own businesses),
+// then vehicles, then heavy equipment, then the government/retail remainder.
+const VEH_LIKE = [
+  "%truck%", "%bus%", "%vehicle%", "suv", "automobiles/cars", "vans", "step vans",
+  "ambulance/rescue", "motorcycles", "cab chassis", "classic/custom cars",
+  "motor homes / travel trailers", "golf carts%",
+];
+const HEAVY_LIKE = [
+  "loaders", "excavators", "dozers", "backhoes", "motor graders", "forklifts", "cranes",
+  "skid steers", "scrapers", "compactors", "tractor - farm", "mowing equipment",
+  "sweeper - street", "snow removal equipment", "%heavy equipment%", "%construction%",
+  "%agricult%", "%forestry%", "%machinery%", "%industrial%", "%aircraft%", "%boats%",
+  "%marine%", "%mining%", "%asphalt%", "%energy%", "%railroad%", "%metalworking%",
+  "%drilling%", "%lathes%",
+];
+const likeChain = (patterns: string[]) =>
+  patterns.map((p) => `LOWER(COALESCE(category,'')) LIKE '${p}'`).join(" OR ");
+
 /**
- * Per-day realized GMV/lots/bids by honest scrape axes — NOT LQDT's segment names:
- *   intl   = site 'GI' (the international marketplace)
- *   gov    = government sellers on AD/GD (seller_type='government')
- *   retail = the remainder (retail sellers on AD/GD; NULL seller_type lands here,
- *            matching the reader default elsewhere in this module)
- * The QTD page compares each group against its closest reported segment
- * (GovDeals / RSCG+CAG / CAG). bid_count sums as bigint — int SUM overflows at
- * ~2.1B and a quarter already carries ~2.2M bids.
+ * Per-day realized GMV/lots/bids by take-rate bucket — honest scrape axes, NOT
+ * LQDT's segment names:
+ *   intl      = site 'GI' (the international marketplace)
+ *   ad_dtc    = site 'AD' (AllSurplus Deals DTC; trace gov sellers included)
+ *   gov_veh   = government sellers' vehicles AND heavy equipment (high-ASP
+ *               rolling stock under GovDeals' tiered fee schedule)
+ *   gov_other = remaining government sellers (keeps gov buckets summing to the
+ *               gov GROUP — gov heavy equipment must not leak into retail)
+ *   ret_veh   = retail sellers' road vehicles (commercial fleets on GD)
+ *   heavy     = retail sellers' heavy equipment / industrial / ag / aviation
+ *   ret_other = the remainder (NULL seller_type lands here, matching the reader
+ *               default elsewhere)
+ * The QTD page derives its gov/retail/intl groups by summing buckets, and fits
+ * revenue coefficients per bucket. bid_count sums as bigint — int SUM overflows
+ * at ~2.1B and a quarter already carries ~2.2M bids.
  */
-export async function getSoldDailyByGroup(fromEt: string, toEt: string): Promise<SoldGroupDailyRow[]> {
-  const grp =
-    "CASE WHEN site = 'GI' THEN 'intl' WHEN seller_type = 'government' THEN 'gov' ELSE 'retail' END";
+export async function getSoldDailyByBucket(fromEt: string, toEt: string): Promise<SoldBucketDailyRow[]> {
+  const highAsp = `(${likeChain(VEH_LIKE)}) OR (${likeChain(HEAVY_LIKE)})`;
+  const bucket =
+    "CASE WHEN site = 'GI' THEN 'intl' " +
+    "WHEN site = 'AD' THEN 'ad_dtc' " +
+    `WHEN seller_type = 'government' THEN (CASE WHEN ${highAsp} THEN 'gov_veh' ELSE 'gov_other' END) ` +
+    `WHEN (${likeChain(VEH_LIKE)}) THEN 'ret_veh' ` +
+    `WHEN (${likeChain(HEAVY_LIKE)}) THEN 'heavy' ` +
+    "ELSE 'ret_other' END";
   const pool = await getPool();
   const r = await pool
     .request()
     .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
     .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
     .query(
-      `SELECT CONVERT(char(10), close_date_et, 23) AS d, ${grp} AS grp, ` +
+      `SELECT CONVERT(char(10), close_date_et, 23) AS d, ${bucket} AS bkt, ` +
         "COALESCE(SUM(sale_amount_usd),0) AS gmv, " +
         "SUM(CASE WHEN sale_amount_usd > 0 THEN 1 ELSE 0 END) AS lots, " +
         "COALESCE(SUM(CAST(bid_count AS bigint)),0) AS bids " +
         "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to " +
-        `GROUP BY close_date_et, ${grp}`,
+        `GROUP BY close_date_et, ${bucket}`,
     );
+  const valid = new Set<string>(["gov_veh", "gov_other", "ret_veh", "ret_other", "heavy", "intl", "ad_dtc"]);
   return r.recordset.map((x) => ({
     date: x.d,
-    group: (x.grp === "gov" || x.grp === "intl" ? x.grp : "retail") as SoldGroupDailyRow["group"],
+    bucket: (valid.has(x.bkt) ? x.bkt : "ret_other") as SoldBucket,
     gmv: Number(x.gmv ?? 0),
     lots: Number(x.lots ?? 0),
     bids: Number(x.bids ?? 0),

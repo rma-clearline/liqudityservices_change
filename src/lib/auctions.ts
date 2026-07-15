@@ -593,11 +593,12 @@ export type RevenueForecast = {
    *  ranges, operating stats). Attached by the forecast route from the gitignored
    *  model export; optional. */
   model_metrics?: { quarter: string; metric: string; value: number; kind: "reported" | "forecast" }[];
-  /** Per-day scraped GMV/lots/bids by honest group axes (gov/retail/intl) from
-   *  lqdt.sold_lots. Attached by the route for quarter=ALL only; optional. */
-  sold_by_group_daily?: {
+  /** Per-day scraped GMV/lots/bids by take-rate bucket (see getSoldDailyByBucket);
+   *  the QTD page derives its gov/retail/intl groups by summing buckets and fits
+   *  revenue coefficients per bucket. Attached by the route for quarter=ALL only. */
+  sold_by_bucket_daily?: {
     date: string;
-    group: "gov" | "retail" | "intl";
+    bucket: "gov_veh" | "gov_other" | "ret_veh" | "ret_other" | "heavy" | "intl" | "ad_dtc";
     gmv: number;
     lots: number;
     bids: number;

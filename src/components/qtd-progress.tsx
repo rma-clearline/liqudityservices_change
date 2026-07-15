@@ -28,7 +28,7 @@ import { enumerateQuarterLabelsBetween, etQuarterKey, formatQuarterLabel } from 
 import {
   computeQtdModelData,
   QtdModelSections,
-  type GroupDailyRow,
+  type BucketDailyRow,
   type ListingsDay,
   type ModelMetricRow,
 } from "./qtd-model-sections";
@@ -67,7 +67,7 @@ type QtdData = {
     updated_at?: string | null;
   }[];
   model_metrics?: ModelMetricRow[];
-  sold_by_group_daily?: GroupDailyRow[];
+  sold_by_bucket_daily?: BucketDailyRow[];
 };
 
 type ProjectionKey = "shape" | "auctions" | "runrate";
@@ -240,6 +240,14 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       {
         term: "Bids per lot",
         def: "Total bids on captured sold lots ÷ lots with a positive price, QTD vs the same days last year — a demand-intensity proxy for the company's reported auction participants.",
+      },
+      {
+        term: "Revenue (mix-adj) / take-rate model",
+        def: "Scraped GMV is split into 7 fee-regime buckets (gov vehicles, gov other, retail vehicles, retail other, heavy equipment, GI, AllSurplus DTC). Each bucket's coefficient θ (revenue per scraped $, capture absorbed) is fitted on the reported quarters against 3 targets per quarter — total revenue ex-Machinio, GovDeals segment revenue, and RSCG+CAG revenue — with priors from the model workbook's segment/purchase/consignment take rates and box bounds. Mix-adj revenue = Σ θ × bucket FQE GMV (each bucket's QTD scaled by the headline FQE ratio, mix held constant) + Machinio's subscription revenue.",
+      },
+      {
+        term: "Take-rate model caveats",
+        def: "Only a few reported quarters overlap full scrape coverage, and the mix is stable, so coefficients are prior-anchored (ridge) — they sharpen every quarter as reports land. The backtest is in-sample. ≈take rate = θ × the bucket's group capture rate, an approximation since capture varies by bucket.",
       },
     ],
   },
@@ -740,7 +748,7 @@ export function QtdProgress() {
     // --- model-section blocks: exactly the numbers the sections render ---------
     const sections = computeQtdModelData({
       metricsRows: state.data?.model_metrics,
-      groupDaily: state.data?.sold_by_group_daily,
+      bucketDaily: state.data?.sold_by_bucket_daily,
       selected,
       currentQuarter,
       estimates: model.estimates,
@@ -807,6 +815,29 @@ export function QtdProgress() {
         if (p.beat) lines.push(rowOf(`Avg beat vs guidance mid (last ${p.beat.n} qtrs)`, pctS(p.beat.avg), `beat ${p.beat.wins} of ${p.beat.n}`));
         if (p.impliedBeat != null) lines.push(rowOf("Our implied beat this quarter", pctS(p.impliedBeat)));
       }
+    }
+
+    if (sections.takeRateModel?.available) {
+      const t = sections.takeRateModel;
+      lines.push("");
+      lines.push(rowOf(`Take-rate model (fitted on ${t.nQuarters} reported quarters; theta = revenue per scraped $, capture absorbed)`));
+      lines.push(rowOf("bucket", "theta", "approx_take_rate", "qtd_gmv_usd", "fqe_gmv_usd", "rev_contribution_usd"));
+      for (const c of t.coeffs) {
+        lines.push(
+          rowOf(
+            c.bucket,
+            c.theta.toFixed(4),
+            `${(c.approxTake * 100).toFixed(1)}%`,
+            Math.round(c.qtdGmv),
+            c.fqeGmv != null ? Math.round(c.fqeGmv) : "",
+            c.revContribution != null ? Math.round(c.revContribution) : "",
+          ),
+        );
+      }
+      lines.push(rowOf("machinio_revenue_added_usd", Math.round(t.machinioAdd)));
+      if (t.mixRevenue != null) lines.push(rowOf("mix_adjusted_revenue_usd", Math.round(t.mixRevenue), t.mixTakeRate != null ? `${(t.mixTakeRate * 100).toFixed(1)}% implied take rate` : ""));
+      lines.push(rowOf("backtest (in-sample)", "quarter", "actual_revenue_usd", "predicted_revenue_usd", "error"));
+      for (const b of t.backtest) lines.push(rowOf("", b.q, Math.round(b.actual), Math.round(b.predicted), pctS(b.errPct)));
     }
 
     if (sections.hasGroups) {
@@ -1316,7 +1347,7 @@ export function QtdProgress() {
       {/* Model-driven sections: segments, earnings preview, transactions, supply/demand */}
       <QtdModelSections
         metricsRows={state.data?.model_metrics}
-        groupDaily={state.data?.sold_by_group_daily}
+        bucketDaily={state.data?.sold_by_bucket_daily}
         selected={selected}
         currentQuarter={currentQuarter}
         estimates={model.estimates}
