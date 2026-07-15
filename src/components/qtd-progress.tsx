@@ -25,7 +25,13 @@ import {
 import type { NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
 import { downloadCsv } from "@/lib/format";
 import { enumerateQuarterLabelsBetween, etQuarterKey, formatQuarterLabel } from "@/lib/time";
-import { QtdModelSections, type GroupDailyRow, type ModelMetricRow } from "./qtd-model-sections";
+import {
+  computeQtdModelData,
+  QtdModelSections,
+  type GroupDailyRow,
+  type ListingsDay,
+  type ModelMetricRow,
+} from "./qtd-model-sections";
 import {
   addDaysKey,
   cumulate,
@@ -395,6 +401,8 @@ export function QtdProgress() {
   const [editBusy, setEditBusy] = useState(false);
   const [editErr, setEditErr] = useState<string | null>(null);
   const [reload, setReload] = useState(0); // bump to refetch after a save
+  // Daily active-listing counts (latest snapshot per date) for the supply section.
+  const [listings, setListings] = useState<ListingsDay[] | "error" | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -414,6 +422,32 @@ export function QtdProgress() {
       cancelled = true;
     };
   }, [reload]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/listings")
+      .then((r) => r.json())
+      .then((d) => {
+        if (cancelled) return;
+        if (!Array.isArray(d)) return setListings("error");
+        // Newest-first with possibly several snapshots per day — keep the latest per date.
+        const seen = new Set<string>();
+        const rows: ListingsDay[] = [];
+        for (const r of d) {
+          const date = typeof r?.date === "string" ? r.date : null;
+          if (!date || seen.has(date)) continue;
+          seen.add(date);
+          rows.push({ date, allsurplus: Number(r.allsurplus ?? 0), govdeals: Number(r.govdeals ?? 0) });
+        }
+        setListings(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setListings("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
   const currentQuarter = etQuarterKey(todayKey);
@@ -641,10 +675,10 @@ export function QtdProgress() {
   const t7dYoyPrev = t7dCols[t7dCols.length - 2]?.yoy ?? null;
   const t7dWowPp = t7dYoyNow != null && t7dYoyPrev != null ? (t7dYoyNow - t7dYoyPrev) * 100 : null;
 
-  // One-click Excel-friendly export: three labeled blocks (summary, key metrics,
-  // full daily progression for the selected quarter). Dollars are raw integers and
-  // Y/Y are "%" strings so Excel parses both natively for pasting into the model.
-  // FUTURE: the segment/transaction section data could be appended as extra blocks.
+  // One-click Excel-friendly export: labeled blocks (summary, key metrics, daily
+  // progression, then the model sections — segments, earnings preview, transactions
+  // & ASP, supply & demand). Dollars are raw integers and Y/Y are "%" strings so
+  // Excel parses both natively for pasting into the model.
   const exportCsv = () => {
     const esc = (v: unknown) => {
       const t = v == null ? "" : String(v);
@@ -701,6 +735,156 @@ export function QtdProgress() {
           !view.complete && i >= view.d - 1 ? Math.round(view.runRateAt(i)) : "",
         ),
       );
+    }
+
+    // --- model-section blocks: exactly the numbers the sections render ---------
+    const sections = computeQtdModelData({
+      metricsRows: state.data?.model_metrics,
+      groupDaily: state.data?.sold_by_group_daily,
+      selected,
+      currentQuarter,
+      estimates: model.estimates,
+      siteByDate: model.siteByDate,
+      viewNow,
+      captureRate,
+      listings,
+    });
+    const fq = (q: string) => formatQuarterLabel(q, "fq");
+
+    if (sections.hasGroups) {
+      lines.push("");
+      lines.push(rowOf(`Segment QTD ${selected} / ${fq(selected)} (captured USD; gov/retail/intl are scrape axes, not LQDT segments)`));
+      lines.push(rowOf("group", "vs_reported_segment", "qtd_gmv_usd", "yoy", "capture_rate", "implied_total_usd"));
+      for (const s of sections.segments) {
+        lines.push(
+          rowOf(
+            s.key,
+            s.vs,
+            Math.round(s.qtdGmv),
+            pctS(s.yoy),
+            s.capture ? `${(s.capture.rate * 100).toFixed(1)}%` : "",
+            s.impliedTotal != null ? Math.round(s.impliedTotal) : "",
+          ),
+        );
+      }
+    }
+
+    if (sections.segmentHistory.some((h) => h.rows.length > 0)) {
+      lines.push("");
+      lines.push(rowOf("Reported segment history (total-company USD; model E = Clearline forecast)"));
+      lines.push(rowOf("metric", "quarter", "fiscal", "basis", "value_usd", "yoy"));
+      for (const h of sections.segmentHistory) {
+        for (const r of h.rows) lines.push(rowOf(h.metric, r.quarter, fq(r.quarter), r.basis, Math.round(r.value), pctS(r.yoy)));
+      }
+    }
+
+    {
+      const p = sections.preview;
+      const hasPreview = p.rows.some((r) => r.guidanceLow != null || r.model != null || r.ours != null);
+      if (hasPreview) {
+        lines.push("");
+        lines.push(rowOf(`Earnings preview ${currentQuarter} / ${fq(currentQuarter)} (total company)`));
+        lines.push(rowOf("metric", "guidance_low", "guidance_high", "guidance_mid", "clearline_model", "ours_implied", "ours_vs_mid"));
+        const num = (v: number | null, kind: "usd" | "eps" | "pct") =>
+          v == null ? "" : kind === "usd" ? Math.round(v) : kind === "eps" ? v.toFixed(2) : `${(v * 100).toFixed(1)}%`;
+        for (const r of p.rows) {
+          lines.push(
+            rowOf(
+              r.label,
+              num(r.guidanceLow, r.kind),
+              num(r.guidanceHigh, r.kind),
+              num(r.guidanceMid, r.kind),
+              num(r.model, r.kind),
+              num(r.ours, r.kind),
+              pctS(r.vsMid),
+            ),
+          );
+        }
+        if (p.takeRate != null)
+          lines.push(rowOf("Take rate used", `${(p.takeRate * 100).toFixed(1)}%`, p.takeRateIsForecast ? "model forecast" : "latest reported"));
+        if (p.consensus != null)
+          lines.push(rowOf("Street consensus GMV (CH)", Math.round(p.consensus), p.consensusDelta != null ? `${pctS(p.consensusDelta)} ours vs consensus` : ""));
+        if (p.beat) lines.push(rowOf(`Avg beat vs guidance mid (last ${p.beat.n} qtrs)`, pctS(p.beat.avg), `beat ${p.beat.wins} of ${p.beat.n}`));
+        if (p.impliedBeat != null) lines.push(rowOf("Our implied beat this quarter", pctS(p.impliedBeat)));
+      }
+    }
+
+    if (sections.hasGroups) {
+      const t = sections.txns;
+      lines.push("");
+      lines.push(rowOf(`Transactions & ASP ${selected} / ${fq(selected)}`));
+      lines.push(rowOf("QTD lots captured", Math.round(t.lotsQtd), pctS(t.lotsYoy)));
+      if (t.capture) lines.push(rowOf("Txn capture rate", `${(t.capture.rate * 100).toFixed(1)}%`, `${t.capture.n} reported qtrs`));
+      if (t.fqe != null)
+        lines.push(
+          rowOf(
+            `FQ transactions implied (${t.method})`,
+            Math.round(t.fqe),
+            t.modelTxn != null ? `model${t.modelTxnIsForecast ? " E" : ""} ${Math.round(t.modelTxn)}` : "",
+            t.modelTxn ? `${pctS(t.fqe / t.modelTxn - 1)} vs model` : "",
+          ),
+        );
+      if (sections.aspRows.length > 0) {
+        lines.push(rowOf("quarter", "fiscal", "period", "scraped_usd_per_lot", "scraped_yoy", "reported_usd_per_txn", "reported_basis", "reported_yoy"));
+        for (const r of sections.aspRows) {
+          lines.push(
+            rowOf(
+              r.q,
+              fq(r.q),
+              r.isQtd ? "QTD" : "full",
+              r.scraped != null ? Math.round(r.scraped) : "",
+              pctS(r.scrapedYoy),
+              r.rep != null ? Math.round(r.rep) : "",
+              r.rep != null ? (r.repE ? "model E" : "reported") : "",
+              pctS(r.repYoy),
+            ),
+          );
+        }
+      }
+      if (sections.ops.quarters.length > 0) {
+        lines.push(rowOf("Reported operating stats"));
+        lines.push(rowOf("metric", "quarter", "fiscal", "value", "yoy"));
+        for (const row of sections.ops.rows) {
+          for (const c of row.cells) {
+            if (c.value != null) lines.push(rowOf(row.metric, c.q, fq(c.q), Math.round(c.value), pctS(c.yoy)));
+          }
+        }
+      }
+    }
+
+    if ((sections.listingRows != null && sections.listingRows.length > 0) || sections.bids) {
+      lines.push("");
+      lines.push(rowOf("Supply & demand"));
+      if (sections.listingRows?.length) {
+        lines.push(
+          rowOf("quarter", "fiscal", "period", "avg_allsurplus_listings", "as_yoy", "avg_govdeals_listings", "gd_yoy", "gmv_per_gd_listing_usd", "gmv_per_as_listing_usd"),
+        );
+        for (const r of sections.listingRows) {
+          lines.push(
+            rowOf(
+              r.q,
+              fq(r.q),
+              r.isQtd ? "QTD" : "full",
+              Math.round(r.as),
+              pctS(r.asYoy),
+              Math.round(r.gd),
+              pctS(r.gdYoy),
+              r.gmvPerGd != null ? Math.round(r.gmvPerGd) : "",
+              r.gmvPerAs != null ? Math.round(r.gmvPerAs) : "",
+            ),
+          );
+        }
+      }
+      if (sections.bids) {
+        lines.push(rowOf("QTD total bids", Math.round(sections.bids.qtd), pctS(sections.bids.yoy)));
+        lines.push(
+          rowOf(
+            "QTD bids per lot",
+            sections.bids.perLot != null ? sections.bids.perLot.toFixed(1) : "",
+            sections.bids.lyPerLot != null ? `LY same window ${sections.bids.lyPerLot.toFixed(1)}` : "",
+          ),
+        );
+      }
     }
 
     downloadCsv(`lqdt-qtd-${selected}-through-${view.dataThrough}.csv`, lines.join("\n") + "\n");
@@ -1139,6 +1323,7 @@ export function QtdProgress() {
         siteByDate={model.siteByDate}
         viewNow={viewNow}
         captureRate={captureRate}
+        listings={listings}
       />
 
       <DefinitionsBox />
