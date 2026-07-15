@@ -43,6 +43,20 @@ export type HistoricalSaleRow = {
   sale_amount_usd: number | null;
   bid_count: number;
   url: string | null;
+  /** Seller's opening/minimum bid (assetBidPrice) — hammer ÷ opening is a
+   *  competitive-intensity signal. Null only if the feed omits it. */
+  opening_bid_native: number | null;
+  opening_bid_usd: number | null;
+  /** Ground-truth outcome flags (isSoldAuction / assetStatusCd, e.g. SOA/STA). */
+  is_sold_auction: boolean | null;
+  asset_status_cd: string | null;
+  /** Auction start (assetAuctionStartDate) — naive ET wall clock; the feed has
+   *  no UTC variant for start. Enables duration + forward-supply cohorts. */
+  start_time_et: string | null;
+  /** Stable taxonomy code (assetCategory, e.g. "80", "95F") + hierarchy path
+   *  (categoryRoutepath — currently always NULL in the feed, captured anyway). */
+  category_code: string | null;
+  category_routepath: string | null;
 };
 
 export type HistoricalSalesResult = {
@@ -119,6 +133,9 @@ export function parseSale(raw: Record<string, unknown>, fx: Awaited<ReturnType<t
   const currencyCode = typeof raw.currencyCode === "string" && raw.currencyCode ? raw.currencyCode : "USD";
   const nativeAmount = safeNumber(raw.currentBid);
   const { usd } = convertToUsd(nativeAmount, currencyCode, fx);
+  // Opening bid: keep null distinct from a genuine $0 opening.
+  const openingNative = raw.assetBidPrice == null ? null : safeNumber(raw.assetBidPrice);
+  const openingUsd = openingNative == null ? null : convertToUsd(openingNative, currencyCode, fx).usd;
 
   return {
     // platform is the row's true marketplace (AD/GD/GI), not the AD-site query.
@@ -138,6 +155,14 @@ export function parseSale(raw: Record<string, unknown>, fx: Awaited<ReturnType<t
     sale_amount_usd: usd === null ? null : Math.round(usd * 100) / 100,
     bid_count: safeNumber(raw.bidCount),
     url: saleUrl(raw),
+    opening_bid_native: openingNative,
+    opening_bid_usd: openingUsd == null ? null : Math.round(openingUsd * 100) / 100,
+    is_sold_auction: typeof raw.isSoldAuction === "boolean" ? raw.isSoldAuction : null,
+    asset_status_cd: safeString(raw, ["assetStatusCd"]) || null,
+    start_time_et:
+      typeof raw.assetAuctionStartDate === "string" && raw.assetAuctionStartDate ? raw.assetAuctionStartDate : null,
+    category_code: raw.assetCategory != null && String(raw.assetCategory).trim() ? String(raw.assetCategory).trim() : null,
+    category_routepath: safeString(raw, ["categoryRoutepath"]) || null,
   };
 }
 

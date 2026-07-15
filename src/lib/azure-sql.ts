@@ -99,6 +99,40 @@ function toSqlDateTime(iso: string | null | undefined): Date | null {
   return new Date(Date.UTC(year, d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds()));
 }
 
+// Maestro's start timestamp is a NAIVE ET wall clock ("2026-06-24T17:59:00", no
+// zone). Parse the digits directly — running it through `new Date(...)` would
+// re-interpret it in the host's timezone (UTC container vs ET laptop) and store
+// different values per environment. The Date's UTC fields carry the wall-clock
+// digits, which is what the bulk loader writes into DATETIME2.
+function toSqlNaiveDateTime(s: string | null | undefined): Date | null {
+  if (!s) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/.exec(s);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const hour = Number(m[4]);
+  const minute = Number(m[5]);
+  const second = Number(m[6] ?? 0);
+  if (year < 2000 || year > 2100) return null;
+  const d = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  // Date.UTC rolls out-of-range components over (month 13 → next January,
+  // hour 25 → next day). Round-trip the fields so a malformed feed value nulls
+  // out — matching toSqlDateTime's contract — instead of storing a plausible
+  // wrong date.
+  if (
+    d.getUTCFullYear() !== year ||
+    d.getUTCMonth() !== month - 1 ||
+    d.getUTCDate() !== day ||
+    d.getUTCHours() !== hour ||
+    d.getUTCMinutes() !== minute ||
+    d.getUTCSeconds() !== second
+  ) {
+    return null;
+  }
+  return d;
+}
+
 const MERGE_SQL = `
 MERGE lqdt.sold_lots WITH (HOLDLOCK) AS T
 USING (SELECT * FROM lqdt.sold_lots_staging WHERE batch_id = @bid) AS S
@@ -106,26 +140,36 @@ USING (SELECT * FROM lqdt.sold_lots_staging WHERE batch_id = @bid) AS S
 WHEN MATCHED AND EXISTS (
   SELECT S.asset_id, S.auction_id, S.account_id, S.site, S.platform, S.seller, S.seller_type, S.gov_level,
          S.title, S.category, S.country, S.state, S.market, S.currency_code, S.sale_amount_native,
-         S.sale_amount_usd, S.bid_count, S.url, S.close_time_utc, S.close_date_et
+         S.sale_amount_usd, S.bid_count, S.url, S.close_time_utc, S.close_date_et,
+         S.opening_bid_native, S.opening_bid_usd, S.is_sold_auction, S.asset_status_cd, S.start_time_et,
+         S.category_code, S.category_routepath
   EXCEPT
   SELECT T.asset_id, T.auction_id, T.account_id, T.site, T.platform, T.seller, T.seller_type, T.gov_level,
          T.title, T.category, T.country, T.state, T.market, T.currency_code, T.sale_amount_native,
-         T.sale_amount_usd, T.bid_count, T.url, T.close_time_utc, T.close_date_et
+         T.sale_amount_usd, T.bid_count, T.url, T.close_time_utc, T.close_date_et,
+         T.opening_bid_native, T.opening_bid_usd, T.is_sold_auction, T.asset_status_cd, T.start_time_et,
+         T.category_code, T.category_routepath
 ) THEN UPDATE SET
   T.asset_id = S.asset_id, T.auction_id = S.auction_id, T.account_id = S.account_id, T.site = S.site,
   T.platform = S.platform, T.seller = S.seller, T.seller_type = S.seller_type, T.gov_level = S.gov_level,
   T.title = S.title, T.category = S.category, T.country = S.country, T.state = S.state, T.market = S.market,
   T.currency_code = S.currency_code, T.sale_amount_native = S.sale_amount_native,
   T.sale_amount_usd = S.sale_amount_usd, T.bid_count = S.bid_count, T.url = S.url,
-  T.close_time_utc = S.close_time_utc, T.close_date_et = S.close_date_et, T.ingested_at = SYSUTCDATETIME()
+  T.close_time_utc = S.close_time_utc, T.close_date_et = S.close_date_et,
+  T.opening_bid_native = S.opening_bid_native, T.opening_bid_usd = S.opening_bid_usd,
+  T.is_sold_auction = S.is_sold_auction, T.asset_status_cd = S.asset_status_cd,
+  T.start_time_et = S.start_time_et, T.category_code = S.category_code,
+  T.category_routepath = S.category_routepath, T.ingested_at = SYSUTCDATETIME()
 WHEN NOT MATCHED THEN INSERT
   (row_key, asset_id, auction_id, account_id, site, platform, seller, seller_type, gov_level, title, category,
    country, state, market, currency_code, sale_amount_native, sale_amount_usd, bid_count, url,
-   close_time_utc, close_date_et)
+   close_time_utc, close_date_et, opening_bid_native, opening_bid_usd, is_sold_auction, asset_status_cd,
+   start_time_et, category_code, category_routepath)
   VALUES
   (S.row_key, S.asset_id, S.auction_id, S.account_id, S.site, S.platform, S.seller, S.seller_type, S.gov_level, S.title, S.category,
    S.country, S.state, S.market, S.currency_code, S.sale_amount_native, S.sale_amount_usd, S.bid_count, S.url,
-   S.close_time_utc, S.close_date_et);`;
+   S.close_time_utc, S.close_date_et, S.opening_bid_native, S.opening_bid_usd, S.is_sold_auction, S.asset_status_cd,
+   S.start_time_et, S.category_code, S.category_routepath);`;
 
 function newStagingTable(): sql.Table {
   const t = new sql.Table("lqdt.sold_lots_staging");
@@ -152,6 +196,13 @@ function newStagingTable(): sql.Table {
   t.columns.add("url", sql.NVarChar(1024), { nullable: true });
   t.columns.add("close_time_utc", sql.DateTime2(0), { nullable: true });
   t.columns.add("close_date_et", sql.Date, { nullable: false });
+  t.columns.add("opening_bid_native", sql.Decimal(19, 4), { nullable: true });
+  t.columns.add("opening_bid_usd", sql.Decimal(19, 4), { nullable: true });
+  t.columns.add("is_sold_auction", sql.Bit, { nullable: true });
+  t.columns.add("asset_status_cd", sql.NVarChar(8), { nullable: true });
+  t.columns.add("start_time_et", sql.DateTime2(0), { nullable: true });
+  t.columns.add("category_code", sql.NVarChar(16), { nullable: true });
+  t.columns.add("category_routepath", sql.NVarChar(400), { nullable: true });
   return t;
 }
 
@@ -182,6 +233,13 @@ function fillStagingTable(batchId: string, rows: SoldExportRow[]): sql.Table {
       toSqlDateTime(r.close_time_utc),
       // DATE column: parse the ET day key at UTC midnight (useUTC keeps the date part).
       new Date(`${r.close_date_et}T00:00:00Z`),
+      r.opening_bid_native ?? null,
+      r.opening_bid_usd ?? null,
+      r.is_sold_auction ?? null,
+      clip(r.asset_status_cd, 8),
+      toSqlNaiveDateTime(r.start_time_et),
+      clip(r.category_code, 16),
+      clip(r.category_routepath, 400),
     );
   }
   return table;
@@ -638,7 +696,9 @@ export async function readSoldLots(
   const r = await request.query(
       "SELECT asset_id, auction_id, account_id, site, platform, seller, seller_type, gov_level, " +
         "title, category, country, state, market, currency_code, sale_amount_native, sale_amount_usd, " +
-        "bid_count, url, close_time_utc, CONVERT(char(10), close_date_et, 23) AS close_date_et " +
+        "bid_count, url, close_time_utc, CONVERT(char(10), close_date_et, 23) AS close_date_et, " +
+        "opening_bid_native, opening_bid_usd, is_sold_auction, asset_status_cd, start_time_et, " +
+        "category_code, category_routepath " +
         `FROM lqdt.sold_lots WHERE ${where.join(" AND ")}`,
     );
   return r.recordset.map((x): SoldExportRow => {
@@ -667,6 +727,15 @@ export async function readSoldLots(
       gov_level: (x.gov_level ?? "commercial") as SoldExportRow["gov_level"],
       seller_type: (x.seller_type ?? "retail") as SoldExportRow["seller_type"],
       market: (x.market ?? "domestic") as SoldExportRow["market"],
+      opening_bid_native: x.opening_bid_native == null ? null : Number(x.opening_bid_native),
+      opening_bid_usd: x.opening_bid_usd == null ? null : Number(x.opening_bid_usd),
+      is_sold_auction: x.is_sold_auction == null ? null : Boolean(x.is_sold_auction),
+      asset_status_cd: x.asset_status_cd == null ? null : String(x.asset_status_cd),
+      // Stored as a naive ET wall clock; render the digits without a zone suffix.
+      start_time_et:
+        x.start_time_et instanceof Date ? x.start_time_et.toISOString().slice(0, 19) : (x.start_time_et ?? null),
+      category_code: x.category_code == null ? null : String(x.category_code),
+      category_routepath: x.category_routepath == null ? null : String(x.category_routepath),
     };
   });
 }
