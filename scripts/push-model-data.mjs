@@ -9,8 +9,8 @@
 //
 // Requires: az CLI logged in with access to the Container App. One-time setup on the
 // app (already done): a secret volume mounted at /mnt/model-data and the env vars
-// REPORTED_GMV_QUARTERLY_PATH / MODEL_ESTIMATES_QUARTERLY_PATH pointing at the
-// mounted secret files.
+// REPORTED_GMV_QUARTERLY_PATH / MODEL_ESTIMATES_QUARTERLY_PATH /
+// MODEL_METRICS_QUARTERLY_PATH pointing at the mounted secret files.
 
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -24,6 +24,7 @@ const RG = process.env.LQDT_RESOURCE_GROUP || "cl-tool-rg";
 const FILES = [
   { csv: "reported-gmv-quarterly.csv", secret: "reported-gmv-quarterly-csv" },
   { csv: "model-estimates-quarterly.csv", secret: "model-estimates-quarterly-csv" },
+  { csv: "model-metrics-quarterly.csv", secret: "model-metrics-quarterly-csv" },
 ];
 
 function az(args) {

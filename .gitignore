@@ -49,3 +49,4 @@ scripts/*.xlsx
 scripts/*.xlsm
 scripts/reported-gmv-quarterly.csv
 scripts/model-estimates-quarterly.csv
+scripts/model-metrics-quarterly.csv
