@@ -589,6 +589,19 @@ export type RevenueForecast = {
     updated_by?: string | null;
     updated_at?: string | null;
   }[];
+  /** Long-format model-workbook metrics (segment GMV, take rates, P&L, guidance
+   *  ranges, operating stats). Attached by the forecast route from the gitignored
+   *  model export; optional. */
+  model_metrics?: { quarter: string; metric: string; value: number; kind: "reported" | "forecast" }[];
+  /** Per-day scraped GMV/lots/bids by honest group axes (gov/retail/intl) from
+   *  lqdt.sold_lots. Attached by the route for quarter=ALL only; optional. */
+  sold_by_group_daily?: {
+    date: string;
+    group: "gov" | "retail" | "intl";
+    gmv: number;
+    lots: number;
+    bids: number;
+  }[];
   debug: {
     now_iso: string;
     total_rows: number;

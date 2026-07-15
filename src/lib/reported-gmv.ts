@@ -29,15 +29,31 @@ export type ModelQuarterEstimate = {
   updated_at?: string | null;
 };
 
+/** One quarterly model metric in long format (see the extractor's METRIC_ROWS
+ *  registry for the key vocabulary: govdeals_gmv, total_take_rate, revenue,
+ *  eps_guidance_low, ...). Values are base units — USD, fraction, count, or $
+ *  per share depending on the metric. `kind` says whether the model column was
+ *  a reported actual or the model's own forecast. */
+export type ModelMetricRow = {
+  quarter: string;
+  metric: string;
+  value: number;
+  kind: "reported" | "forecast";
+};
+
 const REPORTED_GMV_PATH =
   process.env.REPORTED_GMV_QUARTERLY_PATH ||
   path.join(process.cwd(), "scripts", "reported-gmv-quarterly.csv");
 const MODEL_ESTIMATES_PATH =
   process.env.MODEL_ESTIMATES_QUARTERLY_PATH ||
   path.join(process.cwd(), "scripts", "model-estimates-quarterly.csv");
+const MODEL_METRICS_PATH =
+  process.env.MODEL_METRICS_QUARTERLY_PATH ||
+  path.join(process.cwd(), "scripts", "model-metrics-quarterly.csv");
 
 let cached: ReportedQuarterGmv[] | null = null;
 let cachedEstimates: ModelQuarterEstimate[] | null = null;
+let cachedMetrics: ModelMetricRow[] | null = null;
 
 /** The prod files arrive as base64-encoded Container App secrets (base64 survives
  *  CLI quoting; raw multi-line CSVs don't). Local dev reads the plain CSVs. */
@@ -103,6 +119,33 @@ export async function loadModelEstimates(): Promise<ModelQuarterEstimate[]> {
     // No committed CSV -> no guidance/estimate overlay; the rest of the app is unaffected.
   }
   cachedEstimates = out;
+  return out;
+}
+
+/** Long-format quarterly model metrics (segments, take rates, P&L, guidance
+ *  ranges, operating stats), chronological. `[]` if the CSV is absent. Unlike the
+ *  other loaders, zero/negative values are kept — EPS and beat_vs_mid can be
+ *  legitimately negative. */
+export async function loadModelMetrics(): Promise<ModelMetricRow[]> {
+  if (cachedMetrics) return cachedMetrics;
+  const out: ModelMetricRow[] = [];
+  try {
+    const raw = decodeMaybeBase64(await readFile(MODEL_METRICS_PATH, "utf8"));
+    for (const line of raw.trim().split(/\r?\n/).slice(1)) {
+      // Columns: quarter,quarter_end,metric,value,kind (no quoted fields).
+      const [quarter, , metric, valueRaw, kind] = line.split(",");
+      if (!/^\d{4}Q[1-4]$/.test(quarter ?? "")) continue;
+      if (!/^[a-z0-9_]+$/.test(metric ?? "")) continue;
+      if (kind !== "reported" && kind !== "forecast") continue;
+      const value = Number(valueRaw);
+      if (!Number.isFinite(value)) continue;
+      out.push({ quarter, metric, value, kind });
+    }
+    out.sort((a, b) => a.quarter.localeCompare(b.quarter) || a.metric.localeCompare(b.metric));
+  } catch {
+    // No CSV -> the QTD model sections render without model columns.
+  }
+  cachedMetrics = out;
   return out;
 }
 

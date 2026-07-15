@@ -1,14 +1,18 @@
 import { NextResponse } from "next/server";
 import { applyForecastTakeRate, computeRevenueForecast, type RevenueForecast } from "@/lib/auctions";
+import { getSoldDailyByGroup, isAzureSqlConfigured, type SoldGroupDailyRow } from "@/lib/azure-sql";
 import { ttlCache } from "@/lib/cache";
-import { loadModelEstimatesMerged, loadReportedQuarterlyGmv } from "@/lib/reported-gmv";
+import { loadModelEstimatesMerged, loadModelMetrics, loadReportedQuarterlyGmv } from "@/lib/reported-gmv";
 import { supabase } from "@/lib/supabase";
+import { etTodayKey } from "@/lib/time";
 
 export const dynamic = "force-dynamic";
 
 // Database work depends on the quarter, not the take rate. Cache a 100%-rate base
 // forecast and apply the requested rate in memory so slider changes are free.
 const forecastCache = ttlCache<RevenueForecast>(Number(process.env.FORECAST_CACHE_MS) || 15 * 60_000);
+// Full-history daily gov/retail/intl split for the QTD page (quarter=ALL only).
+const groupDailyCache = ttlCache<SoldGroupDailyRow[]>(Number(process.env.FORECAST_CACHE_MS) || 15 * 60_000);
 
 async function loadBaseForecast(quarter?: string): Promise<RevenueForecast> {
   const snapshot = await supabase
@@ -37,9 +41,35 @@ export async function GET(request: Request) {
   // Attach the reported-GMV benchmark + model estimates here (not in the snapshot):
   // full-history, take-rate-independent, and cheap, so they're always fresh regardless
   // of the selected quarter or when the cron last regenerated the snapshot.
-  const [reported_gmv_by_quarter, model_estimates_by_quarter] = await Promise.all([
+  const [reported_gmv_by_quarter, model_estimates_by_quarter, model_metrics] = await Promise.all([
     loadReportedQuarterlyGmv(),
     loadModelEstimatesMerged(),
+    loadModelMetrics(),
   ]);
-  return NextResponse.json({ ...applyForecastTakeRate(base, takeRate), reported_gmv_by_quarter, model_estimates_by_quarter });
+
+  // Daily gov/retail/intl group split — QTD-page (quarter=ALL) only, so the
+  // forecast tab's per-quarter requests stay light. Store failures just omit the
+  // series; the QTD model sections degrade to "unavailable".
+  let sold_by_group_daily: SoldGroupDailyRow[] | undefined;
+  if (quarter?.toUpperCase() === "ALL" && isAzureSqlConfigured()) {
+    try {
+      const timeoutMs = Number(process.env.FORECAST_SOLD_TIMEOUT_MS) || 25_000;
+      sold_by_group_daily = await Promise.race([
+        groupDailyCache.get("all", () => getSoldDailyByGroup(base.earliest_data_date, etTodayKey())),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("sold-by-group timeout")), timeoutMs),
+        ),
+      ]);
+    } catch {
+      // degrade silently — the rest of the payload is unaffected
+    }
+  }
+
+  return NextResponse.json({
+    ...applyForecastTakeRate(base, takeRate),
+    reported_gmv_by_quarter,
+    model_estimates_by_quarter,
+    model_metrics,
+    ...(sold_by_group_daily ? { sold_by_group_daily } : {}),
+  });
 }

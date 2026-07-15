@@ -409,6 +409,49 @@ export async function getCategoryDaily(fromEt: string, toEt: string): Promise<Ca
   }));
 }
 
+export type SoldGroupDailyRow = {
+  date: string; // YYYY-MM-DD (ET)
+  group: "gov" | "retail" | "intl";
+  gmv: number; // realized USD
+  lots: number; // sold lots with a positive price
+  bids: number; // total bids across the group's lots
+};
+
+/**
+ * Per-day realized GMV/lots/bids by honest scrape axes — NOT LQDT's segment names:
+ *   intl   = site 'GI' (the international marketplace)
+ *   gov    = government sellers on AD/GD (seller_type='government')
+ *   retail = the remainder (retail sellers on AD/GD; NULL seller_type lands here,
+ *            matching the reader default elsewhere in this module)
+ * The QTD page compares each group against its closest reported segment
+ * (GovDeals / RSCG+CAG / CAG). bid_count sums as bigint — int SUM overflows at
+ * ~2.1B and a quarter already carries ~2.2M bids.
+ */
+export async function getSoldDailyByGroup(fromEt: string, toEt: string): Promise<SoldGroupDailyRow[]> {
+  const grp =
+    "CASE WHEN site = 'GI' THEN 'intl' WHEN seller_type = 'government' THEN 'gov' ELSE 'retail' END";
+  const pool = await getPool();
+  const r = await pool
+    .request()
+    .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+    .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
+    .query(
+      `SELECT CONVERT(char(10), close_date_et, 23) AS d, ${grp} AS grp, ` +
+        "COALESCE(SUM(sale_amount_usd),0) AS gmv, " +
+        "SUM(CASE WHEN sale_amount_usd > 0 THEN 1 ELSE 0 END) AS lots, " +
+        "COALESCE(SUM(CAST(bid_count AS bigint)),0) AS bids " +
+        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to " +
+        `GROUP BY close_date_et, ${grp}`,
+    );
+  return r.recordset.map((x) => ({
+    date: x.d,
+    group: (x.grp === "gov" || x.grp === "intl" ? x.grp : "retail") as SoldGroupDailyRow["group"],
+    gmv: Number(x.gmv ?? 0),
+    lots: Number(x.lots ?? 0),
+    bids: Number(x.bids ?? 0),
+  }));
+}
+
 // --- analyst estimate overrides (guidance / Clearline) ----------------------
 //
 // Small keyed table holding per-quarter overrides entered from the QTD page.
