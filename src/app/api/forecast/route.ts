@@ -60,8 +60,9 @@ export async function GET(request: Request) {
           setTimeout(() => reject(new Error("sold-by-group timeout")), timeoutMs),
         ),
       ]);
-    } catch {
-      // degrade silently — the rest of the payload is unaffected
+    } catch (err) {
+      // degrade — the rest of the payload is unaffected; the QTD sections show "unavailable"
+      console.warn("forecast: sold_by_group_daily unavailable:", err instanceof Error ? err.message : err);
     }
   }
 

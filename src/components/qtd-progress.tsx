@@ -8,7 +8,7 @@
 // All math is client-side on the /api/forecast?quarter=ALL payload (full daily
 // history + current-quarter open-auction projection + reported/estimate series).
 
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   ComposedChart,
   Line,
@@ -24,9 +24,28 @@ import {
 } from "recharts";
 import type { NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
 import { downloadCsv } from "@/lib/format";
-import { enumerateQuarterLabelsBetween, etQuarterKey, formatQuarterLabel, parseQuarterLabel } from "@/lib/time";
+import { enumerateQuarterLabelsBetween, etQuarterKey, formatQuarterLabel } from "@/lib/time";
+import { QtdModelSections, type GroupDailyRow, type ModelMetricRow } from "./qtd-model-sections";
+import {
+  addDaysKey,
+  cumulate,
+  fmtM,
+  fmtPct,
+  MetricsTable,
+  priorYearQuarter,
+  quarterDayKeys,
+  StatCard,
+  type MCol,
+} from "./qtd-shared";
 
-type DailyPoint = { date: string; realized_gmv_usd: number; projected_gmv_usd: number };
+type DailyPoint = {
+  date: string;
+  realized_gmv_usd: number;
+  projected_gmv_usd: number;
+  ad_realized_gmv_usd?: number;
+  gd_realized_gmv_usd?: number;
+  gi_realized_gmv_usd?: number;
+};
 
 type QtdData = {
   daily: DailyPoint[];
@@ -41,6 +60,8 @@ type QtdData = {
     updated_by?: string | null;
     updated_at?: string | null;
   }[];
+  model_metrics?: ModelMetricRow[];
+  sold_by_group_daily?: GroupDailyRow[];
 };
 
 type ProjectionKey = "shape" | "auctions" | "runrate";
@@ -53,28 +74,6 @@ const PROJECTION_LABEL: Record<ProjectionKey, string> = {
 
 const FALLBACK_CAPTURE = 0.535;
 
-const fmtM = (v: number) => `$${(v / 1e6).toFixed(1)}M`;
-const fmtPct = (v: number, digits = 1) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(digits)}%`;
-
-/** YYYY-MM-DD keys of every day in the calendar quarter `label` (chronological). */
-function quarterDayKeys(label: string): string[] {
-  const q = parseQuarterLabel(label);
-  if (!q) return [];
-  const keys: string[] = [];
-  const cursor = new Date(q.start);
-  while (cursor < q.end) {
-    keys.push(cursor.toISOString().slice(0, 10));
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
-  }
-  return keys;
-}
-
-const priorYearQuarter = (label: string) => `${Number(label.slice(0, 4)) - 1}${label.slice(4)}`;
-
-const addDaysKey = (key: string, n: number) => {
-  const [y, m, d] = key.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
-};
 const monthShift = (ym: string, delta: number) => {
   const [y, m] = ym.split("-").map(Number);
   return new Date(Date.UTC(y, m - 1 + delta, 1)).toISOString().slice(0, 7);
@@ -86,14 +85,6 @@ const lastDayOfMonth = (ym: string) => {
 const MONTHS_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const monthLabel = (ym: string) => `${MONTHS_ABBR[Number(ym.slice(5, 7)) - 1]}-${ym.slice(2, 4)}`;
 const shortDate = (key: string) => `${Number(key.slice(5, 7))}/${Number(key.slice(8, 10))}`;
-
-function cumulate(dayKeys: string[], byDate: Map<string, number>): number[] {
-  let run = 0;
-  return dayKeys.map((k) => {
-    run += byDate.get(k) ?? 0;
-    return run;
-  });
-}
 
 type ChartRow = {
   day: number;
@@ -109,98 +100,6 @@ type ChartRow = {
   _dailyCur: number | null;
   _dailyLy: number | null;
 };
-
-function StatCard({ label, value, sub, strong }: { label: string; value: ReactNode; sub?: ReactNode; strong?: boolean }) {
-  return (
-    <div className="rounded-lg border p-3">
-      <p className="text-xs text-gray-500 mb-0.5">{label}</p>
-      <p className={`tabular-nums ${strong ? "text-xl font-bold text-gray-900" : "text-lg font-semibold text-gray-800"}`}>{value}</p>
-      {sub && <div className="mt-0.5 text-xs text-gray-500">{sub}</div>}
-    </div>
-  );
-}
-
-/** One column of the Yipit-style key-metrics tables. `nominal` is captured-basis
- *  unless `total` (guidance/Clearline/reported — total-company $, never scaled).
- *  `lyReported`: LY reported total, enabling a scaled-vs-reported Y/Y fallback. */
-type MCol = {
-  key: string;
-  top: string;
-  sub?: string;
-  nominal: number;
-  yoy: number | null;
-  lyReported?: number | null;
-  hl?: boolean;
-  total?: boolean;
-};
-
-function MetricsTable({
-  groups,
-  scale,
-  scaled,
-}: {
-  groups: { name: string; cols: MCol[] }[];
-  scale: number;
-  scaled: boolean;
-}) {
-  const shown = groups.filter((g) => g.cols.length > 0);
-  if (shown.length === 0) return null;
-  return (
-    <div className="rounded-lg border">
-      <table className="w-full border-collapse text-xs">
-        <thead>
-          <tr className="border-b-2 border-gray-300 text-left">
-            <th className="px-2.5 py-1 font-semibold text-gray-600">Period</th>
-            <th className="px-2.5 py-1 text-right font-semibold text-gray-600">USDmm</th>
-            <th className="px-2.5 py-1 text-right font-semibold text-gray-600">Y/Y</th>
-          </tr>
-        </thead>
-        <tbody>
-          {shown.map((g) => (
-            <Fragment key={g.name}>
-              {shown.length > 1 && (
-                <tr className="border-b bg-gray-50/60">
-                  <td colSpan={3} className="px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
-                    {g.name}
-                  </td>
-                </tr>
-              )}
-              {g.cols.map((c) => {
-                // Captured-vs-captured Y/Y when LY daily data exists; in scaled mode
-                // fall back to scaled-vs-LY-REPORTED (marked *).
-                const direct = c.yoy;
-                const derived =
-                  direct == null && scaled && !c.total && c.lyReported ? (c.nominal * scale) / c.lyReported - 1 : null;
-                const v = direct ?? derived;
-                return (
-                  <tr key={c.key} className={`border-b border-gray-100 ${c.hl ? "bg-blue-50" : ""}`}>
-                    <td className="whitespace-nowrap px-2.5 py-1 font-medium text-gray-700">
-                      {c.top}
-                      {c.sub && <span className="ml-1 text-[10px] font-normal text-gray-400">{c.sub}</span>}
-                    </td>
-                    <td className="px-2.5 py-1 text-right tabular-nums font-semibold text-gray-900">
-                      {((c.total ? c.nominal : c.nominal * scale) / 1e6).toFixed(1)}
-                    </td>
-                    <td className="px-2.5 py-1 text-right tabular-nums">
-                      {v == null ? (
-                        <span className="text-gray-300">—</span>
-                      ) : (
-                        <span className={v >= 0 ? "text-green-600" : "text-red-600"}>
-                          {fmtPct(v)}
-                          {derived != null && <span className="text-gray-400">*</span>}
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </Fragment>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
 
 // Definitions & methodology for every number on the page — rendered at the bottom
 // so analysts can audit exactly how each figure is derived.
@@ -301,6 +200,43 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
     ],
   },
+  {
+    group: "Segment & model sections",
+    items: [
+      {
+        term: "Segment groups (gov / retail / intl)",
+        def: "Honest scrape axes, NOT LQDT's reporting segments: intl = the GI marketplace; gov = government sellers on AD/GD; retail = the remainder. GD-site retail sellers mix RSCG and CAG, so a clean scraped GovDeals/RSCG/CAG split is not possible.",
+      },
+      {
+        term: "Segment capture rate",
+        def: "Scraped full-quarter group GMV ÷ the closest reported segment(s) — gov↔GovDeals, retail↔RSCG+CAG, intl↔CAG — averaged over the last 3 fully-covered reported quarters. Each group scales by its OWN capture, never the headline rate.",
+      },
+      {
+        term: "Implied revenue",
+        def: "Scaled full-quarter GMV estimate × the model's total take rate for the quarter (falling back to the latest reported take rate) — comparable to company revenue guidance.",
+      },
+      {
+        term: "Guidance / model columns (E)",
+        def: "Reported values come from the model workbook's integer actual columns; values marked E are the Clearline model's own forecasts. Revenue/EBITDA/EPS guidance ranges are the company's, parsed from the model's guidance rows.",
+      },
+      {
+        term: "Txn capture rate",
+        def: "Captured sold lots ÷ LQDT's reported completed transactions, averaged over the last 3 fully-covered reported quarters. Scales captured lot counts to estimated total-company transactions.",
+      },
+      {
+        term: "Scraped $/lot vs reported $/txn",
+        def: "Captured GMV ÷ captured lots per quarter, alongside the company's reported GMV per completed transaction — a mix-shift indicator (is GMV moving on volume or price?). Levels differ because the scrape skews toward higher-value marketplaces.",
+      },
+      {
+        term: "Avg active listings",
+        def: "Mean of the daily active-listing scrape (AllSurplus / GovDeals) over the quarter. GMV per avg listing divides the same quarter's captured site GMV by that average — the supply-productivity ratio the model forecasts with.",
+      },
+      {
+        term: "Bids per lot",
+        def: "Total bids on captured sold lots ÷ lots with a positive price, QTD vs the same days last year — a demand-intensity proxy for the company's reported auction participants.",
+      },
+    ],
+  },
 ];
 
 function DefinitionsBox() {
@@ -330,6 +266,96 @@ function DefinitionsBox() {
       </table>
     </div>
   );
+}
+
+type QtdModel = {
+  realizedByDate: Map<string, number>;
+  projectedByDate: Map<string, number>;
+  siteByDate: Map<string, { ad: number; gd: number; gi: number }>;
+  lastDataDate: string;
+  earliest: string;
+  quarters: string[];
+  reported: Map<string, number>;
+  estimates: Map<string, NonNullable<QtdData["model_estimates_by_quarter"]>[number]>;
+  autoCapture: number;
+  captureQuarters: { quarter: string; rate: number }[];
+};
+
+/** Everything the page derives for one quarter (cumulatives, Y/Y, projections,
+ *  FQE, WoW). Pure so it can run for both the selected quarter (the chart) and
+ *  the current quarter (the earnings-preview section, pinned to "now"). */
+function buildQuarterView(model: QtdModel, selected: string) {
+  const { realizedByDate, projectedByDate, lastDataDate } = model;
+
+  const dayKeys = quarterDayKeys(selected);
+  if (dayKeys.length === 0) return null;
+  const D = dayKeys.length;
+  const startKey = dayKeys[0];
+  const endKey = dayKeys[D - 1];
+  const dataThrough = lastDataDate < endKey ? lastDataDate : endKey;
+  // Days into period with data (0 if the quarter hasn't started/no data).
+  const d = dayKeys.filter((k) => k <= dataThrough).length;
+  if (d === 0) return null;
+  const complete = d === D;
+
+  const curCum = cumulate(dayKeys, realizedByDate);
+  const qtd = curCum[d - 1];
+
+  // Prior-year same fiscal quarter, aligned by day index.
+  const lyKeys = quarterDayKeys(priorYearQuarter(selected));
+  const lyAvailable =
+    lyKeys.length > 0 && lyKeys[0] >= model.earliest && lyKeys[lyKeys.length - 1] <= lastDataDate;
+  const lyCum = lyAvailable ? cumulate(lyKeys, realizedByDate) : null;
+  const lyD = lyCum?.length ?? 0;
+  const lyAt = (i: number) => (lyCum ? lyCum[Math.min(i, lyD - 1)] : 0);
+  const lyQtd = lyCum ? lyAt(d - 1) : null;
+  const yoy = lyQtd && lyQtd > 0 ? qtd / lyQtd - 1 : null;
+
+  // Projections (captured units). Anchor every path at day d so the dashed
+  // lines extend the solid QTD line.
+  const shapeAvailable = !complete && lyCum != null && lyAt(d - 1) > 0;
+  const remainingProjected = dayKeys.slice(d).map((k) => projectedByDate.get(k) ?? 0);
+  const auctionsAvailable = !complete && remainingProjected.some((v) => v > 0);
+  const shapeAt = (i: number) => qtd + (lyAt(i) - lyAt(d - 1)) * (qtd / lyAt(d - 1));
+  let auctionRun = qtd;
+  const auctionPath: number[] = dayKeys.map((_, i) => {
+    if (i < d) return qtd;
+    auctionRun += remainingProjected[i - d] ?? 0;
+    return auctionRun;
+  });
+  const runRateAt = (i: number) => (qtd / d) * (i + 1);
+
+  const fqe = {
+    shape: shapeAvailable ? shapeAt(D - 1) : null,
+    auctions: auctionsAvailable ? auctionPath[D - 1] : null,
+    runrate: !complete ? runRateAt(D - 1) : null,
+    actual: complete ? qtd : null,
+  };
+  // Primary FQE: prior-yr shape, else run-rate. Never the open-auction path —
+  // it only covers the scheduled-auction horizon (~2 weeks), not the full quarter.
+  const primaryFqe = fqe.actual ?? fqe.shape ?? fqe.runrate ?? qtd;
+  const primaryMethod = fqe.actual != null ? "complete quarter" : fqe.shape != null ? PROJECTION_LABEL.shape : PROJECTION_LABEL.runrate;
+
+  // "What changed in the last week": same primary method, data as of 7 days earlier.
+  let wow: number | null = null;
+  if (!complete && d > 8) {
+    const d7 = d - 7;
+    const qtd7 = curCum[d7 - 1];
+    let prevFqe: number | null = null;
+    if (shapeAvailable && lyAt(d7 - 1) > 0) prevFqe = (qtd7 / lyAt(d7 - 1)) * lyAt(D - 1);
+    else if (qtd7 > 0) prevFqe = (qtd7 / d7) * D;
+    const nowFqe = fqe.shape ?? fqe.runrate;
+    if (prevFqe && prevFqe > 0 && nowFqe) wow = nowFqe / prevFqe - 1;
+  }
+
+  return {
+    dayKeys, D, d, startKey, endKey, dataThrough, complete,
+    curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable,
+    shapeAvailable, auctionsAvailable, shapeAt, auctionPath, runRateAt,
+    fqe, primaryFqe, primaryMethod, wow,
+    reported: model.reported.get(selected) ?? null,
+    estimate: model.estimates.get(selected) ?? null,
+  };
 }
 
 function QtdTooltip({ active, payload }: TooltipContentProps<ValueType, NameType>) {
@@ -392,16 +418,22 @@ export function QtdProgress() {
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
   const currentQuarter = etQuarterKey(todayKey);
 
-  const model = useMemo(() => {
+  const model = useMemo((): QtdModel | null => {
     const data = state.data;
     if (!data) return null;
 
     const realizedByDate = new Map<string, number>();
     const projectedByDate = new Map<string, number>();
+    const siteByDate = new Map<string, { ad: number; gd: number; gi: number }>();
     let lastDataDate = "";
     for (const d of data.daily) {
       realizedByDate.set(d.date, d.realized_gmv_usd);
       projectedByDate.set(d.date, d.projected_gmv_usd);
+      siteByDate.set(d.date, {
+        ad: d.ad_realized_gmv_usd ?? 0,
+        gd: d.gd_realized_gmv_usd ?? 0,
+        gi: d.gi_realized_gmv_usd ?? 0,
+      });
       if (d.realized_gmv_usd > 0 && d.date > lastDataDate && d.date <= todayKey) lastDataDate = d.date;
     }
     const earliest = data.earliest_data_date || data.daily[0]?.date || todayKey;
@@ -422,85 +454,15 @@ export function QtdProgress() {
     const recent = captures.slice(-3);
     const autoCapture = recent.length ? recent.reduce((s, c) => s + c.rate, 0) / recent.length : FALLBACK_CAPTURE;
 
-    return { realizedByDate, projectedByDate, lastDataDate, earliest, quarters, reported, estimates, autoCapture, captureQuarters: recent };
+    return { realizedByDate, projectedByDate, siteByDate, lastDataDate, earliest, quarters, reported, estimates, autoCapture, captureQuarters: recent };
   }, [state.data, todayKey, currentQuarter]);
 
   const selected = quarter ?? currentQuarter;
 
-  const view = useMemo(() => {
-    if (!model) return null;
-    const { realizedByDate, projectedByDate, lastDataDate } = model;
-
-    const dayKeys = quarterDayKeys(selected);
-    if (dayKeys.length === 0) return null;
-    const D = dayKeys.length;
-    const startKey = dayKeys[0];
-    const endKey = dayKeys[D - 1];
-    const dataThrough = lastDataDate < endKey ? lastDataDate : endKey;
-    // Days into period with data (0 if the quarter hasn't started/no data).
-    const d = dayKeys.filter((k) => k <= dataThrough).length;
-    if (d === 0) return null;
-    const complete = d === D;
-
-    const curCum = cumulate(dayKeys, realizedByDate);
-    const qtd = curCum[d - 1];
-
-    // Prior-year same fiscal quarter, aligned by day index.
-    const lyKeys = quarterDayKeys(priorYearQuarter(selected));
-    const lyAvailable =
-      lyKeys.length > 0 && lyKeys[0] >= model.earliest && lyKeys[lyKeys.length - 1] <= lastDataDate;
-    const lyCum = lyAvailable ? cumulate(lyKeys, realizedByDate) : null;
-    const lyD = lyCum?.length ?? 0;
-    const lyAt = (i: number) => (lyCum ? lyCum[Math.min(i, lyD - 1)] : 0);
-    const lyQtd = lyCum ? lyAt(d - 1) : null;
-    const yoy = lyQtd && lyQtd > 0 ? qtd / lyQtd - 1 : null;
-
-    // Projections (captured units). Anchor every path at day d so the dashed
-    // lines extend the solid QTD line.
-    const shapeAvailable = !complete && lyCum != null && lyAt(d - 1) > 0;
-    const remainingProjected = dayKeys.slice(d).map((k) => projectedByDate.get(k) ?? 0);
-    const auctionsAvailable = !complete && remainingProjected.some((v) => v > 0);
-    const shapeAt = (i: number) => qtd + (lyAt(i) - lyAt(d - 1)) * (qtd / lyAt(d - 1));
-    let auctionRun = qtd;
-    const auctionPath: number[] = dayKeys.map((_, i) => {
-      if (i < d) return qtd;
-      auctionRun += remainingProjected[i - d] ?? 0;
-      return auctionRun;
-    });
-    const runRateAt = (i: number) => (qtd / d) * (i + 1);
-
-    const fqe = {
-      shape: shapeAvailable ? shapeAt(D - 1) : null,
-      auctions: auctionsAvailable ? auctionPath[D - 1] : null,
-      runrate: !complete ? runRateAt(D - 1) : null,
-      actual: complete ? qtd : null,
-    };
-    // Primary FQE: prior-yr shape, else run-rate. Never the open-auction path —
-    // it only covers the scheduled-auction horizon (~2 weeks), not the full quarter.
-    const primaryFqe = fqe.actual ?? fqe.shape ?? fqe.runrate ?? qtd;
-    const primaryMethod = fqe.actual != null ? "complete quarter" : fqe.shape != null ? PROJECTION_LABEL.shape : PROJECTION_LABEL.runrate;
-
-    // "What changed in the last week": same primary method, data as of 7 days earlier.
-    let wow: number | null = null;
-    if (!complete && d > 8) {
-      const d7 = d - 7;
-      const qtd7 = curCum[d7 - 1];
-      let prevFqe: number | null = null;
-      if (shapeAvailable && lyAt(d7 - 1) > 0) prevFqe = (qtd7 / lyAt(d7 - 1)) * lyAt(D - 1);
-      else if (qtd7 > 0) prevFqe = (qtd7 / d7) * D;
-      const nowFqe = fqe.shape ?? fqe.runrate;
-      if (prevFqe && prevFqe > 0 && nowFqe) wow = nowFqe / prevFqe - 1;
-    }
-
-    return {
-      dayKeys, D, d, startKey, endKey, dataThrough, complete,
-      curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable,
-      shapeAvailable, auctionsAvailable, shapeAt, auctionPath, runRateAt,
-      fqe, primaryFqe, primaryMethod, wow,
-      reported: model.reported.get(selected) ?? null,
-      estimate: model.estimates.get(selected) ?? null,
-    };
-  }, [model, selected]);
+  const view = useMemo(() => (model ? buildQuarterView(model, selected) : null), [model, selected]);
+  // Current-quarter view for the earnings-preview section, which stays pinned to
+  // "now" regardless of the chart's quarter selector.
+  const viewNow = useMemo(() => (model ? buildQuarterView(model, currentQuarter) : null), [model, currentQuarter]);
 
   if (state.error) return <p className="text-sm text-red-600">QTD data unavailable: {state.error}</p>;
   if (!model || !view) return <p className="py-10 text-center text-sm text-gray-500">Loading QTD progress…</p>;
@@ -682,6 +644,7 @@ export function QtdProgress() {
   // One-click Excel-friendly export: three labeled blocks (summary, key metrics,
   // full daily progression for the selected quarter). Dollars are raw integers and
   // Y/Y are "%" strings so Excel parses both natively for pasting into the model.
+  // FUTURE: the segment/transaction section data could be appended as extra blocks.
   const exportCsv = () => {
     const esc = (v: unknown) => {
       const t = v == null ? "" : String(v);
@@ -1165,6 +1128,18 @@ export function QtdProgress() {
         *Scaled QTD/quarter vs LY <em>reported</em> total.
         {!scaled && " Switch to Scaled to total to compare against guidance / the Clearline model."}
       </p>
+
+      {/* Model-driven sections: segments, earnings preview, transactions, supply/demand */}
+      <QtdModelSections
+        metricsRows={state.data?.model_metrics}
+        groupDaily={state.data?.sold_by_group_daily}
+        selected={selected}
+        currentQuarter={currentQuarter}
+        estimates={model.estimates}
+        siteByDate={model.siteByDate}
+        viewNow={viewNow}
+        captureRate={captureRate}
+      />
 
       <DefinitionsBox />
     </div>
