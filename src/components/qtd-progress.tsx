@@ -243,11 +243,11 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "Revenue (mix-adj) / take-rate model",
-        def: "Scraped GMV is split into 7 fee-regime buckets (gov vehicles, gov other, retail vehicles, retail other, heavy equipment, GI, AllSurplus DTC). Each bucket's coefficient θ (revenue per scraped $, capture absorbed) is fitted on the reported quarters against 3 targets per quarter — total revenue ex-Machinio, GovDeals segment revenue, and RSCG+CAG revenue — with priors from the model workbook's segment/purchase/consignment take rates and box bounds. Mix-adj revenue = Σ θ × bucket FQE GMV (each bucket's QTD scaled by the headline FQE ratio, mix held constant) + Machinio's subscription revenue.",
+        def: "Revenue decomposes into three parts. (1) Consignment + fee revenue: scraped GMV splits into fee-regime buckets (gov vehicles & equipment, gov other, retail vehicles, retail other, retail heavy, GI) whose coefficients θ (revenue per scraped $, capture absorbed) are fitted on the reported quarters against consignment+fee revenue (total − Machinio − purchase) and GovDeals segment revenue, with priors from the workbook's take rates and box bounds. (2) Purchase revenue: purchase_gmv × purchase_take_rate (≈104% — LQDT recognizes the full sale price), added back explicitly because most purchase GMV (liquidation.com, AllSurplus DTC) isn't scraped or isn't consignment. (3) Machinio subscription revenue. Mix-adj revenue = Σ θ × bucket FQE GMV + purchase + Machinio.",
       },
       {
         term: "Take-rate model caveats",
-        def: "Only a few reported quarters overlap full scrape coverage, and the mix is stable, so coefficients are prior-anchored (ridge) — they sharpen every quarter as reports land. The backtest is in-sample. ≈take rate = θ × the bucket's group capture rate, an approximation since capture varies by bucket.",
+        def: "Only a few reported quarters overlap full scrape coverage, and the mix is stable, so coefficients are prior-anchored (ridge) — they sharpen every quarter as reports land. The backtest is in-sample. ≈take rate = θ × the bucket's group capture rate, an approximation since capture varies by bucket. AllSurplus DTC has no fitted coefficient — it is purchase-model, covered by the purchase add-back.",
       },
     ],
   },
@@ -834,6 +834,7 @@ export function QtdProgress() {
           ),
         );
       }
+      lines.push(rowOf("purchase_revenue_added_usd", Math.round(t.purchaseAdd), "purchase-model revenue, mostly unscraped GMV"));
       lines.push(rowOf("machinio_revenue_added_usd", Math.round(t.machinioAdd)));
       if (t.mixRevenue != null) lines.push(rowOf("mix_adjusted_revenue_usd", Math.round(t.mixRevenue), t.mixTakeRate != null ? `${(t.mixTakeRate * 100).toFixed(1)}% implied take rate` : ""));
       lines.push(rowOf("backtest (in-sample)", "quarter", "actual_revenue_usd", "predicted_revenue_usd", "error"));

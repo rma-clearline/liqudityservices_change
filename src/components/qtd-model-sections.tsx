@@ -198,6 +198,9 @@ export type QtdModelData = {
     mixRevenue: number | null;
     mixTakeRate: number | null;
     machinioAdd: number;
+    /** Purchase-model revenue add-back (purchase_gmv × purchase_take_rate) —
+     *  handled outside the fit because most purchase GMV isn't scraped. */
+    purchaseAdd: number;
   } | null;
 };
 
@@ -360,33 +363,41 @@ export function computeQtdModelData(input: QtdModelInput): QtdModelData {
 
   // --- take-rate model: bucket coefficients fitted on reported quarters ----------
   // θ_b = revenue per SCRAPED bucket dollar (capture absorbed — the fit needs no
-  // capture assumption). Ridge-anchored to economic priors so with few quarters
-  // the priors dominate; data takes over as reported quarters accrue.
+  // capture assumption). PURCHASE-model revenue (LQDT recognizes the full sale
+  // price, take ≈ 104%, and most purchase GMV — liquidation.com — isn't scraped)
+  // is an explicit add-back from the workbook's purchase_gmv × purchase_take_rate,
+  // like Machinio: folding it into coefficients produced nonsense "take rates".
+  // The fit therefore explains CONSIGNMENT + fee revenue only, and ad_dtc
+  // (purchase-model AllSurplus Deals) is excluded — its revenue arrives via the
+  // purchase line. Ridge-anchored to economic priors so with few quarters the
+  // priors dominate; data takes over as reported quarters accrue.
   let takeRateModel: QtdModelData["takeRateModel"] = null;
   {
-    const fitQuarters = coveredQuarters.filter((q) =>
-      ["revenue", "machinio_revs", "govdeals_gmv", "govdeals_take_rate", "rscg_gmv", "rscg_take_rate", "cag_gmv", "cag_take_rate"].every(
-        (m) => mVal(m, q, "reported") != null,
-      ),
+    const purchaseRevOf = (q: string): number | null => {
+      const pg = mVal("purchase_gmv", q, "reported");
+      const pt = mVal("purchase_take_rate", q, "reported");
+      return pg != null && pt != null ? pg * pt : null;
+    };
+    const fitQuarters = coveredQuarters.filter(
+      (q) =>
+        ["revenue", "machinio_revs", "govdeals_gmv", "govdeals_take_rate"].every((m) => mVal(m, q, "reported") != null) &&
+        purchaseRevOf(q) != null,
     );
     if (hasGroups && fitQuarters.length > 0) {
       const consTake = latestReported("consignment_take_rate") ?? 0.112;
       const govTake = latestReported("govdeals_take_rate") ?? 0.1;
-      const rscgTake = latestReported("rscg_take_rate") ?? 0.73;
       const cagTake = latestReported("cag_take_rate") ?? 0.17;
-      const purchTake = latestReported("purchase_take_rate") ?? 1.0;
-      // Economic take-rate priors per bucket. GovDeals' tiered fee schedule makes
-      // high-ASP rolling stock skew below the segment average and small lots
-      // above it; ret_other is RSCG-like — consignment blended with purchase-model
-      // revenue whose GMV (liquidation.com) isn't scraped, hence the RSCG prior.
-      const PRIOR_TAKE: Record<SoldBucketName, number> = {
+      // Consignment take-rate priors per bucket. GovDeals' tiered fee schedule
+      // makes high-ASP rolling stock skew below the segment average and small
+      // lots above it; heavy/intl lean toward CAG's fee structure.
+      const FIT_BUCKETS: SoldBucketName[] = ["gov_veh", "gov_other", "ret_veh", "ret_other", "heavy", "intl"];
+      const PRIOR_TAKE: Record<string, number> = {
         gov_veh: govTake * 0.85,
         gov_other: govTake * 1.15,
         ret_veh: consTake * 1.2,
-        ret_other: rscgTake,
+        ret_other: consTake * 1.2,
         heavy: cagTake,
         intl: cagTake,
-        ad_dtc: purchTake,
       };
       const capOf = (b: SoldBucketName): number => {
         const cap = segments.find((s) => s.key === BUCKET_TO_GROUP[b])?.capture?.rate;
@@ -394,54 +405,55 @@ export function computeQtdModelData(input: QtdModelInput): QtdModelData {
       };
       const priors: Record<string, number> = {};
       const bounds: Record<string, [number, number]> = {};
-      for (const b of BUCKETS) {
+      for (const b of FIT_BUCKETS) {
         const theta0 = PRIOR_TAKE[b] / capOf(b);
         priors[b] = theta0;
         bounds[b] = [Math.max(0, theta0 * 0.4), Math.min(5, theta0 * 2.5)];
       }
       const GOV_BUCKETS: SoldBucketName[] = ["gov_veh", "gov_other"];
-      const RET_BUCKETS: SoldBucketName[] = ["ret_veh", "ret_other", "heavy", "intl", "ad_dtc"];
       const pick = (S: Record<string, number>, keys: SoldBucketName[]) => Object.fromEntries(keys.map((b) => [b, S[b] ?? 0]));
       const obs: FitObservation[] = [];
       for (const q of fitQuarters) {
         const keys = qKeysCovered(q);
         const S: Record<string, number> = {};
-        for (const b of BUCKETS) S[b] = sumB(b, keys);
-        // 1) total GMV-linked revenue (Machinio's subscription revenue has no GMV)
-        obs.push({ weight: 2, target: mVal("revenue", q, "reported")! - mVal("machinio_revs", q, "reported")!, loadings: S });
-        // 2) GovDeals segment revenue ↔ gov buckets
+        for (const b of FIT_BUCKETS) S[b] = sumB(b, keys);
+        // 1) consignment + fee revenue = total − Machinio − purchase revenue
+        obs.push({
+          weight: 2,
+          target: mVal("revenue", q, "reported")! - mVal("machinio_revs", q, "reported")! - purchaseRevOf(q)!,
+          loadings: S,
+        });
+        // 2) GovDeals segment revenue (essentially all consignment) ↔ gov buckets
         obs.push({
           weight: 1,
           target: mVal("govdeals_gmv", q, "reported")! * mVal("govdeals_take_rate", q, "reported")!,
           loadings: pick(S, GOV_BUCKETS),
         });
-        // 3) RSCG + CAG revenue ↔ the remaining buckets
-        obs.push({
-          weight: 1,
-          target:
-            mVal("rscg_gmv", q, "reported")! * mVal("rscg_take_rate", q, "reported")! +
-            mVal("cag_gmv", q, "reported")! * mVal("cag_take_rate", q, "reported")!,
-          loadings: pick(S, RET_BUCKETS),
-        });
       }
       // λ=0.5: enough prior anchoring to stabilize the collinear directions (the
-      // bucket mix barely moves quarter to quarter) without the systematic
-      // under-prediction a full observation's worth of prior weight caused.
+      // bucket mix barely moves quarter to quarter) without systematic bias.
       const fit = fitTakeRates(obs, priors, bounds, 0.5);
-      // In-sample backtest on the total-revenue equation per fitted quarter.
+      // In-sample backtest on TOTAL revenue per fitted quarter (fit + add-backs).
       const backtest = fitQuarters.map((q) => {
         const keys = qKeysCovered(q);
-        const predicted = BUCKETS.reduce((s, b) => s + fit.theta[b] * sumB(b, keys), 0) + mVal("machinio_revs", q, "reported")!;
+        const predicted =
+          FIT_BUCKETS.reduce((s, b) => s + fit.theta[b] * sumB(b, keys), 0) +
+          purchaseRevOf(q)! +
+          mVal("machinio_revs", q, "reported")!;
         const actual = mVal("revenue", q, "reported")!;
         return { q, actual, predicted, errPct: predicted / actual - 1 };
       });
       // Current-quarter mix-adjusted revenue: each bucket's QTD scaled by the
-      // headline FQE ratio (mix held constant through quarter-end), × θ, plus
-      // Machinio's GMV-less revenue.
+      // headline FQE ratio (mix held constant through quarter-end), × θ, plus the
+      // purchase-revenue and Machinio add-backs (model forecasts, falling back to
+      // the latest reported values).
       const nowKeys = quarterDayKeys(currentQuarter).filter((k) => k <= gLast);
       const scaleUp = viewNow && viewNow.qtd > 0 ? viewNow.primaryFqe / viewNow.qtd : null;
       const machinioAdd = mVal("machinio_revs", currentQuarter, "forecast") ?? latestReported("machinio_revs") ?? 0;
-      const coeffs = BUCKETS.map((b) => {
+      const pgF = mVal("purchase_gmv", currentQuarter, "forecast");
+      const ptF = mVal("purchase_take_rate", currentQuarter, "forecast") ?? latestReported("purchase_take_rate");
+      const purchaseAdd = pgF != null && ptF != null ? pgF * ptF : purchaseRevOf(fitQuarters[fitQuarters.length - 1]) ?? 0;
+      const coeffs = FIT_BUCKETS.map((b) => {
         const qtdGmv = sumB(b, nowKeys);
         const fqeGmv = scaleUp != null ? qtdGmv * scaleUp : null;
         return {
@@ -454,7 +466,8 @@ export function computeQtdModelData(input: QtdModelInput): QtdModelData {
           revContribution: fqeGmv != null ? fit.theta[b] * fqeGmv : null,
         };
       });
-      const mixRevenue = scaleUp != null ? coeffs.reduce((s, c) => s + (c.revContribution ?? 0), 0) + machinioAdd : null;
+      const mixRevenue =
+        scaleUp != null ? coeffs.reduce((s, c) => s + (c.revContribution ?? 0), 0) + purchaseAdd + machinioAdd : null;
       const scaledFqeForMix = viewNow ? viewNow.primaryFqe / captureRate : null;
       takeRateModel = {
         available: true,
@@ -465,6 +478,7 @@ export function computeQtdModelData(input: QtdModelInput): QtdModelData {
         mixRevenue,
         mixTakeRate: mixRevenue != null && scaledFqeForMix != null && scaledFqeForMix > 0 ? mixRevenue / scaledFqeForMix : null,
         machinioAdd,
+        purchaseAdd,
       };
     }
   }
@@ -936,6 +950,13 @@ export function QtdModelSections(props: QtdModelInput) {
                         </td>
                       </tr>
                     ))}
+                    <tr className="border-b border-gray-100 bg-gray-50/60">
+                      <td className="px-2.5 py-1 font-medium text-gray-700">+ Purchase revenue (mostly unscraped GMV, incl. AllSurplus DTC)</td>
+                      <td className="px-2.5 py-1 text-right text-gray-300">—</td>
+                      <td className="px-2.5 py-1 text-right text-gray-300">—</td>
+                      <td className="px-2.5 py-1 text-right text-gray-300">—</td>
+                      <td className="px-2.5 py-1 text-right tabular-nums text-gray-700">{fmtM(m.takeRateModel.purchaseAdd)}</td>
+                    </tr>
                     <tr className="border-b border-gray-100 bg-gray-50/60">
                       <td className="px-2.5 py-1 font-medium text-gray-700">+ Machinio (subscription, no GMV)</td>
                       <td className="px-2.5 py-1 text-right text-gray-300">—</td>
