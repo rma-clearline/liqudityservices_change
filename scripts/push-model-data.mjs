@@ -1,7 +1,10 @@
-// Push the model-derived CSVs (reported GMV, guidance, Clearline estimates) to the
-// production Container App as SECRETS — the CSVs are gitignored and never committed,
-// so this is how prod gets them. Values are base64-encoded (survives CLI quoting);
-// the app's loaders decode transparently.
+// Push the model-derived CSVs (reported GMV, guidance, Clearline estimates, model
+// metrics) to the production Container App as SECRETS — the CSVs are gitignored and
+// never committed, so this is how prod gets them. Values are base64(gzip(csv)):
+// base64 survives CLI quoting, and gzip keeps the az command line far below
+// cmd.exe's 32K limit (az is a batch file, so the whole command runs through
+// cmd.exe — the raw metrics CSV alone exceeded the limit). The app's loaders
+// decode transparently (and still accept plain base64 or plain CSV).
 //
 // Quarterly refresh, one command each:
 //   node scripts/extract-reported-gmv.mjs     # model workbook -> local CSVs
@@ -16,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
 
 const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const APP = process.env.LQDT_APP_NAME || "lqdt-web";
@@ -40,8 +44,9 @@ for (const f of FILES) {
   const p = path.join(SCRIPTS_DIR, f.csv);
   const text = readFileSync(p, "utf8"); // throws if missing — run the extractor first
   const lines = text.trim().split(/\r?\n/).length - 1;
-  pairs.push(`${f.secret}=${Buffer.from(text, "utf8").toString("base64")}`);
-  console.log(`${f.csv}: ${lines} rows -> secret ${f.secret}`);
+  const encoded = gzipSync(Buffer.from(text, "utf8")).toString("base64");
+  pairs.push(`${f.secret}=${encoded}`);
+  console.log(`${f.csv}: ${lines} rows -> secret ${f.secret} (${encoded.length} b64 chars)`);
 }
 
 console.log(`Setting secrets on ${APP} (${RG})...`);

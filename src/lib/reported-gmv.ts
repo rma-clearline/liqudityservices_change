@@ -12,6 +12,7 @@
 
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { gunzipSync } from "node:zlib";
 import { getModelEstimateOverrides, isAzureSqlConfigured } from "@/lib/azure-sql";
 
 export type ReportedQuarterGmv = { quarter: string; reported_gmv_usd: number };
@@ -55,13 +56,17 @@ let cached: ReportedQuarterGmv[] | null = null;
 let cachedEstimates: ModelQuarterEstimate[] | null = null;
 let cachedMetrics: ModelMetricRow[] | null = null;
 
-/** The prod files arrive as base64-encoded Container App secrets (base64 survives
- *  CLI quoting; raw multi-line CSVs don't). Local dev reads the plain CSVs. */
+/** The prod files arrive as Container App secrets encoded base64(gzip(csv)) —
+ *  base64 survives CLI quoting and gzip keeps the `az` command line far below
+ *  cmd.exe's 32K limit (the metrics CSV alone would blow it raw). Older pushes
+ *  were plain base64(csv); local dev reads the plain CSVs. All three work. */
 function decodeMaybeBase64(raw: string): string {
   const head = raw.slice(0, 200);
   if (head.includes(",")) return raw; // plain CSV (header row has commas)
   try {
-    return Buffer.from(raw.trim(), "base64").toString("utf8");
+    const buf = Buffer.from(raw.trim(), "base64");
+    if (buf[0] === 0x1f && buf[1] === 0x8b) return gunzipSync(buf).toString("utf8");
+    return buf.toString("utf8");
   } catch {
     return raw;
   }
