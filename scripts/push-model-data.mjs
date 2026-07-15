@@ -33,9 +33,10 @@ const FILES = [
 
 function az(args) {
   // az is az.cmd (a batch file) on Windows, so this must run through the shell —
-  // and cmd.exe treats "=" as an argument delimiter, so any arg containing "=" must
-  // be double-quoted or the name=value pairs get split before az ever sees them.
-  const quoted = args.map((a) => (a.includes("=") ? `"${a}"` : a));
+  // and cmd.exe treats "=" as an argument delimiter and "|", "?", spaces, etc. as
+  // shell syntax, so any arg containing them must be double-quoted or it gets
+  // split/piped before az ever sees it (e.g. JMESPath queries like "[...] | [0]").
+  const quoted = args.map((a) => (/[^A-Za-z0-9_\-.:/]/.test(a) ? `"${a}"` : a));
   return execFileSync("az", quoted, { shell: true, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
 }
 
