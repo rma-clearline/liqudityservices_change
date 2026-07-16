@@ -99,9 +99,8 @@ All three jobs set `APP_URL` to the app's ingress URL. Trigger a manual run to t
 Dashboard pages are `force-dynamic`; a small shared in-memory TTL cache (`src/lib/cache.ts`)
 fronts the read-only, user-independent hot paths so repeat navigation skips the
 cross-region Supabase round trips: `src/lib/dashboard-data.ts` (listings/contracts/
-marketplace, ~60s), `/api/data-status` (~30s), `/api/forecast` (60s), `/api/stock-prices`
-(~5min). Per-replica, so it pairs with `lqdt-keepwarm`. TTL env overrides:
-`DASHBOARD_CACHE_MS`, `STOCK_PRICE_CACHE_MS`.
+marketplace, ~60s), `/api/data-status` (~30s), `/api/forecast` (60s). Per-replica, so it
+pairs with `lqdt-keepwarm`. TTL env override: `DASHBOARD_CACHE_MS`.
 
 The forecast page's **"Quarterly revenue by category"** chart (`/api/gmv-by-category`) caches
 the one expensive step — the Azure SQL `GROUP BY` — keyed by date range (`CATEGORY_CACHE_MS`,

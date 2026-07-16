@@ -70,7 +70,6 @@ API routes:
 /api/data-status   — Per-table freshness + latest cron-run status/alerts (powers the freshness badges + alerts banner)
 /api/forecast      — Quarterly revenue forecast (auctions-derived), short-cached
 /api/historical-sales — Sold-auction detail for the forecast drill-down modal
-/api/stock-prices  — LQDT daily closes (Yahoo Finance) for the forecast chart overlay
 /api/listings      — Historical listing counts as JSON
 /api/send-snapshot — Manual email snapshot (allow-listed recipients, rate + size limited)
 ```
