@@ -37,7 +37,7 @@ If unset, everything transparently falls back to the live Maestro feed.
 - **Reads:** forecast (live-quarter realized), export, and drill-down prefer the store
   but only for a range it **fully covers** (`storeCoversRange`), else fall back to
   Maestro — so a gap day is never served as a complete `$0` result. Each store read is
-  timeout-guarded so a cold/paused DB falls back instead of hanging.
+  timeout-guarded so an unreachable/stalled DB falls back instead of hanging.
 
 ## Migration / bootstrap
 Run `azure-sql/001_create_sold_lots.sql`, then `002_cost_optimizations.sql`, as a SQL admin (they create the schema,
@@ -49,9 +49,11 @@ as `lqdt_app`, no admin needed). Substitute `<<AZURE_SQL_PASSWORD>>` at run time
   (App Service / Container Apps) are covered by the server's `AllowAzure` firewall rule
   — no public exposure. Vercel's dynamic egress is not, hence the Vercel→Azure Container
   Apps hosting move.
-- **Serverless auto-pause:** the DB pauses after 60 min idle; the first query after a
-  pause takes ~30–60s to wake, during which reads fall back to Maestro. Disable
-  auto-pause (control-plane) if always-instant reads matter (adds ~always-on cost).
+- **Provisioned tier (always-on):** cl-sql-db is a Standard S2 (50 DTU) — no serverless
+  auto-pause, so there is no cold-start wake and reads are served from the store without
+  a first-query penalty. The store-read timeout is now only a guard against a genuinely
+  stalled connection, not a pause. (Watch DTU headroom: a dense single-month raw read is
+  the heaviest query; if reads approach the timeout, that's a sign to size up.)
 - **Re-backfill / gaps:** re-run `/api/backfill-sold` for any window; MERGE makes it
   idempotent. The read coverage gate means a partially-backfilled range serves from
   Maestro until fully filled.
@@ -86,8 +88,9 @@ times are **UTC**.
   alive (a request inside the 300s scale-down cooldown prevents scale-to-zero) without a
   session and without touching the DB. The 0.25-vCPU app fits inside Container Apps' free
   monthly grant (~200h), so business-hours warmth is effectively free; it still scales to
-  zero overnight/weekends. Deliberately does **not** ping a DB-touching route, so the
-  serverless SQL DB stays paused (keeping it warm would cost ~$50/mo).
+  zero overnight/weekends. Pings a **public** page only (no DB): the S2 DB is always-on,
+  so there is nothing to keep warm there — this job exists purely to kill the *app*
+  replica cold-start.
 
 All three jobs set `APP_URL` to the app's ingress URL. Trigger a manual run to test:
 `az containerapp job start -n <job> -g cl-tool-rg`.

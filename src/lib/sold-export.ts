@@ -159,6 +159,29 @@ function chunkRange(from: string, to: string): Chunk[] {
 const rangeCache = new Map<string, { at: number; val: SoldExportFetch }>();
 
 /**
+ * Thrown by fetchSoldRange when a live (Maestro) fetch is asked for a range that
+ * holds more lots than `maxRows` — i.e. too large to materialize safely in one
+ * request. The export route maps this to a clean, retryable 503 so the client can
+ * re-request the range as smaller COMPLETE slices instead of the container dying
+ * and the platform emitting a raw 503.
+ */
+export class RangeTooLargeError extends Error {
+  readonly code = "range_too_large" as const;
+  constructor(
+    readonly from: string,
+    readonly to: string,
+    readonly totalInRange: number,
+    readonly maxRows: number,
+  ) {
+    super(
+      `Live fetch for ${from}..${to} would return ${totalInRange.toLocaleString()} lots ` +
+        `(over the ${maxRows.toLocaleString()} single-request cap); retrying in smaller windows.`,
+    );
+    this.name = "RangeTooLargeError";
+  }
+}
+
+/**
  * Fetch + classify sold lots in [from, to] (ET days). The range is split into
  * weekly chunks; by default EVERY page of every non-empty chunk is fetched
  * (complete coverage), bounded only by `maxPages` as a safety cap. Empty chunks
@@ -170,10 +193,10 @@ const rangeCache = new Map<string, { at: number; val: SoldExportFetch }>();
 export async function fetchSoldRange(
   from: string,
   to: string,
-  opts: { maxPages?: number } = {},
+  opts: { maxPages?: number; maxRows?: number } = {},
 ): Promise<SoldExportFetch> {
   const maxPages = opts.maxPages ?? DEFAULT_MAX_PAGES;
-  const cacheKey = `${from}|${to}|${maxPages}`;
+  const cacheKey = `${from}|${to}|${maxPages}|${opts.maxRows ?? ""}`;
   const hit = rangeCache.get(cacheKey);
   if (hit && Date.now() - hit.at < RANGE_CACHE_MS) return hit.val;
 
@@ -204,6 +227,17 @@ export async function fetchSoldRange(
     const pagesNeeded = Math.ceil(r.total / PAGE_SIZE);
     if (pagesNeeded > 1) deeperNeed.push({ chunk: chunks[idx], pagesNeeded });
   });
+
+  // Preflight size guard for live fetches: if the range holds more lots than one
+  // request can safely materialize (a dense month on the small app container),
+  // abort *before* the expensive Phase-2 pull rather than letting the container
+  // die and the platform emit a raw 503. The caller (export route) surfaces this
+  // as a clean, retryable JSON error; the modal then re-requests the range in
+  // smaller COMPLETE slices (never a value-ranked sample — see Bug 2). Only the
+  // cheap page-1 probes above have run at this point, so this costs little.
+  if (opts.maxRows != null && totalInRange > opts.maxRows) {
+    throw new RangeTooLargeError(from, to, totalInRange, opts.maxRows);
+  }
 
   // Phase 2: ALL remaining pages of every non-empty chunk, breadth-first
   // (page 2 of each, then page 3…), bounded by the maxPages safety cap.

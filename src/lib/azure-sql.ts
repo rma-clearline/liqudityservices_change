@@ -39,8 +39,9 @@ function sqlConfig(): sql.config {
     options: {
       encrypt: true,
       trustServerCertificate: false,
-      // Serverless cl-sql-db auto-pauses after 60 min idle; the first query after
-      // a pause has to wake it (~30-60s), so be patient on connect.
+      // cl-sql-db is a provisioned Standard tier (S2, always-on — no serverless
+      // auto-pause), so connects are fast; these generous caps now only guard a
+      // transient network/connection stall, not a cold-start wake.
       connectTimeout: 90_000,
       requestTimeout: 120_000,
       useUTC: true,

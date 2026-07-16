@@ -156,8 +156,8 @@ export async function GET(request: Request) {
       const fromDate = new Date(`${date}T00:00:00Z`);
       fromDate.setUTCDate(fromDate.getUTCDate() - (lookback - 1));
       const from = fromDate.toISOString().slice(0, 10);
-      // Bound the whole capture so a cold/paused serverless DB (or a slow Maestro
-      // pull) can't push the shared 60s cron past maxDuration and get the function
+      // Bound the whole capture so a slow store read (or a slow Maestro pull)
+      // can't push the shared 60s cron past maxDuration and get the function
       // killed — which would drop cron_runs logging and the noon email for every
       // task. On timeout this task is marked failed; the rest of the cron proceeds.
       const timeoutMs = Number(process.env.SOLD_CAPTURE_TIMEOUT_MS) || 45000;

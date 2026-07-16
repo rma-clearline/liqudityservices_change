@@ -1103,7 +1103,7 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   // `storeDays` records the covered days so the per-platform blocks below reconcile
   // with the blended daily headline (store realized on covered days + tracked
   // realized on the rest). Falls back to the tracked-auctions fill if the store is
-  // unconfigured or unreachable within the timeout (e.g. the serverless DB paused).
+  // unconfigured or unreachable within the timeout (a slow/stalled store read).
   const todayKey = etDateKey(nowIso);
   const liveDays = chartDays.filter((d) => !historicalDailyGmv.totals.has(d) && d <= todayKey);
   const soldBySite: Record<SourceKey, number> = { AD: 0, GD: 0, GI: 0 };

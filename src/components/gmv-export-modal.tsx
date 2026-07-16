@@ -44,8 +44,10 @@ type PivotRow = { period: string; site: string; type: string; market: string; gm
 
 /**
  * Calendar-month sub-ranges overlapping [from, to], each clamped. We split by
- * MONTH (not quarter) so every request stays well under the serverless timeout
- * even for a dense month — a quarter could exceed it and 504.
+ * MONTH (not quarter) so a single request stays within the app's request budget
+ * even for a dense month — a quarter can exceed it. An unusually dense month that
+ * still can't be served whole is binary-split further at fetch time (see
+ * fetchWindow / splitWindow).
  */
 function monthSubRanges(from: string, to: string): { from: string; to: string }[] {
   const out: { from: string; to: string }[] = [];
@@ -67,6 +69,27 @@ function monthSubRanges(from: string, to: string): { from: string; to: string }[
     }
   }
   return out;
+}
+
+// If a single-window request 5xxs (the server refusing a too-large live fallback,
+// or a platform 503 on a dense window), the client binary-splits the window and
+// retries each half — down to single days if needed — so the data is always
+// fetched as COMPLETE slices, never a value-ranked sample. A month halves to a
+// single day in ≤5 levels; 6 is a safe backstop.
+const MAX_SPLIT_DEPTH = 6;
+
+/** Split a [from,to] day window (from < to, YYYY-MM-DD) into two disjoint halves. */
+function splitWindow(win: { from: string; to: string }): [{ from: string; to: string }, { from: string; to: string }] {
+  const DAY = 86_400_000;
+  const startMs = Date.parse(`${win.from}T00:00:00Z`);
+  const endMs = Date.parse(`${win.to}T00:00:00Z`);
+  const days = Math.round((endMs - startMs) / DAY); // ≥ 1 (caller guards from < to)
+  const midMs = startMs + Math.floor(days / 2) * DAY;
+  const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  return [
+    { from: win.from, to: day(midMs) },
+    { from: day(midMs + DAY), to: win.to },
+  ];
 }
 
 /** Parse a pivot CSV (safe columns: no embedded commas) into rows. */
@@ -92,7 +115,8 @@ function parsePivotCsv(csv: string): PivotRow[] {
  *  • Raw transactions — one row per sold lot (Excel-ready detail).
  *  • Pivot summary — GMV + lot count by period × site × type × market.
  * Wide ranges are split into per-month requests (each complete) and assembled,
- * so the export doesn't lose data. Date inputs are clamped to the data range.
+ * so the export doesn't lose data; a month too dense to serve whole is binary-split
+ * further and retried. Date inputs are clamped to the data range.
  */
 export function GmvExportModal({
   defaultFrom,
@@ -147,24 +171,51 @@ export function GmvExportModal({
 
     setBusy(mode);
     try {
-      const rawParts: string[] = []; // raw mode: per-month CSV text (date-disjoint)
+      const rawParts: string[] = []; // raw mode: per-window CSV text (date-disjoint)
       const pivotMap = new Map<string, PivotRow>(); // pivot mode: merged by period×site×type×market
-      let matched = 0;
-      let truncated = false;
+      const acc = { matched: 0, truncated: false };
 
-      for (let i = 0; i < subRanges.length; i++) {
-        const sr = subRanges[i];
-        if (subRanges.length > 1) setProgress(`Fetching ${sr.from.slice(0, 7)} — ${i + 1} of ${subRanges.length}…`);
-        const params = new URLSearchParams({ mode, from: sr.from, to: sr.to, site, type, market });
+      // Fetch one [from,to] window and accumulate it. On a splittable failure —
+      // the server's clean range_too_large 503, a raw platform 503/504, or a
+      // connection reset (the container killed mid-response on a too-heavy window) —
+      // binary-split the window and retry each half, so a dense window is fetched as
+      // smaller COMPLETE slices, never a sample. A 502 (genuine Maestro outage) is
+      // NOT splittable: smaller windows hit the same dead upstream, so fail fast
+      // instead of amplifying requests against it. Recurses to single days.
+      const fetchWindow = async (win: { from: string; to: string }, depth: number, label: string) => {
+        setProgress(depth === 0 ? label : `${label} — splitting dense window (${win.from}…${win.to})`);
+        const params = new URLSearchParams({ mode, from: win.from, to: win.to, site, type, market });
         if (category.trim()) params.set("category", category.trim());
         if (stateFilter.trim()) params.set("state", stateFilter.trim());
         if (minUsd.trim()) params.set("minUsd", minUsd.trim());
         if (maxUsd.trim()) params.set("maxUsd", maxUsd.trim());
         if (mode === "pivot") params.set("period", period);
 
-        const res = await fetch(`/api/export/gmv?${params.toString()}`);
+        const canSplit = win.from < win.to && depth < MAX_SPLIT_DEPTH;
+
+        let res: Response;
+        try {
+          res = await fetch(`/api/export/gmv?${params.toString()}`);
+        } catch (netErr) {
+          // Network error / connection reset (e.g. the container was killed
+          // mid-response on a too-heavy window) — retry smaller, like a 5xx.
+          if (canSplit) {
+            const [a, b] = splitWindow(win);
+            await fetchWindow(a, depth + 1, label);
+            await fetchWindow(b, depth + 1, label);
+            return;
+          }
+          throw netErr instanceof Error ? netErr : new Error(String(netErr));
+        }
+
         if (!res.ok) {
-          let msg = `Export failed for ${sr.from.slice(0, 7)} (${res.status})`;
+          if (res.status >= 500 && res.status !== 502 && canSplit) {
+            const [a, b] = splitWindow(win);
+            await fetchWindow(a, depth + 1, label);
+            await fetchWindow(b, depth + 1, label);
+            return;
+          }
+          let msg = `Export failed for ${win.from}${win.from === win.to ? "" : `…${win.to}`} (${res.status})`;
           try {
             const j = await res.json();
             if (j?.error) msg = j.error;
@@ -173,15 +224,15 @@ export function GmvExportModal({
           }
           throw new Error(msg);
         }
-        matched += Number(res.headers.get("X-Export-Matched") ?? 0);
-        if (res.headers.get("X-Export-Truncated") === "true") truncated = true;
+        acc.matched += Number(res.headers.get("X-Export-Matched") ?? 0);
+        if (res.headers.get("X-Export-Truncated") === "true") acc.truncated = true;
 
         const csv = await res.text();
         if (mode === "raw") {
-          // Rows are date-disjoint across months → keep header from the first only.
+          // Windows are date-disjoint → keep the header from the first part only.
           rawParts.push(rawParts.length === 0 ? csv : csv.split("\n").slice(1).join("\n"));
         } else {
-          // A period (quarter/week) can straddle month boundaries, so merge by key.
+          // A period (quarter/week) can straddle window boundaries, so merge by key.
           for (const r of parsePivotCsv(csv)) {
             const key = `${r.period}|${r.site}|${r.type}|${r.market}`;
             const cur = pivotMap.get(key);
@@ -193,6 +244,13 @@ export function GmvExportModal({
             }
           }
         }
+      };
+
+      for (let i = 0; i < subRanges.length; i++) {
+        const sr = subRanges[i];
+        const label =
+          subRanges.length > 1 ? `Fetching ${sr.from.slice(0, 7)} — ${i + 1} of ${subRanges.length}…` : "Fetching…";
+        await fetchWindow(sr, 0, label);
       }
 
       let outCsv: string;
@@ -219,11 +277,11 @@ export function GmvExportModal({
       setProgress(null);
       const span = `${subRanges.length} month${subRanges.length === 1 ? "" : "s"}`;
       setNotice(
-        matched === 0
+        acc.matched === 0
           ? "No lots matched. Widen the date range or relax filters."
-          : truncated
-            ? `Exported ${matched.toLocaleString()} lots across ${span}. Some chunks hit the safety cap — coverage may be slightly partial for an unusually dense month.`
-            : `Exported ${matched.toLocaleString()} lots — complete coverage across ${span}.`,
+          : acc.truncated
+            ? `Exported ${acc.matched.toLocaleString()} lots across ${span}. Some chunks hit the safety cap — coverage may be slightly partial for an unusually dense month.`
+            : `Exported ${acc.matched.toLocaleString()} lots — complete coverage across ${span}.`,
       );
     } catch (e) {
       setProgress(null);

@@ -3,6 +3,7 @@ import {
   aggregateExport,
   applyExportFilters,
   fetchSoldRange,
+  RangeTooLargeError,
   type ExportFilters,
   type ExportMarket,
   type ExportPeriod,
@@ -28,7 +29,20 @@ type SoldSource = {
   source: "sold_lots" | "maestro";
 };
 
-const STORE_TIMEOUT_MS = Number(process.env.STORE_READ_TIMEOUT_MS) || 25000;
+// The Azure SQL store (provisioned S2, always-on — no serverless auto-pause) is
+// the correct, COMPLETE source for any covered range, so we wait for it rather
+// than bail early to the lossy live-Maestro fallback. 50s comfortably covers a
+// dense single month's raw read on the S2 tier while staying under the ingress
+// limit; it only guards a genuinely stuck connection. (Env-overridable.)
+const STORE_TIMEOUT_MS = Number(process.env.STORE_READ_TIMEOUT_MS) || 50000;
+
+// A single export request must materialize its whole result on the small app
+// container. If a live-fallback range would exceed this many lots, fetchSoldRange
+// aborts with RangeTooLargeError (a clean, retryable 503) instead of attempting a
+// doomed full pull; the modal then re-requests the range in smaller COMPLETE
+// slices. Set well above a normal fallback (the last few uncovered days) but below
+// a dense month (~150k lots). (Env-overridable.)
+const LIVE_FALLBACK_MAX_LOTS = Number(process.env.EXPORT_LIVE_MAX_LOTS) || 60000;
 
 function withTimeout<T>(p: Promise<T>, label: string): Promise<T> {
   return Promise.race([
@@ -40,13 +54,18 @@ function withTimeout<T>(p: Promise<T>, label: string): Promise<T> {
 // Prefer the durable Azure store, but ONLY for a range it FULLY covers (every ET
 // day present) — otherwise a leading/interior gap would be served as a complete $0
 // result. Fall back to the live Maestro feed when the store is unconfigured, doesn't
-// fully cover the range, or is cold/slow (times out on a paused serverless DB).
+// fully cover the range, or is unreachable/slow within the timeout.
 async function loadSoldRows(from: string, to: string, filters: ExportFilters): Promise<SoldSource> {
   if (isAzureSqlConfigured()) {
     try {
-      if (await withTimeout(storeCoversRange(from, to), "store coverage timeout")) {
-        const rows = await withTimeout(
-          readSoldLots(from, to, {
+      // ONE shared timeout budget for the whole store attempt (coverage check +
+      // read), not one per call: two sequential withTimeout guards would let a
+      // stalled DB connection burn 2×STORE_TIMEOUT_MS and blow the request budget.
+      // Returns null when the range isn't fully covered → fall through to Maestro.
+      const rows = await withTimeout(
+        (async () => {
+          if (!(await storeCoversRange(from, to))) return null;
+          return readSoldLots(from, to, {
             site: filters.site === "all" ? undefined : filters.site,
             sellerType: filters.type === "government" || filters.type === "retail" ? filters.type : undefined,
             govLevel: filters.type === "federal" || filters.type === "state" || filters.type === "local" ? filters.type : undefined,
@@ -56,16 +75,19 @@ async function loadSoldRows(from: string, to: string, filters: ExportFilters): P
             country: filters.country,
             minUsd: filters.minUsd,
             maxUsd: filters.maxUsd,
-          }),
-          "store read timeout",
-        );
+          });
+        })(),
+        "store timeout",
+      );
+      if (rows !== null) {
         return { rows, total_in_range: rows.length, fetched: rows.length, truncated: false, source: "sold_lots" };
       }
+      // store doesn't fully cover the range → fall through to Maestro
     } catch {
       // store unreachable / slow / partial → fall through to Maestro
     }
   }
-  const f = await fetchSoldRange(from, to);
+  const f = await fetchSoldRange(from, to, { maxRows: LIVE_FALLBACK_MAX_LOTS });
   return { rows: f.rows, total_in_range: f.total_in_range, fetched: f.fetched, truncated: f.truncated, source: "maestro" };
 }
 
@@ -124,6 +146,12 @@ export async function GET(request: Request) {
   try {
     fetched = await loadSoldRows(from, to, filters);
   } catch (e) {
+    // A range too large to fetch live in one request → clean, retryable 503 so the
+    // client re-requests it as smaller complete slices (never a sample). Anything
+    // else (e.g. a Maestro outage) is a 502.
+    if (e instanceof RangeTooLargeError) {
+      return NextResponse.json({ error: e.message, code: e.code }, { status: 503 });
+    }
     return NextResponse.json(
       { error: e instanceof Error ? e.message : String(e) },
       { status: 502 },
