@@ -478,10 +478,36 @@ export type SoldBucketDailyRow = {
 };
 
 // Take-rate buckets: economically distinct fee regimes the QTD page fits revenue
-// coefficients against. Pattern lists (case-insensitive LIKE) rather than exact
-// category names — the taxonomy has ~190 categories with a long tail of truck/
-// equipment variants. Precedence: site first (GI/AD are their own businesses),
-// then vehicles, then heavy equipment, then the government/retail remainder.
+// coefficients against. Classification is CODE-FIRST: `category_code` is the
+// durable key (a stable alphanumeric taxonomy — immune to description renames),
+// with the description LIKE patterns as the fallback for NULL codes (rows
+// ingested before the Aug-2025 enrichment) and codes not yet in the lists —
+// which preserves the pre-code behavior for exactly those rows. Precedence:
+// site first (GI/AD are their own businesses), then vehicles, then heavy
+// equipment, then the government/retail remainder.
+//
+// Code lists derived 2026-07-16 from the GMV-dominant description of each of
+// the 883 codes observed in lqdt.sold_lots, classified with the LIKE patterns
+// below. To regenerate after new codes appear: aggregate distinct
+// (category_code, category) by SUM(sale_amount_usd), keep each code's top
+// description, classify it with VEH_LIKE/HEAVY_LIKE, and refresh these lists.
+const VEH_CODES = [
+  "09", "131", "236", "25J", "25P", "36H", "385", "641", "642", "643", "644", "645", "646", "647",
+  "648", "649", "64A", "64B", "64C", "64D", "64E", "64F", "64G", "64H", "64I", "64J", "64K", "64L",
+  "64M", "94", "94A", "94B", "94C", "94D", "94E", "94F", "94G", "94H", "94J", "94K", "94L", "94M",
+  "94O", "94P", "94Q", "94R", "94S", "95K", "95M", "95N", "95P", "95R", "O91", "O92", "O93", "O94",
+  "O95", "O96", "O97", "O98", "O99",
+];
+const HEAVY_CODES = [
+  "05", "100", "112", "113", "114", "120", "141", "142", "152", "154", "17", "231", "233", "234",
+  "249", "24B", "264", "277", "28C", "28H", "28I", "28O", "28P", "28R", "316", "319", "31B", "31L",
+  "325", "33E", "340", "341", "345", "347", "34H", "36", "36A", "36B", "36C", "36D", "36E", "36F",
+  "36G", "36I", "36J", "37D", "37E", "37F", "37G", "37H", "37I", "383", "386", "387", "388", "389",
+  "390", "392", "401", "402", "403", "406", "407", "410", "414", "415", "418", "430", "431", "432",
+  "437", "442", "454", "457", "459", "461", "462", "464", "465", "466", "467", "469", "470", "473",
+  "477", "478", "487", "495", "496", "499", "51", "511", "512", "528", "529", "577", "582", "58L",
+  "65", "651", "71", "79", "94N", "95E", "967", "982",
+];
 const VEH_LIKE = [
   "%truck%", "%bus%", "%vehicle%", "suv", "automobiles/cars", "vans", "step vans",
   "ambulance/rescue", "motorcycles", "cab chassis", "classic/custom cars",
@@ -497,6 +523,7 @@ const HEAVY_LIKE = [
 ];
 const likeChain = (patterns: string[]) =>
   patterns.map((p) => `LOWER(COALESCE(category,'')) LIKE '${p}'`).join(" OR ");
+const codeList = (codes: string[]) => codes.map((c) => `'${c}'`).join(",");
 
 /**
  * Per-day realized GMV/lots/bids by take-rate bucket — honest scrape axes, NOT
@@ -516,13 +543,22 @@ const likeChain = (patterns: string[]) =>
  * at ~2.1B and a quarter already carries ~2.2M bids.
  */
 export async function getSoldDailyByBucket(fromEt: string, toEt: string): Promise<SoldBucketDailyRow[]> {
-  const highAsp = `(${likeChain(VEH_LIKE)}) OR (${likeChain(HEAVY_LIKE)})`;
-  const bucket =
+  // Family: category_code first (durable), description patterns as the fallback
+  // for NULL/unlisted codes. CROSS APPLY defines each expression once so the big
+  // IN-lists aren't repeated through the bucket CASE and GROUP BY.
+  const familyExpr =
+    "CASE " +
+    `WHEN category_code IN (${codeList(VEH_CODES)}) THEN 'veh' ` +
+    `WHEN category_code IN (${codeList(HEAVY_CODES)}) THEN 'heavy' ` +
+    `WHEN (${likeChain(VEH_LIKE)}) THEN 'veh' ` +
+    `WHEN (${likeChain(HEAVY_LIKE)}) THEN 'heavy' ` +
+    "ELSE 'other' END";
+  const bucketExpr =
     "CASE WHEN site = 'GI' THEN 'intl' " +
     "WHEN site = 'AD' THEN 'ad_dtc' " +
-    `WHEN seller_type = 'government' THEN (CASE WHEN ${highAsp} THEN 'gov_veh' ELSE 'gov_other' END) ` +
-    `WHEN (${likeChain(VEH_LIKE)}) THEN 'ret_veh' ` +
-    `WHEN (${likeChain(HEAVY_LIKE)}) THEN 'heavy' ` +
+    "WHEN seller_type = 'government' THEN (CASE WHEN f.family IN ('veh','heavy') THEN 'gov_veh' ELSE 'gov_other' END) " +
+    "WHEN f.family = 'veh' THEN 'ret_veh' " +
+    "WHEN f.family = 'heavy' THEN 'heavy' " +
     "ELSE 'ret_other' END";
   const pool = await getPool();
   const r = await pool
@@ -530,12 +566,15 @@ export async function getSoldDailyByBucket(fromEt: string, toEt: string): Promis
     .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
     .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
     .query(
-      `SELECT CONVERT(char(10), close_date_et, 23) AS d, ${bucket} AS bkt, ` +
+      "SELECT CONVERT(char(10), close_date_et, 23) AS d, b.bucket AS bkt, " +
         "COALESCE(SUM(sale_amount_usd),0) AS gmv, " +
         "SUM(CASE WHEN sale_amount_usd > 0 THEN 1 ELSE 0 END) AS lots, " +
         "COALESCE(SUM(CAST(bid_count AS bigint)),0) AS bids " +
-        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to " +
-        `GROUP BY close_date_et, ${bucket}`,
+        "FROM lqdt.sold_lots " +
+        `CROSS APPLY (SELECT ${familyExpr} AS family) AS f ` +
+        `CROSS APPLY (SELECT ${bucketExpr} AS bucket) AS b ` +
+        "WHERE close_date_et BETWEEN @from AND @to " +
+        "GROUP BY close_date_et, b.bucket",
     );
   const valid = new Set<string>(["gov_veh", "gov_other", "ret_veh", "ret_other", "heavy", "intl", "ad_dtc"]);
   return r.recordset.map((x) => ({
