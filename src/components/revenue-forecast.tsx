@@ -73,24 +73,6 @@ type Forecast = {
   reported_gmv_by_quarter?: { quarter: string; reported_gmv_usd: number }[];
 };
 
-type StockPoint = {
-  date: string;
-  close: number;
-};
-
-type StockPriceResponse = {
-  ticker: string;
-  prices: StockPoint[];
-  error?: string;
-};
-
-type StockState = {
-  ticker: string;
-  prices: StockPoint[];
-  error: string | null;
-  rangeKey: string | null;
-};
-
 type SaleRow = {
   platform: string;
   asset_id: string;
@@ -175,7 +157,6 @@ const SALES_MARKET_OPTIONS: { value: SalesMarketFilter; label: string }[] = [
 const CHART_MARKET_OPTIONS = SALES_MARKET_OPTIONS;
 
 const DEFAULT_CHART_MARKET: SalesMarketFilter = "all";
-const STOCK_TICKER = "LQDT";
 
 // Source = true marketplace. Selecting a specific source shows that source's
 // realized GMV/revenue; it's mutually exclusive with the market split (the
@@ -707,9 +688,6 @@ function DailyForecastChart({
   market,
   source,
   granularity,
-  showStock,
-  stockByDate,
-  stockTicker,
   todayKey,
   isCurrent,
   onSelectDate,
@@ -720,9 +698,6 @@ function DailyForecastChart({
   market: SalesMarketFilter;
   source: SourceFilter;
   granularity: Granularity;
-  showStock: boolean;
-  stockByDate: Record<string, number>;
-  stockTicker: string;
   todayKey: string;
   isCurrent: boolean;
   onSelectDate: (date: string) => void;
@@ -751,12 +726,10 @@ function DailyForecastChart({
       date: key,
       Realized: d ? realizedValue(d, metric, market, source) : 0,
       Projected: showProjected && d ? (metric === "gmv" ? d.projected_gmv_usd : d.projected_revenue_usd) : 0,
-      Stock: showStock && d ? stockByDate[key] ?? null : null,
       Reported: showReported ? reported.get(key) ?? null : null,
     };
   });
   const hasAny = data.some((d) => d.Realized > 0 || d.Projected > 0 || (d.Reported ?? 0) > 0);
-  const hasStock = showStock && data.some((d) => d.Stock != null);
   // Thin quarter ticks so the two-line CQ/FQ labels don't overlap (~14 max).
   const quarterInterval = Math.max(0, Math.ceil(data.length / 14) - 1);
   if (!hasAny) {
@@ -772,7 +745,7 @@ function DailyForecastChart({
 
     const bounds = event.currentTarget.getBoundingClientRect();
     const plotLeftOffset = 80;
-    const plotRightOffset = hasStock ? 72 : 16;
+    const plotRightOffset = 16;
     const plotWidth = Math.max(1, bounds.width - plotLeftOffset - plotRightOffset);
     const clickX = event.clientX - bounds.left - plotLeftOffset;
     const ratio = Math.max(0, Math.min(1, clickX / plotWidth));
@@ -788,7 +761,7 @@ function DailyForecastChart({
       aria-label="Open sales for selected daily GMV date"
     >
       <ResponsiveContainer width="100%" height={340}>
-        <ComposedChart data={data} margin={{ top: 10, right: hasStock ? 22 : 16, bottom: 5, left: 20 }}>
+        <ComposedChart data={data} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
           <CartesianGrid strokeDasharray="3 3" />
           {isQuarter ? (
             <XAxis dataKey="date" tick={<QuarterAxisTick />} height={40} interval={quarterInterval} />
@@ -800,23 +773,7 @@ function DailyForecastChart({
             tickFormatter={(v: number) => (v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : (v / 1000).toFixed(0) + "k")}
             tick={{ fontSize: 11 }}
           />
-          {hasStock && (
-            <YAxis
-              yAxisId="stock"
-              orientation="right"
-              width={50}
-              tick={{ fontSize: 11 }}
-              tickFormatter={(v: number) => `$${v.toFixed(0)}`}
-            />
-          )}
-          <Tooltip
-            formatter={(v, name) => {
-              if (name === `${stockTicker} Close`) {
-                return typeof v === "number" ? `$${v.toFixed(2)}` : v;
-              }
-              return typeof v === "number" ? "$" + v.toLocaleString() : v;
-            }}
-          />
+          <Tooltip formatter={(v) => (typeof v === "number" ? "$" + v.toLocaleString() : v)} />
           <Legend />
           {isCurrent && granularity === "day" && (
             <ReferenceLine x={todayLabel} stroke="#9ca3af" strokeDasharray="4 2" label={{ value: "today", position: "top", fontSize: 10, fill: "#6b7280" }} />
@@ -832,18 +789,6 @@ function DailyForecastChart({
               stroke="#15803d"
               strokeWidth={2}
               dot={{ r: 2 }}
-              connectNulls
-            />
-          )}
-          {hasStock && (
-            <Line
-              yAxisId="stock"
-              type="monotone"
-              dataKey="Stock"
-              name={`${stockTicker} Close`}
-              stroke="#dc2626"
-              strokeWidth={2}
-              dot={false}
               connectNulls
             />
           )}
@@ -1168,13 +1113,6 @@ export function RevenueForecast() {
   const [showExport, setShowExport] = useState(false);
   const [qtdDate, setQtdDate] = useState("");
   const [showCategory, setShowCategory] = useState(false);
-  const [showStockPrice, setShowStockPrice] = useState(false);
-  const [stockState, setStockState] = useState<StockState>({
-    ticker: STOCK_TICKER,
-    prices: [],
-    error: null,
-    rangeKey: null,
-  });
   const [selectedSalesDate, setSelectedSalesDate] = useState<string | null>(null);
   const [state, setState] = useState<FetchState>({ forecast: null, error: null, done: false });
   // Set the moment a quarter is picked (a historical quarter isn't materialized,
@@ -1209,68 +1147,6 @@ export function RevenueForecast() {
       cancelled = true;
     };
   }, [requestedTakeRate, quarter]);
-
-  const stockDateRange = useMemo(() => {
-    const daily = state.forecast?.daily ?? [];
-    return {
-      from: daily[0]?.date ?? "",
-      to: daily[daily.length - 1]?.date ?? "",
-    };
-  }, [state.forecast]);
-
-  useEffect(() => {
-    if (!showStockPrice || !stockDateRange.from || !stockDateRange.to) return;
-
-    let cancelled = false;
-    const rangeKey = `${stockDateRange.from}:${stockDateRange.to}`;
-    const params = new URLSearchParams({
-      ticker: STOCK_TICKER,
-      from: stockDateRange.from,
-      to: stockDateRange.to,
-    });
-
-    fetch(`/api/stock-prices?${params.toString()}`)
-      .then(async (response) => {
-        const data = (await response.json()) as StockPriceResponse;
-        if (!response.ok) {
-          throw new Error(data.error || `Stock price request failed (${response.status})`);
-        }
-        return data;
-      })
-      .then((data) => {
-        if (cancelled) return;
-        setStockState({
-          ticker: data.ticker || STOCK_TICKER,
-          prices: data.prices ?? [],
-          error: null,
-          rangeKey,
-        });
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        setStockState((prev) => ({
-          ...prev,
-          error: e instanceof Error ? e.message : String(e),
-          rangeKey,
-        }));
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [showStockPrice, stockDateRange.from, stockDateRange.to]);
-
-  const stockRangeKey = stockDateRange.from && stockDateRange.to ? `${stockDateRange.from}:${stockDateRange.to}` : null;
-  const stockError = stockState.rangeKey === stockRangeKey ? stockState.error : null;
-  const stockLoading = showStockPrice && Boolean(stockRangeKey) && stockState.rangeKey !== stockRangeKey;
-
-  const stockByDate = useMemo(() => {
-    const byDate: Record<string, number> = {};
-    for (const price of stockState.prices) {
-      byDate[price.date] = price.close;
-    }
-    return byDate;
-  }, [stockState.prices]);
 
   const { forecast, error, done } = state;
   if (!done && !forecast) return <p className="text-gray-500 text-sm">Loading forecast...</p>;
@@ -1482,33 +1358,14 @@ export function RevenueForecast() {
                 </button>
               ))}
             </div>
-            <button
-              onClick={() => setShowStockPrice((current) => !current)}
-              aria-pressed={showStockPrice}
-              disabled={granularity !== "day"}
-              title={granularity !== "day" ? "LQDT price overlay is available in Day view" : undefined}
-              className={`px-2 py-0.5 text-xs rounded border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                showStockPrice && granularity === "day"
-                  ? "bg-red-600 text-white border-red-600"
-                  : "bg-white text-gray-600 border-gray-300 hover:border-gray-400"
-              }`}
-            >
-              {stockLoading ? "LQDT..." : "LQDT Price"}
-            </button>
           </div>
         </div>
-        {showStockPrice && stockError && (
-          <p className="mb-2 text-xs text-red-600">LQDT price unavailable.</p>
-        )}
         <DailyForecastChart
           daily={chartDaily}
           metric={chartMetric}
           market={chartMarket}
           source={chartSource}
           granularity={granularity}
-          showStock={showStockPrice && !stockError && granularity === "day"}
-          stockByDate={stockByDate}
-          stockTicker={stockState.ticker}
           todayKey={todayKey}
           isCurrent={forecast.is_current}
           onSelectDate={setSelectedSalesDate}
