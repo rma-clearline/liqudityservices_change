@@ -11,7 +11,7 @@ import {
   type ExportType,
   type SoldExportRow,
 } from "@/lib/sold-export";
-import { isAzureSqlConfigured, readSoldLots, storeCoversRange } from "@/lib/azure-sql";
+import { countSoldLots, isAzureSqlConfigured, readSoldLots, storeCoversRange } from "@/lib/azure-sql";
 import { toCsv } from "@/lib/format";
 import { siteLabel } from "@/lib/sites";
 import { etTodayKey, quarterBounds } from "@/lib/time";
@@ -44,6 +44,22 @@ const STORE_TIMEOUT_MS = Number(process.env.STORE_READ_TIMEOUT_MS) || 50000;
 // a dense month (~150k lots). (Env-overridable.)
 const LIVE_FALLBACK_MAX_LOTS = Number(process.env.EXPORT_LIVE_MAX_LOTS) || 60000;
 
+// Same guard for the STORE path: a covered dense range (a full dense month is
+// ~70k lots; the API accepts up to 366 days ≈ 830k) would be materialized as wide
+// JS rows + one giant CSV string and can OOM the container — the platform then
+// kills the replica and 503s everything, including the retries. countSoldLots
+// (an indexed COUNT, ~1s) refuses it cheaply BEFORE the read, as a clean
+// range_too_large 503 the modal answers by splitting. Higher than the live cap:
+// a store read is one query, not an 800-page live pull, so memory is the only
+// constraint. Default sized for the 1Gi container. (Env-overridable.)
+const STORE_MAX_LOTS = Number(process.env.EXPORT_STORE_MAX_LOTS) || 120000;
+
+// KNOWN LIMITATION: this races but does NOT cancel the losing promise — a store
+// read that exceeds the budget keeps buffering rows in the background (until the
+// driver's 120s requestTimeout) while the caller moves on to the Maestro fallback.
+// Cancelling would require plumbing mssql request.cancel() through readSoldLots;
+// with the count guard bounding reads and 1Gi of memory, the residual overlap
+// window isn't worth that complexity today.
 function withTimeout<T>(p: Promise<T>, label: string): Promise<T> {
   return Promise.race([
     p,
@@ -57,25 +73,30 @@ function withTimeout<T>(p: Promise<T>, label: string): Promise<T> {
 // fully cover the range, or is unreachable/slow within the timeout.
 async function loadSoldRows(from: string, to: string, filters: ExportFilters): Promise<SoldSource> {
   if (isAzureSqlConfigured()) {
+    const readFilters = {
+      site: filters.site === "all" ? undefined : filters.site,
+      sellerType: filters.type === "government" || filters.type === "retail" ? filters.type : undefined,
+      govLevel: filters.type === "federal" || filters.type === "state" || filters.type === "local" ? filters.type : undefined,
+      market: filters.market === "all" ? undefined : filters.market,
+      category: filters.category,
+      state: filters.state,
+      country: filters.country,
+      minUsd: filters.minUsd,
+      maxUsd: filters.maxUsd,
+    };
     try {
       // ONE shared timeout budget for the whole store attempt (coverage check +
-      // read), not one per call: two sequential withTimeout guards would let a
-      // stalled DB connection burn 2×STORE_TIMEOUT_MS and blow the request budget.
-      // Returns null when the range isn't fully covered → fall through to Maestro.
+      // count guard + read), not one per call: sequential withTimeout guards would
+      // let a stalled DB connection burn several×STORE_TIMEOUT_MS and blow the
+      // request budget. Returns null when the range isn't fully covered → fall
+      // through to Maestro.
       const rows = await withTimeout(
         (async () => {
           if (!(await storeCoversRange(from, to))) return null;
-          return readSoldLots(from, to, {
-            site: filters.site === "all" ? undefined : filters.site,
-            sellerType: filters.type === "government" || filters.type === "retail" ? filters.type : undefined,
-            govLevel: filters.type === "federal" || filters.type === "state" || filters.type === "local" ? filters.type : undefined,
-            market: filters.market === "all" ? undefined : filters.market,
-            category: filters.category,
-            state: filters.state,
-            country: filters.country,
-            minUsd: filters.minUsd,
-            maxUsd: filters.maxUsd,
-          });
+          // Refuse a too-large read BEFORE materializing it (see STORE_MAX_LOTS).
+          const lotCount = await countSoldLots(from, to, readFilters);
+          if (lotCount > STORE_MAX_LOTS) throw new RangeTooLargeError(from, to, lotCount, STORE_MAX_LOTS);
+          return readSoldLots(from, to, readFilters);
         })(),
         "store timeout",
       );
@@ -83,7 +104,10 @@ async function loadSoldRows(from: string, to: string, filters: ExportFilters): P
         return { rows, total_in_range: rows.length, fetched: rows.length, truncated: false, source: "sold_lots" };
       }
       // store doesn't fully cover the range → fall through to Maestro
-    } catch {
+    } catch (e) {
+      // Too-large means "split the window" — Maestro can't serve it either (the
+      // live path would just refuse it again after wasted probes), so surface it.
+      if (e instanceof RangeTooLargeError) throw e;
       // store unreachable / slow / partial → fall through to Maestro
     }
   }

@@ -159,11 +159,12 @@ function chunkRange(from: string, to: string): Chunk[] {
 const rangeCache = new Map<string, { at: number; val: SoldExportFetch }>();
 
 /**
- * Thrown by fetchSoldRange when a live (Maestro) fetch is asked for a range that
- * holds more lots than `maxRows` — i.e. too large to materialize safely in one
- * request. The export route maps this to a clean, retryable 503 so the client can
- * re-request the range as smaller COMPLETE slices instead of the container dying
- * and the platform emitting a raw 503.
+ * Thrown when a sold-lot fetch — the live Maestro pull (fetchSoldRange's maxRows
+ * preflight) OR the Azure-store read (the export route's countSoldLots guard) —
+ * is asked for a range holding more lots than one request can safely materialize
+ * on the small app container. The export route maps this to a clean, retryable
+ * 503 so the client re-requests the range as smaller COMPLETE slices instead of
+ * the container dying and the platform emitting a raw 503.
  */
 export class RangeTooLargeError extends Error {
   readonly code = "range_too_large" as const;
@@ -173,9 +174,12 @@ export class RangeTooLargeError extends Error {
     readonly totalInRange: number,
     readonly maxRows: number,
   ) {
+    // NOTE: the modal surfaces this text VERBATIM as the terminal error when the
+    // window can't be split further — don't promise a retry here; the client owns
+    // (and reports) its own retry/split behavior.
     super(
-      `Live fetch for ${from}..${to} would return ${totalInRange.toLocaleString()} lots ` +
-        `(over the ${maxRows.toLocaleString()} single-request cap); retrying in smaller windows.`,
+      `Range ${from}..${to} holds ${totalInRange.toLocaleString()} lots — more than the ` +
+        `${maxRows.toLocaleString()}-lot single-request cap. Narrow the date range or filters.`,
     );
     this.name = "RangeTooLargeError";
   }

@@ -78,6 +78,8 @@ function monthSubRanges(from: string, to: string): { from: string; to: string }[
 // single day in ≤5 levels; 6 is a safe backstop.
 const MAX_SPLIT_DEPTH = 6;
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 /** Split a [from,to] day window (from < to, YYYY-MM-DD) into two disjoint halves. */
 function splitWindow(win: { from: string; to: string }): [{ from: string; to: string }, { from: string; to: string }] {
   const DAY = 86_400_000;
@@ -175,14 +177,22 @@ export function GmvExportModal({
       const pivotMap = new Map<string, PivotRow>(); // pivot mode: merged by period×site×type×market
       const acc = { matched: 0, truncated: false };
 
-      // Fetch one [from,to] window and accumulate it. On a splittable failure —
-      // the server's clean range_too_large 503, a raw platform 503/504, or a
-      // connection reset (the container killed mid-response on a too-heavy window) —
-      // binary-split the window and retry each half, so a dense window is fetched as
-      // smaller COMPLETE slices, never a sample. A 502 (genuine Maestro outage) is
-      // NOT splittable: smaller windows hit the same dead upstream, so fail fast
-      // instead of amplifying requests against it. Recurses to single days.
-      const fetchWindow = async (win: { from: string; to: string }, depth: number, label: string) => {
+      // Same-window retries for the whole export run (all windows share it, so a
+      // hard-down backend can't stall the export for minutes across many leaves).
+      let retryBudget = 6;
+
+      // Fetch one [from,to] window and accumulate it. Failure handling, in order:
+      //  • Server's deliberate range_too_large 503 (JSON code) → the window IS too
+      //    dense — binary-split immediately and fetch each half as a COMPLETE
+      //    slice (never a value-ranked sample).
+      //  • Raw platform 5xx / connection reset → usually the replica restarting
+      //    (e.g. after a heavy request killed it) — retry the SAME window once
+      //    after a short pause, then split, then surface.
+      //  • 502 (genuine Maestro outage) → fail fast: smaller windows hit the same
+      //    dead upstream, so splitting/retrying just amplifies requests against it.
+      // Recurses down to single-day windows.
+      const RETRY_DELAY_MS = 3000;
+      const fetchWindow = async (win: { from: string; to: string }, depth: number, label: string, attempt = 0): Promise<void> => {
         setProgress(depth === 0 ? label : `${label} — splitting dense window (${win.from}…${win.to})`);
         const params = new URLSearchParams({ mode, from: win.from, to: win.to, site, type, market });
         if (category.trim()) params.set("category", category.trim());
@@ -192,42 +202,71 @@ export function GmvExportModal({
         if (mode === "pivot") params.set("period", period);
 
         const canSplit = win.from < win.to && depth < MAX_SPLIT_DEPTH;
+        const winLabel = `${win.from}${win.from === win.to ? "" : `…${win.to}`}`;
+        const split = async () => {
+          const [a, b] = splitWindow(win);
+          await fetchWindow(a, depth + 1, label);
+          await fetchWindow(b, depth + 1, label);
+        };
+        const retrySameWindow = async () => {
+          retryBudget -= 1;
+          setProgress(`${label} — server hiccup, retrying ${winLabel} shortly…`);
+          await sleep(RETRY_DELAY_MS);
+          return fetchWindow(win, depth, label, attempt + 1);
+        };
 
         let res: Response;
         try {
           res = await fetch(`/api/export/gmv?${params.toString()}`);
         } catch (netErr) {
-          // Network error / connection reset (e.g. the container was killed
-          // mid-response on a too-heavy window) — retry smaller, like a 5xx.
-          if (canSplit) {
-            const [a, b] = splitWindow(win);
-            await fetchWindow(a, depth + 1, label);
-            await fetchWindow(b, depth + 1, label);
-            return;
-          }
+          // Connection reset / network error — often the replica restarting after
+          // being killed mid-response. Wait briefly and retry the same window,
+          // then fall back to splitting it.
+          if (attempt === 0 && retryBudget > 0) return retrySameWindow();
+          if (canSplit) return split();
           throw netErr instanceof Error ? netErr : new Error(String(netErr));
         }
 
         if (!res.ok) {
-          if (res.status >= 500 && res.status !== 502 && canSplit) {
-            const [a, b] = splitWindow(win);
-            await fetchWindow(a, depth + 1, label);
-            await fetchWindow(b, depth + 1, label);
-            return;
-          }
-          let msg = `Export failed for ${win.from}${win.from === win.to ? "" : `…${win.to}`} (${res.status})`;
+          // Read the error body once: the server's deliberate refuse is JSON with
+          // code="range_too_large"; platform errors are typically non-JSON.
+          let errBody: { error?: string; code?: string } | null = null;
           try {
-            const j = await res.json();
-            if (j?.error) msg = j.error;
+            errBody = await res.json();
           } catch {
-            /* non-JSON error body */
+            /* non-JSON (platform) error body */
           }
-          throw new Error(msg);
+
+          if (res.status >= 500 && res.status !== 502) {
+            if (errBody?.code === "range_too_large") {
+              // Deterministic: the window is too dense — retrying can't help.
+              if (canSplit) return split();
+            } else {
+              // Raw platform 5xx — likely a restarting replica: retry, then split.
+              if (attempt === 0 && retryBudget > 0) return retrySameWindow();
+              if (canSplit) return split();
+            }
+          }
+          throw new Error(errBody?.error || `Export failed for ${winLabel} (${res.status})`);
         }
+
+        // fetch() resolves once HEADERS arrive, so a replica killed mid-CSV-transfer
+        // surfaces as a rejection of the BODY read, not of fetch() — guard it with
+        // the same retry→split→surface handling as a pre-header reset.
+        let csv: string;
+        try {
+          csv = await res.text();
+        } catch (bodyErr) {
+          if (attempt === 0 && retryBudget > 0) return retrySameWindow();
+          if (canSplit) return split();
+          throw bodyErr instanceof Error ? bodyErr : new Error(String(bodyErr));
+        }
+
+        // Accumulate only after the body is FULLY read — a window retried after a
+        // mid-body failure must not double-count its headers.
         acc.matched += Number(res.headers.get("X-Export-Matched") ?? 0);
         if (res.headers.get("X-Export-Truncated") === "true") acc.truncated = true;
 
-        const csv = await res.text();
         if (mode === "raw") {
           // Windows are date-disjoint → keep the header from the first part only.
           rawParts.push(rawParts.length === 0 ? csv : csv.split("\n").slice(1).join("\n"));

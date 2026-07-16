@@ -718,12 +718,15 @@ export type SoldLotReadFilters = {
   maxUsd?: number;
 };
 
-export async function readSoldLots(
+/** Configure a request with the shared sold-lot WHERE clause (range + filters).
+ *  A mssql Request runs one query, so callers needing a count AND a read build
+ *  two requests via this helper — keeping both queries filter-identical. */
+function buildSoldLotRequest(
+  pool: sql.ConnectionPool,
   fromEt: string,
   toEt: string,
-  filters: SoldLotReadFilters = {},
-): Promise<SoldExportRow[]> {
-  const pool = await getPool();
+  filters: SoldLotReadFilters,
+): { request: sql.Request; where: string } {
   const request = pool
     .request()
     .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
@@ -758,13 +761,40 @@ export async function readSoldLots(
     request.input("maxUsd", sql.Decimal(19, 4), filters.maxUsd);
     where.push("sale_amount_usd <= @maxUsd");
   }
+  return { request, where: where.join(" AND ") };
+}
+
+/**
+ * Count the lots a readSoldLots call would materialize — same range + filters,
+ * but an indexed COUNT instead of the row pull. Lets the export route refuse a
+ * too-large read cheaply (~1s) BEFORE materializing rows that would exhaust the
+ * small app container's memory.
+ */
+export async function countSoldLots(
+  fromEt: string,
+  toEt: string,
+  filters: SoldLotReadFilters = {},
+): Promise<number> {
+  const pool = await getPool();
+  const { request, where } = buildSoldLotRequest(pool, fromEt, toEt, filters);
+  const r = await request.query(`SELECT COUNT(*) AS n FROM lqdt.sold_lots WHERE ${where}`);
+  return Number(r.recordset[0]?.n ?? 0);
+}
+
+export async function readSoldLots(
+  fromEt: string,
+  toEt: string,
+  filters: SoldLotReadFilters = {},
+): Promise<SoldExportRow[]> {
+  const pool = await getPool();
+  const { request, where } = buildSoldLotRequest(pool, fromEt, toEt, filters);
   const r = await request.query(
       "SELECT asset_id, auction_id, account_id, site, platform, seller, seller_type, gov_level, " +
         "title, category, country, state, market, currency_code, sale_amount_native, sale_amount_usd, " +
         "bid_count, url, close_time_utc, CONVERT(char(10), close_date_et, 23) AS close_date_et, " +
         "opening_bid_native, opening_bid_usd, is_sold_auction, asset_status_cd, start_time_et, " +
         "category_code, category_routepath " +
-        `FROM lqdt.sold_lots WHERE ${where.join(" AND ")}`,
+        `FROM lqdt.sold_lots WHERE ${where}`,
     );
   return r.recordset.map((x): SoldExportRow => {
     const closeIso = x.close_time_utc instanceof Date ? x.close_time_utc.toISOString() : (x.close_time_utc ?? "");
