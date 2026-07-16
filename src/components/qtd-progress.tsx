@@ -6,7 +6,7 @@
 // scaled — comparisons vs company guidance and the Clearline model estimate.
 //
 // All math is client-side on the /api/forecast?quarter=ALL payload (full daily
-// history + current-quarter open-auction projection + reported/estimate series).
+// history + reported/estimate series).
 
 import { Fragment, useEffect, useMemo, useState } from "react";
 import {
@@ -47,7 +47,6 @@ import {
 type DailyPoint = {
   date: string;
   realized_gmv_usd: number;
-  projected_gmv_usd: number;
   ad_realized_gmv_usd?: number;
   gd_realized_gmv_usd?: number;
   gi_realized_gmv_usd?: number;
@@ -70,11 +69,10 @@ type QtdData = {
   sold_by_bucket_daily?: BucketDailyRow[];
 };
 
-type ProjectionKey = "shape" | "auctions" | "runrate";
+type ProjectionKey = "shape" | "runrate";
 
 const PROJECTION_LABEL: Record<ProjectionKey, string> = {
   shape: "Prior-yr shape",
-  auctions: "Open auctions",
   runrate: "Run rate",
 };
 
@@ -98,7 +96,6 @@ type ChartRow = {
   Current: number | null;
   "Last year": number | null;
   "Prior-yr shape": number | null;
-  "Open auctions": number | null;
   "Run rate": number | null;
   "Cumulative Y/Y": number | null;
   /** True when the row's projection values are Y/Y percentages, not dollars. */
@@ -151,16 +148,12 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
         def: "QTD ÷ (LY cumulative through the same day ÷ LY full quarter). Applies last year's rest-of-quarter daily distribution at the current Y/Y pace — the Yipit-style RoQ method; handles seasonality/lumpiness. Needs LY daily data.",
       },
       {
-        term: "Open auctions",
-        def: "QTD + the app's per-day projected GMV from currently scheduled open auctions. Grounded in actual scheduled supply; the dashed line ends at the last scheduled-auction day (~2 weeks out) rather than extending to quarter end — NOT a full-quarter estimate.",
-      },
-      {
         term: "Run rate",
         def: "QTD daily average × days in the quarter. Crude (ignores seasonality) but always available; the fallback when prior-year data doesn't exist.",
       },
       {
         term: "Projections in Y/Y % mode",
-        def: "The same paths drawn as implied cumulative Y/Y: projected cumulative ÷ LY cumulative at the same day − 1. Prior-yr shape and run rate converge at their implied full-quarter Y/Y; open auctions ends at its scheduled-supply horizon. Prior-yr shape is flat by construction (it applies LY's shape at the current pace), so it reads as the extrapolated full-quarter Y/Y line. In Scaled mode, when LY reported GMV exists, these use the same reported anchor as the QTD Y/Y card (scaled cumulative ÷ LY reported prorated to the same day − 1).",
+        def: "The same paths drawn as implied cumulative Y/Y: projected cumulative ÷ LY cumulative at the same day − 1, converging at each method's implied full-quarter Y/Y. Prior-yr shape is flat by construction (it applies LY's shape at the current pace), so it reads as the extrapolated full-quarter Y/Y line. In Scaled mode, when LY reported GMV exists, these use the same reported anchor as the QTD Y/Y card (scaled cumulative ÷ LY reported prorated to the same day − 1).",
       },
     ],
   },
@@ -284,7 +277,6 @@ function DefinitionsBox() {
 
 type QtdModel = {
   realizedByDate: Map<string, number>;
-  projectedByDate: Map<string, number>;
   siteByDate: Map<string, { ad: number; gd: number; gi: number }>;
   lastDataDate: string;
   earliest: string;
@@ -299,7 +291,7 @@ type QtdModel = {
  *  FQE, WoW). Pure so it can run for both the selected quarter (the chart) and
  *  the current quarter (the earnings-preview section, pinned to "now"). */
 function buildQuarterView(model: QtdModel, selected: string) {
-  const { realizedByDate, projectedByDate, lastDataDate } = model;
+  const { realizedByDate, lastDataDate } = model;
 
   const dayKeys = quarterDayKeys(selected);
   if (dayKeys.length === 0) return null;
@@ -339,33 +331,15 @@ function buildQuarterView(model: QtdModel, selected: string) {
   // Projections (captured units). Anchor every path at day d so the dashed
   // lines extend the solid QTD line.
   const shapeAvailable = !complete && lyCum != null && lyAt(d - 1) > 0;
-  const remainingProjected = dayKeys.slice(d).map((k) => projectedByDate.get(k) ?? 0);
-  const auctionsAvailable = !complete && remainingProjected.some((v) => v > 0);
   const shapeAt = (i: number) => qtd + (lyAt(i) - lyAt(d - 1)) * (qtd / lyAt(d - 1));
-  let auctionRun = qtd;
-  const auctionPath: number[] = dayKeys.map((_, i) => {
-    if (i < d) return qtd;
-    auctionRun += remainingProjected[i - d] ?? 0;
-    return auctionRun;
-  });
-  // Absolute day index of the LAST scheduled open-auction day (~2 weeks out).
-  // Beyond it auctionPath only flatlines — which in Y/Y mode reads as a bogus
-  // collapse (flat numerator ÷ growing LY denominator) — so the chart stops the
-  // series here. Interior zero days (weekends) stay inside the horizon.
-  let auctionHorizonIdx = d - 1;
-  remainingProjected.forEach((v, j) => {
-    if (v > 0) auctionHorizonIdx = d + j;
-  });
   const runRateAt = (i: number) => (qtd / d) * (i + 1);
 
   const fqe = {
     shape: shapeAvailable ? shapeAt(D - 1) : null,
-    auctions: auctionsAvailable ? auctionPath[D - 1] : null,
     runrate: !complete ? runRateAt(D - 1) : null,
     actual: complete ? qtd : null,
   };
-  // Primary FQE: prior-yr shape, else run-rate. Never the open-auction path —
-  // it only covers the scheduled-auction horizon (~2 weeks), not the full quarter.
+  // Primary FQE: prior-yr shape, else run-rate.
   const primaryFqe = fqe.actual ?? fqe.shape ?? fqe.runrate ?? qtd;
   const primaryMethod = fqe.actual != null ? "complete quarter" : fqe.shape != null ? PROJECTION_LABEL.shape : PROJECTION_LABEL.runrate;
 
@@ -384,7 +358,7 @@ function buildQuarterView(model: QtdModel, selected: string) {
   return {
     dayKeys, D, d, startKey, endKey, dataThrough, complete,
     curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable, lyReported, lyReportedAt,
-    shapeAvailable, auctionsAvailable, shapeAt, auctionPath, auctionHorizonIdx, runRateAt,
+    shapeAvailable, shapeAt, runRateAt,
     fqe, primaryFqe, primaryMethod, wow,
     reported: model.reported.get(selected) ?? null,
     estimate: model.estimates.get(selected) ?? null,
@@ -419,7 +393,7 @@ export function QtdProgress() {
   const [metric, setMetric] = useState<"dollars" | "yoy">("dollars");
   const [scaled, setScaled] = useState(false);
   const [captureInput, setCaptureInput] = useState(""); // "" = auto
-  const [projections, setProjections] = useState<Set<ProjectionKey>>(new Set(["shape", "auctions", "runrate"]));
+  const [projections, setProjections] = useState<Set<ProjectionKey>>(new Set(["shape", "runrate"]));
   // Guidance / Clearline edit panel ("" = blank field; values entered in $M).
   const [editOpen, setEditOpen] = useState(false);
   const [editLow, setEditLow] = useState("");
@@ -484,12 +458,10 @@ export function QtdProgress() {
     if (!data) return null;
 
     const realizedByDate = new Map<string, number>();
-    const projectedByDate = new Map<string, number>();
     const siteByDate = new Map<string, { ad: number; gd: number; gi: number }>();
     let lastDataDate = "";
     for (const d of data.daily) {
       realizedByDate.set(d.date, d.realized_gmv_usd);
-      projectedByDate.set(d.date, d.projected_gmv_usd);
       siteByDate.set(d.date, {
         ad: d.ad_realized_gmv_usd ?? 0,
         gd: d.gd_realized_gmv_usd ?? 0,
@@ -515,7 +487,7 @@ export function QtdProgress() {
     const recent = captures.slice(-3);
     const autoCapture = recent.length ? recent.reduce((s, c) => s + c.rate, 0) / recent.length : FALLBACK_CAPTURE;
 
-    return { realizedByDate, projectedByDate, siteByDate, lastDataDate, earliest, quarters, reported, estimates, autoCapture, captureQuarters: recent };
+    return { realizedByDate, siteByDate, lastDataDate, earliest, quarters, reported, estimates, autoCapture, captureQuarters: recent };
   }, [state.data, todayKey, currentQuarter]);
 
   const selected = quarter ?? currentQuarter;
@@ -576,11 +548,6 @@ export function QtdProgress() {
       // the "Reported actual" reference line instead of captured × capture-rate.
       "Last year": reportedAnchor && lyRepAt ? lyRepAt(i) : lyVal != null ? lyVal * scale : null,
       "Prior-yr shape": proj(view.shapeAvailable && projections.has("shape") && (anchor || i >= d) ? view.shapeAt(i) : null),
-      "Open auctions": proj(
-        view.auctionsAvailable && projections.has("auctions") && (anchor || i >= d) && i <= view.auctionHorizonIdx
-          ? view.auctionPath[i]
-          : null,
-      ),
       "Run rate": proj(!view.complete && projections.has("runrate") && (anchor || i >= d) ? view.runRateAt(i) : null),
       "Cumulative Y/Y": yoyMode && inData ? impliedYoy(view.curCum[i]) : null,
       _yoyMode: yoyMode,
@@ -770,7 +737,7 @@ export function QtdProgress() {
     lines.push("");
 
     lines.push(rowOf(`Daily progression ${selected} / ${formatQuarterLabel(selected, "fq")} (captured USD)`));
-    lines.push(rowOf("day", "date", "daily_gmv_usd", "cum_gmv_usd", "ly_date", "ly_daily_gmv_usd", "ly_cum_gmv_usd", "cum_yoy", "proj_prior_shape_cum_usd", "proj_open_auctions_cum_usd", "proj_run_rate_cum_usd"));
+    lines.push(rowOf("day", "date", "daily_gmv_usd", "cum_gmv_usd", "ly_date", "ly_daily_gmv_usd", "ly_cum_gmv_usd", "cum_yoy", "proj_prior_shape_cum_usd", "proj_run_rate_cum_usd"));
     const lyDayKeys = quarterDayKeys(priorYearQuarter(selected));
     for (let i = 0; i < view.D; i++) {
       const inData = i < view.d;
@@ -787,7 +754,6 @@ export function QtdProgress() {
           view.lyCum ? Math.round(view.lyAt(i)) : "",
           inData && view.lyCum && view.lyAt(i) > 0 ? pctS(view.curCum[i] / view.lyAt(i) - 1) : "",
           view.shapeAvailable && i >= view.d - 1 ? Math.round(view.shapeAt(i)) : "",
-          view.auctionsAvailable && i >= view.d - 1 && i <= view.auctionHorizonIdx ? Math.round(view.auctionPath[i]) : "",
           !view.complete && i >= view.d - 1 ? Math.round(view.runRateAt(i)) : "",
         ),
       );
@@ -1255,7 +1221,7 @@ export function QtdProgress() {
         <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
           Projections:
           {(Object.keys(PROJECTION_LABEL) as ProjectionKey[]).map((k) => {
-            const available = k === "shape" ? view.shapeAvailable : k === "auctions" ? view.auctionsAvailable : true;
+            const available = k === "shape" ? view.shapeAvailable : true;
             return (
               <button
                 key={k}
@@ -1269,13 +1235,7 @@ export function QtdProgress() {
                   })
                 }
                 className={chip(projections.has(k) && available, available ? "" : "opacity-40 cursor-not-allowed")}
-                title={
-                  k === "shape" && !view.shapeAvailable
-                    ? "Needs prior-year daily data"
-                    : k === "auctions" && !view.auctionsAvailable
-                      ? "No scheduled open-auction projection for this quarter"
-                      : undefined
-                }
+                title={k === "shape" && !view.shapeAvailable ? "Needs prior-year daily data" : undefined}
               >
                 {PROJECTION_LABEL[k]}
               </button>
@@ -1311,9 +1271,6 @@ export function QtdProgress() {
               )}
               {view.shapeAvailable && projections.has("shape") && (
                 <Line type="monotone" dataKey="Prior-yr shape" stroke="#7c3aed" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
-              )}
-              {view.auctionsAvailable && projections.has("auctions") && (
-                <Line type="monotone" dataKey="Open auctions" stroke="#0e8fa8" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
               )}
               {!view.complete && projections.has("runrate") && (
                 <Line type="monotone" dataKey="Run rate" stroke="#6b7280" strokeWidth={1} strokeDasharray="3 3" dot={false} connectNulls />
@@ -1358,9 +1315,6 @@ export function QtdProgress() {
                   Prior-yr shape is flat by construction — the extrapolated-FQE line. */}
               {view.shapeAvailable && projections.has("shape") && (
                 <Line type="monotone" dataKey="Prior-yr shape" stroke="#7c3aed" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
-              )}
-              {view.auctionsAvailable && projections.has("auctions") && (
-                <Line type="monotone" dataKey="Open auctions" stroke="#0e8fa8" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
               )}
               {!view.complete && projections.has("runrate") && (
                 <Line type="monotone" dataKey="Run rate" stroke="#6b7280" strokeWidth={1} strokeDasharray="3 3" dot={false} connectNulls />
