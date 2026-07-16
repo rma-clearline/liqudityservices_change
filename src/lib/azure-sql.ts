@@ -521,9 +521,41 @@ const HEAVY_LIKE = [
   "%marine%", "%mining%", "%asphalt%", "%energy%", "%railroad%", "%metalworking%",
   "%drilling%", "%lathes%",
 ];
-const likeChain = (patterns: string[]) =>
-  patterns.map((p) => `LOWER(COALESCE(category,'')) LIKE '${p}'`).join(" OR ");
-const codeList = (codes: string[]) => codes.map((c) => `'${c}'`).join(",");
+// Classification runs in JS on the GROUPED result (see getSoldDailyByBucket),
+// not per-row in SQL: pushing the 167 code literals + ~43 leading-wildcard LIKEs
+// into a CASE over 750K rows (and grouping on that computed expression) took ~50s
+// on this tier and blew the read timeout; grouping by raw dimensions first is
+// ~4s and yields ~100K rows to classify cheaply here.
+const VEH_CODE_SET = new Set(VEH_CODES);
+const HEAVY_CODE_SET = new Set(HEAVY_CODES);
+// SQL `LIKE 'x'` on LOWER(category): translate each pattern to an anchored regex
+// (`%` → `.*`; the patterns contain no other regex metacharacters or SQL `_`).
+const likeToRegex = (p: string) => new RegExp("^" + p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replaceAll("%", ".*") + "$");
+const VEH_RE = VEH_LIKE.map(likeToRegex);
+const HEAVY_RE = HEAVY_LIKE.map(likeToRegex);
+
+/** Take-rate family for one lot group — mirrors the previous SQL CASE exactly:
+ *  category_code first (durable), description patterns as the NULL/unlisted-code
+ *  fallback. */
+function takeRateFamily(categoryCode: string | null, category: string | null): "veh" | "heavy" | "other" {
+  if (categoryCode != null) {
+    if (VEH_CODE_SET.has(categoryCode)) return "veh";
+    if (HEAVY_CODE_SET.has(categoryCode)) return "heavy";
+  }
+  const d = (category ?? "").toLowerCase();
+  if (VEH_RE.some((re) => re.test(d))) return "veh";
+  if (HEAVY_RE.some((re) => re.test(d))) return "heavy";
+  return "other";
+}
+
+function takeRateBucket(site: string | null, sellerType: string | null, family: "veh" | "heavy" | "other"): SoldBucket {
+  if (site === "GI") return "intl";
+  if (site === "AD") return "ad_dtc";
+  if (sellerType === "government") return family === "veh" || family === "heavy" ? "gov_veh" : "gov_other";
+  if (family === "veh") return "ret_veh";
+  if (family === "heavy") return "heavy";
+  return "ret_other";
+}
 
 /**
  * Per-day realized GMV/lots/bids by take-rate bucket — honest scrape axes, NOT
@@ -543,47 +575,40 @@ const codeList = (codes: string[]) => codes.map((c) => `'${c}'`).join(",");
  * at ~2.1B and a quarter already carries ~2.2M bids.
  */
 export async function getSoldDailyByBucket(fromEt: string, toEt: string): Promise<SoldBucketDailyRow[]> {
-  // Family: category_code first (durable), description patterns as the fallback
-  // for NULL/unlisted codes. CROSS APPLY defines each expression once so the big
-  // IN-lists aren't repeated through the bucket CASE and GROUP BY.
-  const familyExpr =
-    "CASE " +
-    `WHEN category_code IN (${codeList(VEH_CODES)}) THEN 'veh' ` +
-    `WHEN category_code IN (${codeList(HEAVY_CODES)}) THEN 'heavy' ` +
-    `WHEN (${likeChain(VEH_LIKE)}) THEN 'veh' ` +
-    `WHEN (${likeChain(HEAVY_LIKE)}) THEN 'heavy' ` +
-    "ELSE 'other' END";
-  const bucketExpr =
-    "CASE WHEN site = 'GI' THEN 'intl' " +
-    "WHEN site = 'AD' THEN 'ad_dtc' " +
-    "WHEN seller_type = 'government' THEN (CASE WHEN f.family IN ('veh','heavy') THEN 'gov_veh' ELSE 'gov_other' END) " +
-    "WHEN f.family = 'veh' THEN 'ret_veh' " +
-    "WHEN f.family = 'heavy' THEN 'heavy' " +
-    "ELSE 'ret_other' END";
+  // Group by RAW dimensions in SQL (indexed date scan + hash aggregate, ~4s over
+  // the full store), then classify the ~100K grouped rows into buckets here.
+  // Doing the code/LIKE classification per-row in SQL over 750K rows and grouping
+  // on that computed expression took ~50s on this tier — past the read timeout.
   const pool = await getPool();
   const r = await pool
     .request()
     .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
     .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
     .query(
-      "SELECT CONVERT(char(10), close_date_et, 23) AS d, b.bucket AS bkt, " +
+      "SELECT CONVERT(char(10), close_date_et, 23) AS d, site, seller_type, category_code, category, " +
         "COALESCE(SUM(sale_amount_usd),0) AS gmv, " +
         "SUM(CASE WHEN sale_amount_usd > 0 THEN 1 ELSE 0 END) AS lots, " +
         "COALESCE(SUM(CAST(bid_count AS bigint)),0) AS bids " +
-        "FROM lqdt.sold_lots " +
-        `CROSS APPLY (SELECT ${familyExpr} AS family) AS f ` +
-        `CROSS APPLY (SELECT ${bucketExpr} AS bucket) AS b ` +
-        "WHERE close_date_et BETWEEN @from AND @to " +
-        "GROUP BY close_date_et, b.bucket",
+        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to " +
+        "GROUP BY CONVERT(char(10), close_date_et, 23), site, seller_type, category_code, category",
     );
-  const valid = new Set<string>(["gov_veh", "gov_other", "ret_veh", "ret_other", "heavy", "intl", "ad_dtc"]);
-  return r.recordset.map((x) => ({
-    date: x.d,
-    bucket: (valid.has(x.bkt) ? x.bkt : "ret_other") as SoldBucket,
-    gmv: Number(x.gmv ?? 0),
-    lots: Number(x.lots ?? 0),
-    bids: Number(x.bids ?? 0),
-  }));
+  // Accumulate the grouped rows into (date, bucket) totals.
+  const byKey = new Map<string, SoldBucketDailyRow>();
+  for (const x of r.recordset) {
+    const family = takeRateFamily(
+      x.category_code == null ? null : String(x.category_code),
+      x.category == null ? null : String(x.category),
+    );
+    const bucket = takeRateBucket(x.site == null ? null : String(x.site), x.seller_type == null ? null : String(x.seller_type), family);
+    const date = String(x.d);
+    const key = `${date}|${bucket}`;
+    let row = byKey.get(key);
+    if (!row) byKey.set(key, (row = { date, bucket, gmv: 0, lots: 0, bids: 0 }));
+    row.gmv += Number(x.gmv ?? 0);
+    row.lots += Number(x.lots ?? 0);
+    row.bids += Number(x.bids ?? 0);
+  }
+  return [...byKey.values()];
 }
 
 // --- analyst estimate overrides (guidance / Clearline) ----------------------
