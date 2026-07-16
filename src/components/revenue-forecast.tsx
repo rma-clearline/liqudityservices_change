@@ -800,19 +800,6 @@ function DailyForecastChart({
 
 // --- Feature helpers/components -------------------------------------------
 
-/** QTD realized (GMV + revenue) for the quarter containing `asOf`, through that day. */
-function qtdRealizedAsOf(daily: DailyPoint[], asOf: string): { gmv: number; revenue: number; days: number } | null {
-  if (!asOf) return null;
-  const q = etQuarterKey(asOf);
-  const inQ = daily.filter((d) => d.date <= asOf && etQuarterKey(d.date) === q);
-  if (inQ.length === 0) return null;
-  return {
-    gmv: inQ.reduce((s, d) => s + d.realized_gmv_usd, 0),
-    revenue: inQ.reduce((s, d) => s + d.realized_revenue_usd, 0),
-    days: inQ.length,
-  };
-}
-
 type PeriodRow = { period: string; gmv: number; revenue: number; seq: number | null; yoy: number | null; partial: boolean };
 
 // Same formula works for month ("YYYY-MM") and quarter ("YYYYQn") keys.
@@ -1111,7 +1098,6 @@ export function RevenueForecast() {
   const [chartSource, setChartSource] = useState<SourceFilter>("all");
   const [granularity, setGranularity] = useState<Granularity>("day");
   const [showExport, setShowExport] = useState(false);
-  const [qtdDate, setQtdDate] = useState("");
   const [showCategory, setShowCategory] = useState(false);
   const [selectedSalesDate, setSelectedSalesDate] = useState<string | null>(null);
   const [state, setState] = useState<FetchState>({ forecast: null, error: null, done: false });
@@ -1175,9 +1161,8 @@ export function RevenueForecast() {
   // component's early returns where hooks can't be called.
   const chartDaily = bucketDaily(forecast.daily, granularity);
   const reportedByQuarter = new Map((forecast.reported_gmv_by_quarter ?? []).map((r) => [r.quarter, r.reported_gmv_usd]));
-  const qtd = qtdRealizedAsOf(forecast.daily, qtdDate);
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-  // Export/QTD date bounds: the actual GMV data range (earliest data day →
+  // Export date bounds: the actual GMV data range (earliest data day →
   // today), so users can't query dates with no data. Default the export to the
   // full history; analysts narrow it in the modal.
   const earliestDataDate = forecast.earliest_data_date || dailyStart || todayKey;
@@ -1251,39 +1236,6 @@ export function RevenueForecast() {
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <Card label={totalGmvLabel} value={fmtDollar(isAll ? forecast.realized_total_gmv_usd : forecast.projected_total_gmv_usd)} />
         <Card label={totalRevLabel} value={fmtDollar(isAll ? forecast.realized_total_revenue_usd : forecast.projected_total_revenue_usd)} strong />
-      </div>
-
-      <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-gray-50 p-3 text-sm">
-        <label className="flex items-center gap-2 text-gray-600">
-          QTD as of
-          <input
-            type="date"
-            value={qtdDate}
-            min={earliestDataDate}
-            max={todayKey}
-            onChange={(e) => {
-              const v = e.target.value;
-              // Clamp to the data range so users can't pick dates with no data.
-              setQtdDate(!v ? "" : v < earliestDataDate ? earliestDataDate : v > todayKey ? todayKey : v);
-            }}
-            className="rounded border px-2 py-0.5 text-sm text-gray-900"
-          />
-        </label>
-        {qtd ? (
-          <span className="text-gray-700">
-            <strong>{formatQuarterLabel(etQuarterKey(qtdDate))}</strong> realized through {qtdDate}:{" "}
-            <strong className="text-gray-900">{fmtDollar(qtd.revenue)}</strong> revenue ·{" "}
-            {fmtDollar(qtd.gmv)} GMV <span className="text-gray-400">({qtd.days} days in)</span>
-          </span>
-        ) : qtdDate ? (
-          <span className="text-xs text-gray-400">
-            No realized data for that date in this view — switch the Quarter selector to &ldquo;All (full history)&rdquo;.
-          </span>
-        ) : (
-          <span className="text-xs text-gray-400">
-            Pick a date to see quarter-to-date realized revenue as of that day (compare the QTD pace vs full-quarter guidance).
-          </span>
-        )}
       </div>
 
       <div>
