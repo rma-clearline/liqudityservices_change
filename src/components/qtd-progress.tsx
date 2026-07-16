@@ -127,7 +127,7 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "QTD Y/Y",
-        def: "Cumulative captured QTD ÷ last year's same fiscal quarter aligned by day-of-quarter (day 13 vs day 13), minus 1. Calendar dates differ; day alignment keeps the comparison at the same depth into the quarter.",
+        def: "Cumulative captured QTD ÷ last year's same fiscal quarter aligned by day-of-quarter (day 13 vs day 13), minus 1. Calendar dates differ; day alignment keeps the comparison at the same depth into the quarter. In Scaled mode, when LY reported GMV exists, the base switches to LY reported GMV prorated to the same day (reported × LY captured-through-day ÷ LY captured full quarter) — marked *.",
       },
       {
         term: "Data through / Day N of M",
@@ -135,7 +135,7 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "T7D Y/Y",
-        def: "Trailing-7-day captured GMV vs the same 7 days 52 weeks ago (a 364-day shift, which preserves the weekday mix — auction closings cluster by weekday). WoW = change vs the prior week's T7D Y/Y.",
+        def: "Trailing-7-day captured GMV vs the same 7 days 52 weeks ago (a 364-day shift, which preserves the weekday mix — auction closings cluster by weekday).",
       },
       {
         term: "Last 7 days (FQE change)",
@@ -152,7 +152,7 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "Open auctions",
-        def: "QTD + the app's per-day projected GMV from currently scheduled open auctions. Grounded in actual scheduled supply but only extends as far as auctions are scheduled (~2 weeks) — NOT a full-quarter estimate.",
+        def: "QTD + the app's per-day projected GMV from currently scheduled open auctions. Grounded in actual scheduled supply; the dashed line ends at the last scheduled-auction day (~2 weeks out) rather than extending to quarter end — NOT a full-quarter estimate.",
       },
       {
         term: "Run rate",
@@ -160,7 +160,7 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "Projections in Y/Y % mode",
-        def: "The same paths drawn as implied cumulative Y/Y: projected cumulative ÷ LY cumulative at the same day − 1, converging at each method's implied full-quarter Y/Y. Prior-yr shape is flat by construction (it applies LY's shape at the current pace), so it reads as the extrapolated full-quarter Y/Y line.",
+        def: "The same paths drawn as implied cumulative Y/Y: projected cumulative ÷ LY cumulative at the same day − 1. Prior-yr shape and run rate converge at their implied full-quarter Y/Y; open auctions ends at its scheduled-supply horizon. Prior-yr shape is flat by construction (it applies LY's shape at the current pace), so it reads as the extrapolated full-quarter Y/Y line. In Scaled mode, when LY reported GMV exists, these use the same reported anchor as the QTD Y/Y card (scaled cumulative ÷ LY reported prorated to the same day − 1).",
       },
     ],
   },
@@ -325,6 +325,17 @@ function buildQuarterView(model: QtdModel, selected: string) {
   const lyQtd = lyCum ? lyAt(d - 1) : null;
   const yoy = lyQtd && lyQtd > 0 ? qtd / lyQtd - 1 : null;
 
+  // LY REPORTED GMV prorated to day i using LY's captured daily shape — the
+  // denominator for the reported-anchored Y/Y shown in Scaled mode. Using
+  // lyCum's true final value (not lyAt(D-1)) makes lyReportedAt(D-1) equal
+  // lyReported exactly even when the quarters' day counts differ.
+  const lyReported = model.reported.get(priorYearQuarter(selected)) ?? null;
+  const lyCapturedTotal = lyCum ? lyCum[lyCum.length - 1] : 0;
+  const lyReportedAt =
+    lyReported != null && lyReported > 0 && lyCum != null && lyCapturedTotal > 0
+      ? (i: number) => lyReported * (lyAt(i) / lyCapturedTotal)
+      : null;
+
   // Projections (captured units). Anchor every path at day d so the dashed
   // lines extend the solid QTD line.
   const shapeAvailable = !complete && lyCum != null && lyAt(d - 1) > 0;
@@ -336,6 +347,14 @@ function buildQuarterView(model: QtdModel, selected: string) {
     if (i < d) return qtd;
     auctionRun += remainingProjected[i - d] ?? 0;
     return auctionRun;
+  });
+  // Absolute day index of the LAST scheduled open-auction day (~2 weeks out).
+  // Beyond it auctionPath only flatlines — which in Y/Y mode reads as a bogus
+  // collapse (flat numerator ÷ growing LY denominator) — so the chart stops the
+  // series here. Interior zero days (weekends) stay inside the horizon.
+  let auctionHorizonIdx = d - 1;
+  remainingProjected.forEach((v, j) => {
+    if (v > 0) auctionHorizonIdx = d + j;
   });
   const runRateAt = (i: number) => (qtd / d) * (i + 1);
 
@@ -364,8 +383,8 @@ function buildQuarterView(model: QtdModel, selected: string) {
 
   return {
     dayKeys, D, d, startKey, endKey, dataThrough, complete,
-    curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable,
-    shapeAvailable, auctionsAvailable, shapeAt, auctionPath, runRateAt,
+    curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable, lyReported, lyReportedAt,
+    shapeAvailable, auctionsAvailable, shapeAt, auctionPath, auctionHorizonIdx, runRateAt,
     fqe, primaryFqe, primaryMethod, wow,
     reported: model.reported.get(selected) ?? null,
     estimate: model.estimates.get(selected) ?? null,
@@ -516,30 +535,54 @@ export function QtdProgress() {
       : model.autoCapture;
   const scale = scaled ? 1 / captureRate : 1;
 
+  // Reported-anchored Y/Y (Scaled mode only): scaled QTD vs LY REPORTED GMV
+  // prorated to the same day by LY's captured shape. Hoisted to consts so TS
+  // narrowing survives the rows-map closure. When the anchor is unavailable
+  // (As-captured mode, or no LY reported), everything falls back to the
+  // captured-vs-captured behavior exactly.
+  const lyRepAt = view.lyReportedAt;
+  const reportedAnchor = scaled && lyRepAt != null && lyRepAt(view.d - 1) > 0;
+  const lyRepQtd = reportedAnchor && lyRepAt ? lyRepAt(view.d - 1) : null;
+  const yoyDisplay = lyRepQtd != null ? (view.qtd * scale) / lyRepQtd - 1 : view.yoy;
+
   const { dayKeys, D, d } = view;
   const yoyMode = metric === "yoy";
   const rows: ChartRow[] = dayKeys.map((date, i) => {
     const inData = i < d;
     const lyVal = view.lyCum ? view.lyAt(i) : null;
     const anchor = i === d - 1; // projections start at the last data day
-    // In $ mode a projection plots its (scaled) cumulative path; in Y/Y mode it
-    // plots the IMPLIED cumulative Y/Y (projected cum ÷ LY cum − 1, %) — converging
-    // at the method's implied full-quarter Y/Y. Scale cancels in the ratio.
-    const proj = (raw: number | null): number | null => {
-      if (raw == null) return null;
-      if (!yoyMode) return raw * scale;
+    // Implied cumulative Y/Y for a cumulative $ value at day i. Captured mode:
+    // raw ÷ LY captured − 1 (capture scale cancels in the ratio). Scaled mode
+    // with LY reported available: (raw × scale) ÷ LY-reported-prorated-to-day
+    // − 1 — the same reported anchor as the QTD Y/Y card, so the chart's last
+    // in-data point always equals the card.
+    const impliedYoy = (raw: number): number | null => {
+      if (reportedAnchor && lyRepAt) {
+        const dn = lyRepAt(i);
+        return dn > 0 ? ((raw * scale) / dn - 1) * 100 : null;
+      }
       return lyVal != null && lyVal > 0 ? (raw / lyVal - 1) * 100 : null;
     };
+    // In $ mode a projection plots its (scaled) cumulative path; in Y/Y mode
+    // the implied cumulative Y/Y above.
+    const proj = (raw: number | null): number | null =>
+      raw == null ? null : !yoyMode ? raw * scale : impliedYoy(raw);
     return {
       day: i + 1,
       date,
       Current: inData ? view.curCum[i] * scale : null,
-      "Last year": lyVal != null ? lyVal * scale : null,
+      // In Scaled mode with the reported anchor, LY plots the reported total
+      // distributed by LY's captured shape — so its endpoint lands exactly on
+      // the "Reported actual" reference line instead of captured × capture-rate.
+      "Last year": reportedAnchor && lyRepAt ? lyRepAt(i) : lyVal != null ? lyVal * scale : null,
       "Prior-yr shape": proj(view.shapeAvailable && projections.has("shape") && (anchor || i >= d) ? view.shapeAt(i) : null),
-      "Open auctions": proj(view.auctionsAvailable && projections.has("auctions") && (anchor || i >= d) ? view.auctionPath[i] : null),
+      "Open auctions": proj(
+        view.auctionsAvailable && projections.has("auctions") && (anchor || i >= d) && i <= view.auctionHorizonIdx
+          ? view.auctionPath[i]
+          : null,
+      ),
       "Run rate": proj(!view.complete && projections.has("runrate") && (anchor || i >= d) ? view.runRateAt(i) : null),
-      "Cumulative Y/Y":
-        yoyMode && inData && view.lyCum && view.lyAt(i) > 0 ? (view.curCum[i] / view.lyAt(i) - 1) * 100 : null,
+      "Cumulative Y/Y": yoyMode && inData ? impliedYoy(view.curCum[i]) : null,
       _yoyMode: yoyMode,
       _dailyCur: inData ? (view.curCum[i] - (i > 0 ? view.curCum[i - 1] : 0)) : null,
       _dailyLy: view.lyCum && i < (view.lyCum.length ?? 0) ? view.lyCum[i] - (i > 0 ? view.lyCum[i - 1] : 0) : null,
@@ -680,8 +723,6 @@ export function QtdProgress() {
     });
   }
   const t7dYoyNow = t7dCols[t7dCols.length - 1]?.yoy ?? null;
-  const t7dYoyPrev = t7dCols[t7dCols.length - 2]?.yoy ?? null;
-  const t7dWowPp = t7dYoyNow != null && t7dYoyPrev != null ? (t7dYoyNow - t7dYoyPrev) * 100 : null;
 
   // One-click Excel-friendly export: labeled blocks (summary, key metrics, daily
   // progression, then the model sections — segments, earnings preview, transactions
@@ -704,7 +745,14 @@ export function QtdProgress() {
     lines.push(rowOf("Capture rate", `${(captureRate * 100).toFixed(1)}%`, captureInput.trim() ? "manual override" : "auto (last 3 reported qtrs)"));
     lines.push(rowOf("QTD GMV captured (USD)", Math.round(view.qtd)));
     lines.push(rowOf("QTD GMV scaled (USD)", Math.round(view.qtd / captureRate)));
-    lines.push(rowOf("QTD Y/Y", pctS(view.yoy)));
+    lines.push(rowOf("QTD Y/Y (captured vs captured)", pctS(view.yoy)));
+    // Export is toggle-independent: include the reported-anchored basis too.
+    const lyRepQtdExport = view.lyReportedAt ? view.lyReportedAt(view.d - 1) : 0;
+    if (lyRepQtdExport > 0) {
+      lines.push(
+        rowOf("QTD Y/Y (scaled vs LY reported, prorated)", pctS(view.qtd / captureRate / lyRepQtdExport - 1)),
+      );
+    }
     lines.push(rowOf(view.complete ? "Full quarter actual, scaled (USD)" : `FQ estimate (${view.primaryMethod}), scaled (USD)`, Math.round(scaledFqe)));
     if (guidanceLow != null && guidanceHigh != null) {
       lines.push(rowOf("Guidance low/high (USD)", Math.round(guidanceLow), Math.round(guidanceHigh), guidanceMid ? `${pctS(scaledFqe / guidanceMid - 1)} vs mid` : ""));
@@ -739,7 +787,7 @@ export function QtdProgress() {
           view.lyCum ? Math.round(view.lyAt(i)) : "",
           inData && view.lyCum && view.lyAt(i) > 0 ? pctS(view.curCum[i] / view.lyAt(i) - 1) : "",
           view.shapeAvailable && i >= view.d - 1 ? Math.round(view.shapeAt(i)) : "",
-          view.auctionsAvailable && i >= view.d - 1 ? Math.round(view.auctionPath[i]) : "",
+          view.auctionsAvailable && i >= view.d - 1 && i <= view.auctionHorizonIdx ? Math.round(view.auctionPath[i]) : "",
           !view.complete && i >= view.d - 1 ? Math.round(view.runRateAt(i)) : "",
         ),
       );
@@ -1135,11 +1183,22 @@ export function QtdProgress() {
         />
         <StatCard
           label="QTD Y/Y"
-          value={view.yoy != null ? <span className={view.yoy >= 0 ? "text-green-600" : "text-red-600"}>{fmtPct(view.yoy)}</span> : "—"}
+          value={
+            yoyDisplay != null ? (
+              <span className={yoyDisplay >= 0 ? "text-green-600" : "text-red-600"}>
+                {fmtPct(yoyDisplay)}
+                {reportedAnchor && <span className="text-gray-400">*</span>}
+              </span>
+            ) : (
+              "—"
+            )
+          }
           sub={
-            view.lyQtd != null
-              ? `vs LY same ${view.d} days: ${fmtM(view.lyQtd * scale)} · LY full qtr: ${fmtM((view.lyCum?.[view.lyCum.length - 1] ?? 0) * scale)}`
-              : "prior-year daily data begins Jul 2025"
+            reportedAnchor && lyRepQtd != null
+              ? `vs LY same ${view.d} days: ${fmtM(lyRepQtd)} · LY full qtr: ${fmtM(view.lyReported ?? 0)} (reported)`
+              : view.lyQtd != null
+                ? `vs LY same ${view.d} days: ${fmtM(view.lyQtd * scale)} · LY full qtr: ${fmtM((view.lyCum?.[view.lyCum.length - 1] ?? 0) * scale)}`
+                : "prior-year daily data begins Jul 2025"
           }
         />
         <StatCard
@@ -1172,11 +1231,7 @@ export function QtdProgress() {
               <span className={t7dYoyNow >= 0 ? "text-green-600" : "text-red-600"}>{fmtPct(t7dYoyNow)}</span>
             )
           }
-          sub={
-            t7dWowPp == null
-              ? "trailing 7 days vs 52 weeks ago"
-              : `${t7dWowPp >= 0 ? "↗" : "↘"} ${Math.abs(t7dWowPp).toFixed(1)} pp WoW`
-          }
+          sub="trailing 7 days vs 52 weeks ago"
         />
         <StatCard
           label="Last 7 days"
@@ -1263,9 +1318,10 @@ export function QtdProgress() {
               {!view.complete && projections.has("runrate") && (
                 <Line type="monotone" dataKey="Run rate" stroke="#6b7280" strokeWidth={1} strokeDasharray="3 3" dot={false} connectNulls />
               )}
-              {/* Benchmarks sit within a few % of each other — a single shaded guidance
-                  BAND with one label (right), Clearline labeled left, and reported
-                  centered keeps lines and labels from colliding. */}
+              {/* Benchmark labels hug the right edge, tight to their own line/band:
+                  Guidance at the band's top-right edge, Clearline just BELOW its
+                  line, Reported just ABOVE its line — opposing nudges keep them
+                  apart even though Clearline typically sits inside the band. */}
               {scaled && guidanceLow != null && guidanceHigh != null && (
                 <ReferenceArea
                   y1={guidanceLow}
@@ -1275,7 +1331,7 @@ export function QtdProgress() {
                   stroke="#15803d"
                   strokeOpacity={0.4}
                   strokeDasharray="4 2"
-                  label={{ value: `Guidance ${fmtM(guidanceLow)}–${fmtM(guidanceHigh)}`, position: "insideTopRight", fontSize: 10, fill: "#15803d" }}
+                  label={{ value: `Guidance ${fmtM(guidanceLow)}–${fmtM(guidanceHigh)}`, position: "insideTopRight", fontSize: 10, fill: "#15803d", dy: -2 }}
                 />
               )}
               {scaled && clearline != null && (
@@ -1283,14 +1339,14 @@ export function QtdProgress() {
                   y={clearline}
                   stroke="#d97706"
                   strokeDasharray="5 3"
-                  label={{ value: `Clearline ${fmtM(clearline)}`, position: "insideLeft", fontSize: 10, fill: "#d97706", dy: -7 }}
+                  label={{ value: `Clearline ${fmtM(clearline)}`, position: "insideRight", fontSize: 10, fill: "#d97706", dy: 10 }}
                 />
               )}
               {scaled && view.reported != null && (
                 <ReferenceLine
                   y={view.reported}
                   stroke="#dc2626"
-                  label={{ value: `Reported actual ${fmtM(view.reported)}`, position: "center", fontSize: 10, fill: "#dc2626", dy: -7 }}
+                  label={{ value: `Reported actual ${fmtM(view.reported)}`, position: "insideRight", fontSize: 10, fill: "#dc2626", dy: -7 }}
                 />
               )}
             </>
