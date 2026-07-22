@@ -70,10 +70,12 @@ times are **UTC**.
   scrapers run on every fire, but the once-daily work (`sold_lots` reconciliation, SAM,
   state contracts, retention, forecast snapshot) only on the **noon-ET** fire
   (16:00 UTC = noon EDT / 11am EST; gated by `DAILY_INGEST_HOURS_ET=11,12`). Replaced the
-  old Vercel cron. The **report email** fires on the report-hour runs — noon AND ~5pm ET
-  (`REPORT_HOURS_ET=11,12,16,17`, DST-safe), so it is sent by both `lqdt-cron` (noon) and
-  `lqdt-sold-capture` (5pm). Preview a report to rma@clearlinecap.com without running the
-  pipeline via `?sendReportOnly=1&secret=…`.
+  old Vercel cron. The **report email** fires on exactly two runs: the **noon** daily
+  fire (`isDailyRun`, `DAILY_INGEST_HOURS_ET`) and the **~5pm** sold-capture fire
+  (`?sold=1` at ET `REPORT_EVENING_HOURS_ET=16,17`, DST-safe). Tying the evening send to
+  the `?sold=1` flag is what keeps the every-4h 4pm-EDT `lqdt-cron` fire (20:00 UTC, ET
+  hour 16, no sold flag) from sending a spurious third report. Preview a report to
+  rma@clearlinecap.com without running the pipeline via `?sendReportOnly=1&secret=…`.
 - **`lqdt-sold-capture`** — intraday `sold_lots` refreshes so the *current* day's GMV
   shows up same-day instead of waiting for the next noon reconciliation. Cron
   `0 3,21 * * *` → **~5pm ET** (21:00 UTC — "halfway", ~66% of the day's GMV closed) and

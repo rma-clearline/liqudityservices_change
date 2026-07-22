@@ -369,16 +369,23 @@ export async function GET(request: Request) {
     }),
   );
 
-  // Report email on the report-hour runs (noon + 5pm ET by default, DST-safe).
+  // Report email on exactly two runs — noon + 5pm ET — tied to the specific
+  // fire, not the raw hour, so DST can't misroute it:
+  //   - noon:    the daily lqdt-cron fire (isDailyRun, 16:00 UTC → ET 12/11).
+  //   - evening: the 5pm lqdt-sold-capture fire (?sold=1 at ET 16/17, 21:00 UTC).
+  // Gating the evening send on ?sold=1 excludes the 4pm-EDT every-4h lqdt-cron
+  // fire (20:00 UTC → ET hour 16, but no sold flag) — the spurious third send —
+  // and the ET-hour bound excludes the 11pm sold-capture fire (03:00 UTC → 22/23).
   // ?sendEmail=1 forces, ?sendEmail=0 suppresses. The forecast snapshot above is
-  // refreshed before this step on both those runs, so the QTD numbers are fresh.
-  const reportHours = (process.env.REPORT_HOURS_ET || "11,12,16,17")
+  // refreshed before this step on both runs, so the QTD numbers are fresh.
+  const eveningHours = (process.env.REPORT_EVENING_HOURS_ET || "16,17")
     .split(",")
     .map(Number)
     .filter((h) => Number.isInteger(h) && h >= 0 && h <= 23);
   const forceEmail = searchParams.get("sendEmail") === "1";
   const skipEmail = searchParams.get("sendEmail") === "0";
-  const shouldEmail = !skipEmail && (forceEmail || reportHours.includes(now.getHours()));
+  const eveningReport = searchParams.get("sold") === "1" && eveningHours.includes(now.getHours());
+  const shouldEmail = !skipEmail && (forceEmail || isDailyRun || eveningReport);
   let emailResult: ReportEmailResult = {
     success: false,
     error: shouldEmail ? "skipped" : "skipped: not a report-hour run",
