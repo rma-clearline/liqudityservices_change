@@ -68,16 +68,20 @@ times are **UTC**.
 - **`lqdt-cron`** — the app's data pipeline. Cron `0 0,4,8,12,16,20 * * *` (every 4h).
   Runs `curl -fsS "$APP_URL/api/cron?secret=$CRON_SECRET"` (secret `cron-secret`). The
   scrapers run on every fire, but the once-daily work (`sold_lots` reconciliation, SAM,
-  state contracts, retention, forecast snapshot, email) only on the **noon-ET** fire
+  state contracts, retention, forecast snapshot) only on the **noon-ET** fire
   (16:00 UTC = noon EDT / 11am EST; gated by `DAILY_INGEST_HOURS_ET=11,12`). Replaced the
-  old Vercel cron.
+  old Vercel cron. The **report email** fires on the report-hour runs — noon AND ~5pm ET
+  (`REPORT_HOURS_ET=11,12,16,17`, DST-safe), so it is sent by both `lqdt-cron` (noon) and
+  `lqdt-sold-capture` (5pm). Preview a report to rma@clearlinecap.com without running the
+  pipeline via `?sendReportOnly=1&secret=…`.
 - **`lqdt-sold-capture`** — intraday `sold_lots` refreshes so the *current* day's GMV
   shows up same-day instead of waiting for the next noon reconciliation. Cron
   `0 3,21 * * *` → **~5pm ET** (21:00 UTC — "halfway", ~66% of the day's GMV closed) and
   **~11pm ET** (03:00 UTC — "end", ~99% closed). Runs
   `curl -fsS "$APP_URL/api/cron?sold=1&secret=$CRON_SECRET"`; `sold=1` captures sold lots +
-  refreshes the forecast snapshot only, skipping the once-daily email/SAM/state/retention
-  (so it never burns the SAM daily quota or re-sends email). Auction closings cluster in
+  refreshes the forecast snapshot, skipping the once-daily SAM/state/retention (so it never
+  burns the SAM daily quota). The 5pm fire also sends the report email (it is a report
+  hour); the 11pm fire (03:00 UTC → 22/23 ET) does not. Auction closings cluster in
   the evening ET (lot surge 7–10pm; only ~25% of GMV has closed by noon), which is why the
   noon fire alone left the current day near-empty until the next day. Two intraday fires +
   noon cover the day; reverting to every-4h capture is unnecessary cost. Times drift ±1h

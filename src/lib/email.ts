@@ -1,7 +1,7 @@
 import { Resend } from "resend";
 import { supabase } from "./supabase";
 import type { ListingRow } from "./supabase";
-import { downsample, MAX_CHART_LABELS } from "./chart-utils";
+import { downsample, MAX_CHART_LABELS, renderChartPng } from "./chart-utils";
 
 function getResend() {
   return new Resend(process.env.RESEND_API_KEY);
@@ -18,7 +18,7 @@ function fmtNum(n: number | null) {
   return n != null ? n.toLocaleString("en-US") : "N/A";
 }
 
-async function generateChartImage(rows: ListingRow[]): Promise<{ image: string | null; debug?: string }> {
+export async function generateChartImage(rows: ListingRow[]): Promise<{ image: string | null; debug?: string }> {
   const withData = rows.filter((r) => r.allsurplus != null || r.govdeals != null);
   if (withData.length === 0) return { image: null, debug: "no data rows" };
 
@@ -147,32 +147,7 @@ async function generateChartImage(rows: ListingRow[]): Promise<{ image: string |
     },
   };
 
-  try {
-    const postBody = JSON.stringify({
-      chart: chartConfig,
-      width: 800,
-      height: 400,
-      backgroundColor: "white",
-      format: "png",
-      version: "2",
-    });
-
-    const res = await fetch("https://quickchart.io/chart", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: postBody,
-    });
-
-    if (!res.ok) {
-      const errBody = await res.text().catch(() => "(could not read body)");
-      return { image: null, debug: `quickchart ${res.status}: ${errBody.slice(0, 300)}` };
-    }
-
-    const buffer = await res.arrayBuffer();
-    return { image: Buffer.from(buffer).toString("base64"), debug: `ok, ${buffer.byteLength} bytes` };
-  } catch (err) {
-    return { image: null, debug: `fetch error: ${err instanceof Error ? err.message : String(err)}` };
-  }
+  return renderChartPng(chartConfig, { width: 800, height: 400 });
 }
 
 export async function sendDailySummary({ date, timestamp, allsurplus, govdeals }: EmailParams) {

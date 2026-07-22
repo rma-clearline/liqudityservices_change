@@ -18,3 +18,30 @@ export function downsample<T>(items: T[], maxPoints: number): T[] {
 
 /** QuickChart free tier allows at most this many labels per chart. */
 export const MAX_CHART_LABELS = 250;
+
+/**
+ * Render a Chart.js (v2) config to a base64 PNG via the QuickChart REST API —
+ * the app's server-side static-chart path (email can't run JS). Never throws:
+ * returns { image: null, debug } on any network/HTTP error so a chart failure
+ * degrades to a text-only email instead of blocking the send.
+ */
+export async function renderChartPng(
+  config: unknown,
+  { width = 800, height = 400 }: { width?: number; height?: number } = {},
+): Promise<{ image: string | null; debug: string }> {
+  try {
+    const res = await fetch("https://quickchart.io/chart", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chart: config, width, height, backgroundColor: "white", format: "png", version: "2" }),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "(could not read body)");
+      return { image: null, debug: `quickchart ${res.status}: ${errBody.slice(0, 300)}` };
+    }
+    const buffer = await res.arrayBuffer();
+    return { image: Buffer.from(buffer).toString("base64"), debug: `ok, ${buffer.byteLength} bytes` };
+  } catch (err) {
+    return { image: null, debug: `fetch error: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}

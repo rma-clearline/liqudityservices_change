@@ -1,42 +1,14 @@
 "use client";
 
-// Shared primitives for the QTD page (qtd-progress.tsx + qtd-model-sections.tsx):
-// formatting, fiscal-quarter day math, and the Yipit-style stat card / vertical
-// metrics table. Extracted verbatim from qtd-progress.tsx — no behavior changes.
+// React primitives for the QTD page (StatCard, MetricsTable). The pure helpers
+// (fmtM, fmtPct, quarterDayKeys, priorYearQuarter, addDaysKey, cumulate) and the
+// MCol type live in src/lib/qtd-shared.ts so they can also run in Node (the cron
+// report email); they're re-exported here so existing client imports keep working.
 
 import { Fragment, type ReactNode } from "react";
-import { parseQuarterLabel } from "@/lib/time";
+import { fmtPct, type MCol } from "@/lib/qtd-shared";
 
-export const fmtM = (v: number) => `$${(v / 1e6).toFixed(1)}M`;
-export const fmtPct = (v: number, digits = 1) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(digits)}%`;
-
-/** YYYY-MM-DD keys of every day in the calendar quarter `label` (chronological). */
-export function quarterDayKeys(label: string): string[] {
-  const q = parseQuarterLabel(label);
-  if (!q) return [];
-  const keys: string[] = [];
-  const cursor = new Date(q.start);
-  while (cursor < q.end) {
-    keys.push(cursor.toISOString().slice(0, 10));
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
-  }
-  return keys;
-}
-
-export const priorYearQuarter = (label: string) => `${Number(label.slice(0, 4)) - 1}${label.slice(4)}`;
-
-export const addDaysKey = (key: string, n: number) => {
-  const [y, m, d] = key.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
-};
-
-export function cumulate(dayKeys: string[], byDate: Map<string, number>): number[] {
-  let run = 0;
-  return dayKeys.map((k) => {
-    run += byDate.get(k) ?? 0;
-    return run;
-  });
-}
+export { fmtM, fmtPct, quarterDayKeys, priorYearQuarter, addDaysKey, cumulate, type MCol } from "@/lib/qtd-shared";
 
 export function StatCard({ label, value, sub, strong }: { label: string; value: ReactNode; sub?: ReactNode; strong?: boolean }) {
   return (
@@ -47,20 +19,6 @@ export function StatCard({ label, value, sub, strong }: { label: string; value: 
     </div>
   );
 }
-
-/** One column of the Yipit-style key-metrics tables. `nominal` is captured-basis
- *  unless `total` (guidance/Clearline/reported — total-company $, never scaled).
- *  `lyReported`: LY reported total, enabling a scaled-vs-reported Y/Y fallback. */
-export type MCol = {
-  key: string;
-  top: string;
-  sub?: string;
-  nominal: number;
-  yoy: number | null;
-  lyReported?: number | null;
-  hl?: boolean;
-  total?: boolean;
-};
 
 export function MetricsTable({
   groups,

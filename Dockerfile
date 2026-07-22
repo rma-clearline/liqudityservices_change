@@ -33,6 +33,7 @@ ENV NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL \
     RESEND_API_KEY=build-placeholder \
     RESEND_FROM_EMAIL=build@placeholder.local \
     NOTIFICATION_EMAIL=build@placeholder.local \
+    REPORT_HOURS_ET=11,12,16,17 \
     SAM_API_KEY=build-placeholder \
     AUTH_SECRET=build-placeholder \
     ENTRA_TENANT_ID=build-placeholder \

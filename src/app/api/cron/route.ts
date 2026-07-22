@@ -8,7 +8,7 @@ import { writeSoldLots, isAzureSqlConfigured } from "@/lib/azure-sql";
 import { fetchNewContracts, fetchContractSummary } from "@/lib/contracts";
 import { fetchSamOpportunities } from "@/lib/sam-opportunities";
 import { fetchAllStateContracts } from "@/lib/state-contracts";
-import { sendDailySummary } from "@/lib/email";
+import { sendReportEmail, type ReportEmailResult } from "@/lib/report-email";
 import { CronLogger, type SourceSummary } from "@/lib/cron-log";
 
 // Daily reconciliation also materializes the forecast after ingestion.
@@ -44,6 +44,16 @@ export async function GET(request: Request) {
   const forceDaily = searchParams.get("daily") === "1" || searchParams.get("sendEmail") === "1";
   const runSoldCapture = isDailyRun || forceDaily || searchParams.get("sold") === "1";
   const runStateContracts = isDailyRun || forceDaily || searchParams.get("state") === "1";
+
+  // Preview trigger: build + send the report ONLY (to rma@clearlinecap.com),
+  // running no scrapers and writing no cron_runs — for reviewing the output.
+  if (searchParams.get("sendReportOnly") === "1") {
+    if (!process.env.RESEND_API_KEY) {
+      return NextResponse.json({ error: "RESEND_API_KEY not set" }, { status: 500 });
+    }
+    const preview = await sendReportEmail({ date, timestamp, toOverride: "rma@clearlinecap.com" });
+    return NextResponse.json({ mode: "report-preview", to: "rma@clearlinecap.com", date, timestamp, ...preview });
+  }
 
   const logger = new CronLogger();
 
@@ -359,22 +369,24 @@ export async function GET(request: Request) {
     }),
   );
 
-  // Email on the DST-safe daily run. ?sendEmail=1 forces.
+  // Report email on the report-hour runs (noon + 5pm ET by default, DST-safe).
+  // ?sendEmail=1 forces, ?sendEmail=0 suppresses. The forecast snapshot above is
+  // refreshed before this step on both those runs, so the QTD numbers are fresh.
+  const reportHours = (process.env.REPORT_HOURS_ET || "11,12,16,17")
+    .split(",")
+    .map(Number)
+    .filter((h) => Number.isInteger(h) && h >= 0 && h <= 23);
   const forceEmail = searchParams.get("sendEmail") === "1";
   const skipEmail = searchParams.get("sendEmail") === "0";
-  const shouldEmail = !skipEmail && (forceEmail || isDailyRun);
-  let emailResult: { success: boolean; error?: string; chartIncluded?: boolean; chartDebug?: string } = {
+  const shouldEmail = !skipEmail && (forceEmail || reportHours.includes(now.getHours()));
+  let emailResult: ReportEmailResult = {
     success: false,
-    error: shouldEmail ? "skipped" : "skipped: not noon ET run",
+    error: shouldEmail ? "skipped" : "skipped: not a report-hour run",
   };
-  if (shouldEmail && process.env.RESEND_API_KEY && listingResult) {
-    emailResult = await sendDailySummary({
-      date,
-      timestamp,
-      allsurplus: listingResult.allsurplus,
-      govdeals: listingResult.govdeals,
-    });
-    logger.push("email", emailResult.success ? "success" : "failed", null, { chartIncluded: emailResult.chartIncluded }, emailResult.error ?? null);
+  if (shouldEmail && process.env.RESEND_API_KEY) {
+    emailResult = await sendReportEmail({ date, timestamp });
+    // Persist the headline in the email row so the NEXT report can diff against it.
+    logger.push("email", emailResult.success ? "success" : "failed", null, { charts: emailResult.charts, headline: emailResult.headline ?? null }, emailResult.error ?? null);
   } else {
     logger.push("email", "skipped", null, null, emailResult.error ?? null);
   }

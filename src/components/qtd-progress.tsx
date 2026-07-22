@@ -24,7 +24,15 @@ import {
 } from "recharts";
 import type { NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
 import { downloadCsv } from "@/lib/format";
-import { enumerateQuarterLabelsBetween, etQuarterKey, formatQuarterLabel } from "@/lib/time";
+import { etQuarterKey, formatQuarterLabel } from "@/lib/time";
+import {
+  buildModel,
+  buildQuarterView,
+  PROJECTION_LABEL,
+  type ProjectionKey,
+  type QtdData as QtdComputeData,
+  type QtdModel,
+} from "@/lib/qtd-compute";
 import {
   computeQtdModelData,
   QtdModelSections,
@@ -34,7 +42,6 @@ import {
 } from "./qtd-model-sections";
 import {
   addDaysKey,
-  cumulate,
   fmtM,
   fmtPct,
   MetricsTable,
@@ -44,39 +51,11 @@ import {
   type MCol,
 } from "./qtd-shared";
 
-type DailyPoint = {
-  date: string;
-  realized_gmv_usd: number;
-  ad_realized_gmv_usd?: number;
-  gd_realized_gmv_usd?: number;
-  gi_realized_gmv_usd?: number;
-};
-
-type QtdData = {
-  daily: DailyPoint[];
-  earliest_data_date: string;
-  reported_gmv_by_quarter?: { quarter: string; reported_gmv_usd: number }[];
-  model_estimates_by_quarter?: {
-    quarter: string;
-    guidance_low_usd: number | null;
-    guidance_high_usd: number | null;
-    clearline_estimate_usd: number | null;
-    source?: "model" | "manual";
-    updated_by?: string | null;
-    updated_at?: string | null;
-  }[];
+// The forecast ALL payload, with the model-sections extras this component also renders.
+type QtdData = QtdComputeData & {
   model_metrics?: ModelMetricRow[];
   sold_by_bucket_daily?: BucketDailyRow[];
 };
-
-type ProjectionKey = "shape" | "runrate";
-
-const PROJECTION_LABEL: Record<ProjectionKey, string> = {
-  shape: "Prior-yr shape",
-  runrate: "Run rate",
-};
-
-const FALLBACK_CAPTURE = 0.535;
 
 const monthShift = (ym: string, delta: number) => {
   const [y, m] = ym.split("-").map(Number);
@@ -275,96 +254,6 @@ function DefinitionsBox() {
   );
 }
 
-type QtdModel = {
-  realizedByDate: Map<string, number>;
-  siteByDate: Map<string, { ad: number; gd: number; gi: number }>;
-  lastDataDate: string;
-  earliest: string;
-  quarters: string[];
-  reported: Map<string, number>;
-  estimates: Map<string, NonNullable<QtdData["model_estimates_by_quarter"]>[number]>;
-  autoCapture: number;
-  captureQuarters: { quarter: string; rate: number }[];
-};
-
-/** Everything the page derives for one quarter (cumulatives, Y/Y, projections,
- *  FQE, WoW). Pure so it can run for both the selected quarter (the chart) and
- *  the current quarter (the earnings-preview section, pinned to "now"). */
-function buildQuarterView(model: QtdModel, selected: string) {
-  const { realizedByDate, lastDataDate } = model;
-
-  const dayKeys = quarterDayKeys(selected);
-  if (dayKeys.length === 0) return null;
-  const D = dayKeys.length;
-  const startKey = dayKeys[0];
-  const endKey = dayKeys[D - 1];
-  const dataThrough = lastDataDate < endKey ? lastDataDate : endKey;
-  // Days into period with data (0 if the quarter hasn't started/no data).
-  const d = dayKeys.filter((k) => k <= dataThrough).length;
-  if (d === 0) return null;
-  const complete = d === D;
-
-  const curCum = cumulate(dayKeys, realizedByDate);
-  const qtd = curCum[d - 1];
-
-  // Prior-year same fiscal quarter, aligned by day index.
-  const lyKeys = quarterDayKeys(priorYearQuarter(selected));
-  const lyAvailable =
-    lyKeys.length > 0 && lyKeys[0] >= model.earliest && lyKeys[lyKeys.length - 1] <= lastDataDate;
-  const lyCum = lyAvailable ? cumulate(lyKeys, realizedByDate) : null;
-  const lyD = lyCum?.length ?? 0;
-  const lyAt = (i: number) => (lyCum ? lyCum[Math.min(i, lyD - 1)] : 0);
-  const lyQtd = lyCum ? lyAt(d - 1) : null;
-  const yoy = lyQtd && lyQtd > 0 ? qtd / lyQtd - 1 : null;
-
-  // LY REPORTED GMV prorated to day i using LY's captured daily shape — the
-  // denominator for the reported-anchored Y/Y shown in Scaled mode. Using
-  // lyCum's true final value (not lyAt(D-1)) makes lyReportedAt(D-1) equal
-  // lyReported exactly even when the quarters' day counts differ.
-  const lyReported = model.reported.get(priorYearQuarter(selected)) ?? null;
-  const lyCapturedTotal = lyCum ? lyCum[lyCum.length - 1] : 0;
-  const lyReportedAt =
-    lyReported != null && lyReported > 0 && lyCum != null && lyCapturedTotal > 0
-      ? (i: number) => lyReported * (lyAt(i) / lyCapturedTotal)
-      : null;
-
-  // Projections (captured units). Anchor every path at day d so the dashed
-  // lines extend the solid QTD line.
-  const shapeAvailable = !complete && lyCum != null && lyAt(d - 1) > 0;
-  const shapeAt = (i: number) => qtd + (lyAt(i) - lyAt(d - 1)) * (qtd / lyAt(d - 1));
-  const runRateAt = (i: number) => (qtd / d) * (i + 1);
-
-  const fqe = {
-    shape: shapeAvailable ? shapeAt(D - 1) : null,
-    runrate: !complete ? runRateAt(D - 1) : null,
-    actual: complete ? qtd : null,
-  };
-  // Primary FQE: prior-yr shape, else run-rate.
-  const primaryFqe = fqe.actual ?? fqe.shape ?? fqe.runrate ?? qtd;
-  const primaryMethod = fqe.actual != null ? "complete quarter" : fqe.shape != null ? PROJECTION_LABEL.shape : PROJECTION_LABEL.runrate;
-
-  // "What changed in the last week": same primary method, data as of 7 days earlier.
-  let wow: number | null = null;
-  if (!complete && d > 8) {
-    const d7 = d - 7;
-    const qtd7 = curCum[d7 - 1];
-    let prevFqe: number | null = null;
-    if (shapeAvailable && lyAt(d7 - 1) > 0) prevFqe = (qtd7 / lyAt(d7 - 1)) * lyAt(D - 1);
-    else if (qtd7 > 0) prevFqe = (qtd7 / d7) * D;
-    const nowFqe = fqe.shape ?? fqe.runrate;
-    if (prevFqe && prevFqe > 0 && nowFqe) wow = nowFqe / prevFqe - 1;
-  }
-
-  return {
-    dayKeys, D, d, startKey, endKey, dataThrough, complete,
-    curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable, lyReported, lyReportedAt,
-    shapeAvailable, shapeAt, runRateAt,
-    fqe, primaryFqe, primaryMethod, wow,
-    reported: model.reported.get(selected) ?? null,
-    estimate: model.estimates.get(selected) ?? null,
-  };
-}
-
 function QtdTooltip({ active, payload }: TooltipContentProps<ValueType, NameType>) {
   if (!active || !payload?.length) return null;
   const row = payload[0]?.payload as ChartRow | undefined;
@@ -453,42 +342,10 @@ export function QtdProgress() {
   const todayKey = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
   const currentQuarter = etQuarterKey(todayKey);
 
-  const model = useMemo((): QtdModel | null => {
-    const data = state.data;
-    if (!data) return null;
-
-    const realizedByDate = new Map<string, number>();
-    const siteByDate = new Map<string, { ad: number; gd: number; gi: number }>();
-    let lastDataDate = "";
-    for (const d of data.daily) {
-      realizedByDate.set(d.date, d.realized_gmv_usd);
-      siteByDate.set(d.date, {
-        ad: d.ad_realized_gmv_usd ?? 0,
-        gd: d.gd_realized_gmv_usd ?? 0,
-        gi: d.gi_realized_gmv_usd ?? 0,
-      });
-      if (d.realized_gmv_usd > 0 && d.date > lastDataDate && d.date <= todayKey) lastDataDate = d.date;
-    }
-    const earliest = data.earliest_data_date || data.daily[0]?.date || todayKey;
-    const quarters = enumerateQuarterLabelsBetween(etQuarterKey(earliest), currentQuarter).reverse(); // newest first
-
-    const reported = new Map((data.reported_gmv_by_quarter ?? []).map((r) => [r.quarter, r.reported_gmv_usd]));
-    const estimates = new Map((data.model_estimates_by_quarter ?? []).map((e) => [e.quarter, e]));
-
-    // Auto capture rate: mean scraped÷reported over the last 3 reported quarters
-    // whose window is fully covered by daily data.
-    const captures: { quarter: string; rate: number }[] = [];
-    for (const [q, rep] of [...reported.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      const keys = quarterDayKeys(q);
-      if (keys.length === 0 || keys[0] < earliest || keys[keys.length - 1] > lastDataDate) continue;
-      const scrapedSum = keys.reduce((s, k) => s + (realizedByDate.get(k) ?? 0), 0);
-      if (scrapedSum > 0 && rep > 0) captures.push({ quarter: q, rate: scrapedSum / rep });
-    }
-    const recent = captures.slice(-3);
-    const autoCapture = recent.length ? recent.reduce((s, c) => s + c.rate, 0) / recent.length : FALLBACK_CAPTURE;
-
-    return { realizedByDate, siteByDate, lastDataDate, earliest, quarters, reported, estimates, autoCapture, captureQuarters: recent };
-  }, [state.data, todayKey, currentQuarter]);
+  const model = useMemo<QtdModel | null>(
+    () => (state.data ? buildModel(state.data, todayKey, currentQuarter) : null),
+    [state.data, todayKey, currentQuarter],
+  );
 
   const selected = quarter ?? currentQuarter;
 
