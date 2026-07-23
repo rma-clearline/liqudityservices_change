@@ -221,6 +221,47 @@ function buildQtdChartConfig(h: QtdHeadline) {
   };
 }
 
+// --- QTD cumulative Y/Y chart (shown ABOVE the dollar chart) ----------------
+function buildQtdYoyChartConfig(h: QtdHeadline) {
+  const labels = h.series.map((p) => p.date.slice(5)); // MM-DD
+  const datasets: Record<string, unknown>[] = [
+    {
+      label: "Cumulative Y/Y",
+      data: h.series.map((p) => (p.yoy == null ? null : p.yoy * 100)),
+      borderColor: "#2563eb",
+      borderWidth: 2.5,
+      pointRadius: 0,
+      fill: false,
+      spanGaps: true,
+    },
+    {
+      // Zero reference line.
+      label: "0%",
+      data: labels.map(() => 0),
+      borderColor: "#9ca3af",
+      borderWidth: 1,
+      borderDash: [3, 3],
+      pointRadius: 0,
+      fill: false,
+    },
+  ];
+  return {
+    type: "line",
+    data: { labels, datasets },
+    options: {
+      title: {
+        display: true,
+        text: `QTD ${formatQuarterLabel(h.currentQuarter)} — cumulative Y/Y % (through ${h.dataThrough}, day ${h.d}/${h.D})`,
+      },
+      scales: {
+        xAxes: [{ ticks: { maxTicksLimit: 13, fontSize: 10 } }],
+        yAxes: [{ scaleLabel: { display: true, labelString: "Cumulative Y/Y (%)" } }],
+      },
+      legend: { position: "bottom", labels: { fontSize: 10 } },
+    },
+  };
+}
+
 // --- HTML helpers -----------------------------------------------------------
 const FONT = "font-family:'Segoe UI',system-ui,Arial,sans-serif;";
 const chgColor = (v: number | null | undefined) => (v == null ? "#6b7280" : v >= 0 ? "#15803d" : "#b91c1c");
@@ -244,7 +285,7 @@ function tilesGrid(cells: string[]): string {
   return `<table style="width:100%;border-collapse:collapse;table-layout:fixed;">${rows.join("")}</table>`;
 }
 
-function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCids: { qtd?: string; listings?: string }): string {
+function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCids: { qtdYoy?: string; qtd?: string; listings?: string }): string {
   const h = d.headline;
   const tiles: string[] = [];
   if (h) {
@@ -324,6 +365,7 @@ function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCid
     sinceLine = `<p style="font-size:12px;color:#6b7280;margin:8px 0 0;">Since last report (${d.sinceLast.prevDataThrough}): ${parts.join(" · ")}</p>`;
   }
 
+  const qtdYoyImg = chartCids.qtdYoy ? `<img src="cid:${chartCids.qtdYoy}" style="width:100%;max-width:720px;margin:12px 0;" alt="QTD cumulative Y/Y chart" />` : "";
   const qtdImg = chartCids.qtd ? `<img src="cid:${chartCids.qtd}" style="width:100%;max-width:720px;margin:12px 0;" alt="QTD GMV chart" />` : "";
   const listingsImg = chartCids.listings ? `<img src="cid:${chartCids.listings}" style="width:100%;max-width:720px;margin:12px 0;" alt="Listings chart" />` : "";
 
@@ -337,9 +379,10 @@ function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCid
       </td>
       <td style="vertical-align:top;text-align:right;white-space:nowrap;">${button}</td>
     </tr></table>
-    ${qtdImg}
+    ${qtdYoyImg}
     ${tiles.length ? `<div style="margin:12px 0 0;">${tilesGrid(tiles)}</div>` : ""}
     ${sinceLine}
+    ${qtdImg}
     ${segmentTable}
     ${previewTable}
     <h3 style="margin:22px 0 6px;font-size:14px;">Active listings</h3>
@@ -359,8 +402,8 @@ export type ReportEmailResult = {
   success: boolean;
   error?: string;
   recipients?: number;
-  charts?: { qtd: boolean; listings: boolean };
-  debug?: { qtd?: string; listings?: string };
+  charts?: { qtdYoy: boolean; qtd: boolean; listings: boolean };
+  debug?: { qtdYoy?: string; qtd?: string; listings?: string };
   /** Current headline — the cron logs this in the email row so the NEXT report
    *  can show "since last report" deltas. */
   headline?: HeadlineSnapshot | null;
@@ -391,10 +434,17 @@ export async function sendReportEmail({
 
   // Charts — each independent; failure degrades to text.
   const attachments: { filename: string; content: string; content_type: string; contentId: string }[] = [];
-  const chartCids: { qtd?: string; listings?: string } = {};
-  const debug: { qtd?: string; listings?: string } = {};
+  const chartCids: { qtdYoy?: string; qtd?: string; listings?: string } = {};
+  const debug: { qtdYoy?: string; qtd?: string; listings?: string } = {};
 
   if (data.headline) {
+    // Y/Y % chart first (rendered on top), then the cumulative-dollar chart.
+    const yoy = await renderChartPng(buildQtdYoyChartConfig(data.headline), { width: 800, height: 400 });
+    debug.qtdYoy = yoy.debug;
+    if (yoy.image) {
+      attachments.push({ filename: "qtd-yoy.png", content: yoy.image, content_type: "image/png", contentId: "chart_qtd_yoy" });
+      chartCids.qtdYoy = "chart_qtd_yoy";
+    }
     const qtd = await renderChartPng(buildQtdChartConfig(data.headline), { width: 800, height: 400 });
     debug.qtd = qtd.debug;
     if (qtd.image) {
@@ -422,7 +472,7 @@ export async function sendReportEmail({
     html,
   });
 
-  const charts = { qtd: !!chartCids.qtd, listings: !!chartCids.listings };
+  const charts = { qtdYoy: !!chartCids.qtdYoy, qtd: !!chartCids.qtd, listings: !!chartCids.listings };
   return error
     ? { success: false, error: error.message, recipients: recipients.length, charts, debug, headline: data.snapshot }
     : { success: true, recipients: recipients.length, charts, debug, headline: data.snapshot };
