@@ -10,6 +10,8 @@ import { fetchSamOpportunities } from "@/lib/sam-opportunities";
 import { fetchAllStateContracts } from "@/lib/state-contracts";
 import { sendReportEmail, type ReportEmailResult } from "@/lib/report-email";
 import { CronLogger, type SourceSummary } from "@/lib/cron-log";
+import { useAzureData } from "@/lib/data-backend";
+import { azUpsertListing } from "@/lib/azure-tables";
 
 // Daily reconciliation also materializes the forecast after ingestion.
 export const maxDuration = 120;
@@ -64,10 +66,20 @@ export async function GET(request: Request) {
     "listings",
     async () => {
       const { allsurplus, govdeals } = await scrapeListings();
-      const { error } = await supabaseAdmin
-        .from("listings")
-        .upsert({ date, timestamp, allsurplus, govdeals }, { onConflict: "date" });
-      return { allsurplus, govdeals, error: error?.message ?? null };
+      let error: string | null = null;
+      if (useAzureData()) {
+        try {
+          await azUpsertListing({ date, timestamp, allsurplus, govdeals });
+        } catch (e) {
+          error = e instanceof Error ? e.message : String(e);
+        }
+      } else {
+        const res = await supabaseAdmin
+          .from("listings")
+          .upsert({ date, timestamp, allsurplus, govdeals }, { onConflict: "date" });
+        error = res.error?.message ?? null;
+      }
+      return { allsurplus, govdeals, error };
     },
     (r): SourceSummary => ({
       status: r.error ? "failed" : "success",

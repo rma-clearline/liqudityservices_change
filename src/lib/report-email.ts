@@ -19,6 +19,8 @@ import { buildModel, buildQuarterView, computeQtdHeadline, type QtdData, type Qt
 import { computeQtdModelData, type ListingsDay } from "@/lib/qtd-model-compute";
 import { fmtM, fmtPct } from "@/lib/qtd-shared";
 import { supabaseAdmin } from "@/lib/supabase";
+import { useAzureData } from "@/lib/data-backend";
+import { azFetchRecentEmailRuns } from "@/lib/azure-tables";
 import { addDaysKey } from "@/lib/qtd-shared";
 import { etQuarterKey, formatQuarterLabel } from "@/lib/time";
 
@@ -50,14 +52,18 @@ async function loadPreviousReportHeadline(): Promise<HeadlineSnapshot | null> {
     }
   }
   try {
-    const { data } = await supabaseAdmin
-      .from("cron_runs")
-      .select("detail, started_at")
-      .eq("source", "email")
-      .eq("status", "success")
-      .order("started_at", { ascending: false })
-      .limit(10);
-    for (const row of data ?? []) {
+    const rows = useAzureData()
+      ? await azFetchRecentEmailRuns(10)
+      : ((
+          await supabaseAdmin
+            .from("cron_runs")
+            .select("detail, started_at")
+            .eq("source", "email")
+            .eq("status", "success")
+            .order("started_at", { ascending: false })
+            .limit(10)
+        ).data ?? []);
+    for (const row of rows) {
       const hl = (row.detail as { headline?: HeadlineSnapshot } | null)?.headline;
       if (hl && typeof hl.fqe === "number") return hl;
     }

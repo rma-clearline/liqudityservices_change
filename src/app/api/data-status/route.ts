@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { supabase } from "@/lib/supabase";
 import { ttlCache } from "@/lib/cache";
+import { useAzureData } from "@/lib/data-backend";
+import { azFetchDataFreshness, azFetchCronRunsRecent } from "@/lib/azure-tables";
 
 export const dynamic = "force-dynamic";
 
@@ -56,17 +58,19 @@ export async function GET() {
 }
 
 async function buildDataStatus() {
-  const [tables, cronRes] = await Promise.all([
+  const [tables, cronRows] = await Promise.all([
     loadTableFreshness(),
-    supabase
-      .from("cron_runs")
-      .select("run_id, source, status, rows_ingested, error, started_at, ended_at, duration_ms")
-      .order("started_at", { ascending: false })
-      .limit(60),
+    useAzureData()
+      ? (azFetchCronRunsRecent(60).catch(() => []) as Promise<CronRunRow[]>)
+      : supabase
+          .from("cron_runs")
+          .select("run_id, source, status, rows_ingested, error, started_at, ended_at, duration_ms")
+          .order("started_at", { ascending: false })
+          .limit(60)
+          .then((res) => (res.data ?? []) as CronRunRow[]),
   ]);
 
   // Reduce recent cron_runs to the latest entry per source.
-  const cronRows = (cronRes.data ?? []) as CronRunRow[];
   const perSource: Record<string, CronRunRow> = {};
   for (const row of cronRows) {
     if (!perSource[row.source]) perSource[row.source] = row; // rows already sorted desc
@@ -112,6 +116,7 @@ async function buildDataStatus() {
 }
 
 async function loadTableFreshness(): Promise<Record<string, string | null>> {
+  if (useAzureData()) return azFetchDataFreshness().catch(() => ({}));
   const { data, error } = await supabase.rpc("latest_data_freshness");
   if (!error && data && typeof data === "object" && !Array.isArray(data)) {
     return data as Record<string, string | null>;

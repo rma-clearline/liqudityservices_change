@@ -11,6 +11,17 @@ import type {
   SellerDeltaRow,
 } from "./supabase";
 import { ttlCache } from "./cache";
+import { useAzureData } from "./data-backend";
+import {
+  azFetchListings,
+  azFetchFederalContracts,
+  azFetchLatestContractSnapshot,
+  azFetchSamOpportunities,
+  azFetchStateContracts,
+  azLatestSellerSnapshot,
+  azFetchMarketplaceSellers,
+  azFetchSellerDeltas,
+} from "./azure-tables";
 
 // Cached loaders for the dashboard's Server-Component reads. Every query here is
 // GLOBAL and read-only (identical for all authenticated users), so a shared
@@ -24,6 +35,7 @@ const listingsCache = ttlCache<ListingRow[]>(TTL);
 
 export function getListings(): Promise<ListingRow[]> {
   return listingsCache.get("all", async () => {
+    if (useAzureData()) return azFetchListings();
     const { data } = await supabase
       .from("listings")
       .select("*")
@@ -53,6 +65,7 @@ const contractsCache = ttlCache<ContractsData>(TTL);
 // Latest marketplace_sellers snapshot: newest date, then all of that day's rows
 // (both platforms) so the government-level mix is a single consistent snapshot.
 async function latestSellerSnapshot(): Promise<{ date: string | null; sellers: MarketplaceSellerRow[] }> {
+  if (useAzureData()) return azLatestSellerSnapshot();
   const latest = await supabase
     .from("marketplace_sellers")
     .select("date")
@@ -66,6 +79,16 @@ async function latestSellerSnapshot(): Promise<{ date: string | null; sellers: M
 
 export function getContractsData(): Promise<ContractsData> {
   return contractsCache.get("all", async () => {
+    if (useAzureData()) {
+      const [contracts, snapshot, sam, state, sellerSnapshot] = await Promise.all([
+        azFetchFederalContracts(20),
+        azFetchLatestContractSnapshot(),
+        azFetchSamOpportunities(100),
+        azFetchStateContracts(200),
+        latestSellerSnapshot(),
+      ]);
+      return { contracts, snapshot, sam, state, sellerSnapshot };
+    }
     const [contractsRes, snapshotsRes, samRes, stateRes, sellerSnapshot] = await Promise.all([
       supabase.from("federal_contracts").select("*").order("start_date", { ascending: false }).limit(20),
       supabase.from("contract_snapshots").select("*").order("date", { ascending: false }).limit(1),
@@ -99,6 +122,10 @@ const marketplaceCache = ttlCache<MarketplaceData>(TTL);
 
 export function getMarketplaceData(): Promise<MarketplaceData> {
   return marketplaceCache.get("all", async () => {
+    if (useAzureData()) {
+      const [sellers, deltas] = await Promise.all([azFetchMarketplaceSellers(200), azFetchSellerDeltas()]);
+      return { sellers, deltas };
+    }
     const [sellersRes, deltasRes] = await Promise.all([
       supabase
         .from("marketplace_sellers")
