@@ -7,13 +7,19 @@
 //
 // Only cache data that is the SAME for every (authenticated) user and never
 // mutated in place by callers. Errors are not cached — a failed `load` is retried
-// on the next call.
+// on the next call. A `shouldCache` predicate lets the caller also refuse to cache
+// a resolved-but-degraded value (e.g. a forecast whose store read failed) so the
+// next request re-loads instead of serving the degraded value for the full TTL.
 
 type Entry<T> = { at: number; val: T };
 
 export type TtlCache<T> = {
-  /** Return the cached value if still fresh, else run `load`, store, and return it. */
-  get(key: string, load: () => Promise<T>): Promise<T>;
+  /**
+   * Return the cached value if still fresh, else run `load`, store, and return it.
+   * When `shouldCache` is given and returns false for the loaded value, the value
+   * is returned to this caller but NOT stored — the next call re-loads.
+   */
+  get(key: string, load: () => Promise<T>, shouldCache?: (val: T) => boolean): Promise<T>;
   /** Invalidate one key, or all keys when called with no argument. */
   clear(key?: string): void;
 };
@@ -22,7 +28,7 @@ export function ttlCache<T>(ttlMs: number): TtlCache<T> {
   const store = new Map<string, Entry<T>>();
   const pending = new Map<string, Promise<T>>();
   return {
-    async get(key, load) {
+    async get(key, load, shouldCache) {
       const hit = store.get(key);
       if (hit && Date.now() - hit.at < ttlMs) return hit.val;
       const inFlight = pending.get(key);
@@ -30,7 +36,7 @@ export function ttlCache<T>(ttlMs: number): TtlCache<T> {
 
       const request = load()
         .then((val) => {
-          store.set(key, { at: Date.now(), val });
+          if (!shouldCache || shouldCache(val)) store.set(key, { at: Date.now(), val });
           return val;
         })
         .finally(() => {

@@ -37,7 +37,10 @@ export async function GET(request: Request) {
   const quarter = searchParams.get("quarter")?.trim() || undefined;
 
   const key = quarter ?? "current";
-  const base = await forecastCache.get(key, () => loadBaseForecast(quarter));
+  // Don't cache a degraded forecast (live-quarter store read failed → collapsed to
+  // the sparse tracked feed). Caching one would serve the collapse for the full TTL;
+  // skipping the store means the next request re-computes and recovers immediately.
+  const base = await forecastCache.get(key, () => loadBaseForecast(quarter), (f) => !f.store_degraded);
   // Attach the reported-GMV benchmark + model estimates here (not in the snapshot):
   // full-history, take-rate-independent, and cheap, so they're always fresh regardless
   // of the selected quarter or when the cron last regenerated the snapshot.

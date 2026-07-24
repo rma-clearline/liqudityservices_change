@@ -573,6 +573,11 @@ export type RevenueForecast = {
   /** Realized-only totals (exclude the current-quarter projection). */
   realized_total_gmv_usd: number;
   realized_total_revenue_usd: number;
+  /** True when the live-quarter store read failed within its retry budget, so this
+   *  forecast fell back to the sparse tracked feed (recent GMV under-reports). The
+   *  /api/forecast cache uses this to avoid caching a degraded result. Absent/false
+   *  on healthy runs and when the store is legitimately unconfigured. */
+  store_degraded?: boolean;
   /** LQDT's total-company REPORTED GMV by calendar quarter — the benchmark the
    *  scraped/projected GMV is compared against. Attached by the forecast route from
    *  the committed model export; optional so the core computation is unaffected. */
@@ -1108,13 +1113,41 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   const liveDays = chartDays.filter((d) => !historicalDailyGmv.totals.has(d) && d <= todayKey);
   const soldBySite: Record<SourceKey, number> = { AD: 0, GD: 0, GI: 0 };
   const storeDays = new Set<string>();
+  // Set true only when the store is configured + expected to answer but the read
+  // fails within the retry budget. A degraded run reverts the live quarter to the
+  // sparse tracked feed (collapsing recent GMV), so callers must NOT cache it —
+  // the /api/forecast cache skips storing a degraded forecast so the next request
+  // recovers immediately instead of serving the collapse for the full TTL.
+  let storeReadFailed = false;
   if (liveDays.length > 0 && isAzureSqlConfigured()) {
-    try {
-      const timeoutMs = Number(process.env.FORECAST_SOLD_TIMEOUT_MS) || 25000;
-      const soldRows = await Promise.race([
-        getSoldDaily(liveDays[0], liveDays[liveDays.length - 1]),
-        new Promise<SoldDailyRow[]>((_, reject) => setTimeout(() => reject(new Error("sold_lots timeout")), timeoutMs)),
-      ]);
+    const timeoutMs = Number(process.env.FORECAST_SOLD_TIMEOUT_MS) || 25000;
+    const attempts = Math.max(1, Number(process.env.FORECAST_SOLD_ATTEMPTS) || 2);
+    // Read the store with a bounded retry: a cold connection pool (first request
+    // after a scale/restart) or a transient blip fails the first attempt but the
+    // retry — pool now warming — usually succeeds. The retry uses a shorter
+    // timeout so the worst case stays bounded on a genuinely stalled DB.
+    let soldRows: SoldDailyRow[] | null = null;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const attemptMs = attempt === 1 ? timeoutMs : Math.min(timeoutMs, 8000);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        soldRows = await Promise.race([
+          getSoldDaily(liveDays[0], liveDays[liveDays.length - 1]).finally(() => clearTimeout(timer)),
+          new Promise<SoldDailyRow[]>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("sold_lots timeout")), attemptMs);
+          }),
+        ]);
+        break; // success
+      } catch {
+        clearTimeout(timer);
+        if (attempt >= attempts) {
+          storeReadFailed = true; // exhausted retries → degraded run
+        } else {
+          await new Promise((r) => setTimeout(r, 500)); // brief backoff, then retry
+        }
+      }
+    }
+    if (soldRows) {
       const perDay = new Map<string, { all: number; domestic: number; intl: number; lots: number } & Record<SourceKey, number>>();
       for (const r of soldRows) {
         let b = perDay.get(r.date);
@@ -1142,10 +1175,6 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
         soldBySite.GI += s.GI;
         storeDays.add(key);
       }
-    } catch {
-      // Store unreachable → keep the tracked-auctions fill for all live days.
-      storeDays.clear();
-      soldBySite.AD = soldBySite.GD = soldBySite.GI = 0;
     }
   }
 
@@ -1270,6 +1299,7 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     projected_total_revenue_usd,
     realized_total_gmv_usd,
     realized_total_revenue_usd,
+    store_degraded: storeReadFailed,
     debug,
   };
 }
