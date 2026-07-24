@@ -111,7 +111,7 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "T7D Y/Y",
-        def: "Trailing-7-day captured GMV vs the same 7 days 52 weeks ago (a 364-day shift, which preserves the weekday mix — auction closings cluster by weekday).",
+        def: "Trailing-7-day captured GMV vs the same 7 days 52 weeks ago (a 364-day shift, which preserves the weekday mix — auction closings cluster by weekday). The window ends at the last COMPLETE ET day; the current (still-filling) day is excluded so intraday snapshots don't swing.",
       },
       {
         term: "Last 7 days (FQE change)",
@@ -534,9 +534,14 @@ export function QtdProgress() {
   }
 
   // Trailing 7 days, one row per week-ending; Y/Y is 52-week (weekday-aligned).
+  // End at the last COMPLETE ET day — "today" is only partially captured until its
+  // auctions close, so including it compares a partial day to a full LY day and
+  // makes the small 7-day base swing several points intraday. (MTD/QTD above keep
+  // `last` — a partial day is negligible there and freshness is the point.)
+  const t7dEnd = last < todayKey ? last : addDaysKey(todayKey, -1);
   const t7dCols: MCol[] = [];
   for (const off of [49, 42, 35, 28, 21, 14, 7, 0]) {
-    const end = addDaysKey(last, -off);
+    const end = addDaysKey(t7dEnd, -off);
     const start = addDaysKey(end, -6);
     if (!coveredFrom(start)) continue;
     const nominal = sumRange(start, end);

@@ -240,7 +240,12 @@ export function computeQtdHeadline(
     for (let k = from; k <= to; k = addDaysKey(k, 1)) s += realized.get(k) ?? 0;
     return s;
   };
-  const t7dEnd = model.lastDataDate;
+  // End the T7D window at the last COMPLETE ET day. "Today" is only partially
+  // captured until its auctions close in the evening, so including it compares a
+  // partial current day against a full LY day — on a ~$18M weekly base a single
+  // day's fill swings Y/Y several points between the noon and 5pm reports. When
+  // capture lags (lastDataDate already behind), that day is complete — use it.
+  const t7dEnd = model.lastDataDate < todayKey ? model.lastDataDate : addDaysKey(todayKey, -1);
   const t7dStart = addDaysKey(t7dEnd, -6);
   let t7dYoy: number | null = null;
   if (t7dStart >= model.earliest) {
