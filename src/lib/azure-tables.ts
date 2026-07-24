@@ -447,8 +447,10 @@ export async function azSweepClosures(nowIso: string): Promise<{ sold: number; n
     .request()
     .input("now", sql.DateTime2, new Date(nowIso))
     .query(
+      // <=0 (not =0) so it + the bid_count>0 branch are exhaustive — a negative
+      // bid_count files as nosale, matching the Supabase `bids>0 ? unknown : nosale`.
       "UPDATE lqdt.auctions SET status = 'closed_nosale', final_price_usd = 0, closed_at = @now " +
-        "WHERE status = 'open' AND close_time_utc < @now AND (bid_count IS NULL OR bid_count = 0)",
+        "WHERE status = 'open' AND close_time_utc < @now AND (bid_count IS NULL OR bid_count <= 0)",
     );
   const unknownRes = await pool
     .request()
@@ -596,8 +598,11 @@ const STATE_MERGE_SQL =
   "ON t.state_code=s.state_code AND t.source_dataset_id=s.source_dataset_id AND t.contract_id=s.contract_id " +
   "AND t.vendor_normalized=s.vendor_normalized AND t.year=s.year AND t.quarter=s.quarter " +
   "AND t.customer_agency=s.customer_agency AND t.record_type=COALESCE(s.record_type,'payment') " +
-  "WHEN MATCHED AND EXISTS (SELECT t.source_portal,t.vendor_name,t.contract_title,t.amount,t.period_start,t.period_end,t.source_query " +
-  "EXCEPT SELECT s.source_portal,s.vendor_name,s.contract_title,s.amount,s.period_start,s.period_end,s.source_query) " +
+  // Force a binary (case/accent-sensitive) collation on the string comparisons so
+  // the change-guard matches Postgres's `IS DISTINCT FROM` (bytewise) — the Azure
+  // DB default is case-insensitive, which would otherwise skip a case-only change.
+  "WHEN MATCHED AND EXISTS (SELECT t.source_portal COLLATE Latin1_General_BIN2, t.vendor_name COLLATE Latin1_General_BIN2, t.contract_title COLLATE Latin1_General_BIN2, t.amount, t.period_start, t.period_end, t.source_query COLLATE Latin1_General_BIN2 " +
+  "EXCEPT SELECT s.source_portal COLLATE Latin1_General_BIN2, s.vendor_name COLLATE Latin1_General_BIN2, s.contract_title COLLATE Latin1_General_BIN2, s.amount, s.period_start, s.period_end, s.source_query COLLATE Latin1_General_BIN2) " +
   "THEN UPDATE SET source_portal=s.source_portal, vendor_name=s.vendor_name, contract_title=s.contract_title, amount=s.amount, " +
   "period_start=s.period_start, period_end=s.period_end, source_query=s.source_query, last_seen_date=s.last_seen_date " +
   "WHEN NOT MATCHED THEN INSERT (state_code, source_portal, source_dataset_id, contract_id, vendor_name, vendor_normalized, " +
