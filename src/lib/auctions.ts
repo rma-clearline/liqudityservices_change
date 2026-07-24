@@ -15,6 +15,15 @@ import {
 } from "./maestro";
 import { dateKeyToUtcDate, enumerateDays, enumerateQuarterLabelsBetween, etDateKey, parseQuarterLabel, quarterBounds } from "./time";
 import { getSoldDaily, isAzureSqlConfigured, type SoldDailyRow } from "./azure-sql";
+import { useAzureData } from "./data-backend";
+import {
+  azUpsertAuctionsOpen,
+  azUpsertAuctionsSold,
+  azSweepClosures,
+  azFetchAuctionsClosed,
+  azFetchAuctionsOpen,
+  azFetchAuctionsDebug,
+} from "./azure-tables";
 
 const PAGE_SIZE = Number(process.env.AUCTIONS_PAGE_SIZE) || 50;
 const MAX_PAGES_PER_PLATFORM = Number(process.env.AUCTIONS_MAX_PAGES) || 10;
@@ -308,9 +317,18 @@ async function ingestPlatform(platform: Platform, fx: FxRates, nowIso: string): 
     result.rowsSkippedFx += rows.filter((r) => r.current_bid_usd === null).length;
 
     if (rows.length > 0) {
-      const { error } = await supabaseAdmin.from("auctions").upsert(rows, { onConflict: "platform,asset_id" });
-      if (!error) result.upserted += rows.length;
-      else if (!result.upsertError) result.upsertError = error.message;
+      if (useAzureData()) {
+        try {
+          await azUpsertAuctionsOpen(rows);
+          result.upserted += rows.length;
+        } catch (e) {
+          if (!result.upsertError) result.upsertError = e instanceof Error ? e.message : String(e);
+        }
+      } else {
+        const { error } = await supabaseAdmin.from("auctions").upsert(rows, { onConflict: "platform,asset_id" });
+        if (!error) result.upserted += rows.length;
+        else if (!result.upsertError) result.upsertError = error.message;
+      }
     }
 
     if (pageResult.listings.length < PAGE_SIZE) break;
@@ -323,6 +341,13 @@ async function ingestPlatform(platform: Platform, fx: FxRates, nowIso: string): 
 type ClosureResult = { sold: number; nosale: number; unknown: number };
 
 async function sweepClosures(nowIso: string): Promise<ClosureResult> {
+  if (useAzureData()) {
+    try {
+      return await azSweepClosures(nowIso);
+    } catch {
+      return { sold: 0, nosale: 0, unknown: 0 };
+    }
+  }
   const { data, error } = await supabaseAdmin
     .from("auctions")
     .select("id, bid_count")
@@ -461,9 +486,18 @@ async function ingestSoldPlatform(
     result.rowsSkippedFx += rows.filter((r) => r.final_price_usd === null).length;
 
     if (rows.length > 0) {
-      const { error } = await supabaseAdmin.from("auctions").upsert(rows, { onConflict: "platform,asset_id" });
-      if (!error) result.upserted += rows.length;
-      else if (!result.upsertError) result.upsertError = error.message;
+      if (useAzureData()) {
+        try {
+          await azUpsertAuctionsSold(rows);
+          result.upserted += rows.length;
+        } catch (e) {
+          if (!result.upsertError) result.upsertError = e instanceof Error ? e.message : String(e);
+        }
+      } else {
+        const { error } = await supabaseAdmin.from("auctions").upsert(rows, { onConflict: "platform,asset_id" });
+        if (!error) result.upserted += rows.length;
+        else if (!result.upsertError) result.upsertError = error.message;
+      }
     }
 
     if (pageResult.listings.length < SOLD_PAGE_SIZE) break;
@@ -828,11 +862,20 @@ function sumHistoricalPlatform(
 }
 
 async function collectDebug(nowIso: string, startIso: string, endIso: string) {
-  const [allRes, sampleRes] = await Promise.all([
-    supabase.from("auctions").select("platform, status, close_time_utc"),
-    supabase.from("auctions").select("*").limit(1),
-  ]);
-  const rows = allRes.data ?? [];
+  let rows: unknown[];
+  let sampleRow: Record<string, unknown> | null;
+  if (useAzureData()) {
+    const d = await azFetchAuctionsDebug();
+    rows = d.rows;
+    sampleRow = d.sample;
+  } else {
+    const [allRes, sampleRes] = await Promise.all([
+      supabase.from("auctions").select("platform, status, close_time_utc"),
+      supabase.from("auctions").select("*").limit(1),
+    ]);
+    rows = allRes.data ?? [];
+    sampleRow = (sampleRes.data?.[0] as Record<string, unknown> | undefined) ?? null;
+  }
   const by_platform: Record<string, number> = {};
   const by_status: Record<string, number> = {};
   let with_close_time = 0;
@@ -868,7 +911,7 @@ async function collectDebug(nowIso: string, startIso: string, endIso: string) {
     in_quarter_closed,
     min_close_time,
     max_close_time,
-    sample_row: (sampleRes.data?.[0] as Record<string, unknown> | undefined) ?? null,
+    sample_row: sampleRow,
   };
 }
 
@@ -972,30 +1015,35 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   const perPlatform = await Promise.all(
     platforms.map(async (platform) => {
       const historical = sumHistoricalPlatform(historicalDailyGmv, platform, quarterDaySet);
-      const [closedRaw, openRaw] = await Promise.all([
-        fetchAllAuctionRows((from, to) =>
-          supabase
-            .from("auctions")
-            .select("asset_id, status, final_price_usd, current_bid_usd, close_time_utc, category, bid_count")
-            .eq("platform", platform)
-            .gte("close_time_utc", startIso)
-            .lt("close_time_utc", endIso)
-            .in("status", ["closed_sold", "closed_nosale"])
-            .order("close_time_utc", { ascending: false })
-            .range(from, to),
-        ),
-        fetchAllAuctionRows((from, to) =>
-          supabase
-            .from("auctions")
-            .select("asset_id, current_bid_usd, close_time_utc, category, bid_count")
-            .eq("platform", platform)
-            .eq("status", "open")
-            .gte("close_time_utc", nowIso)
-            .lt("close_time_utc", endIso)
-            .order("close_time_utc", { ascending: false })
-            .range(from, to),
-        ),
-      ]);
+      const [closedRaw, openRaw] = useAzureData()
+        ? await Promise.all([
+            azFetchAuctionsClosed(platform, startIso, endIso),
+            azFetchAuctionsOpen(platform, nowIso, endIso),
+          ])
+        : await Promise.all([
+            fetchAllAuctionRows((from, to) =>
+              supabase
+                .from("auctions")
+                .select("asset_id, status, final_price_usd, current_bid_usd, close_time_utc, category, bid_count")
+                .eq("platform", platform)
+                .gte("close_time_utc", startIso)
+                .lt("close_time_utc", endIso)
+                .in("status", ["closed_sold", "closed_nosale"])
+                .order("close_time_utc", { ascending: false })
+                .range(from, to),
+            ),
+            fetchAllAuctionRows((from, to) =>
+              supabase
+                .from("auctions")
+                .select("asset_id, current_bid_usd, close_time_utc, category, bid_count")
+                .eq("platform", platform)
+                .eq("status", "open")
+                .gte("close_time_utc", nowIso)
+                .lt("close_time_utc", endIso)
+                .order("close_time_utc", { ascending: false })
+                .range(from, to),
+            ),
+          ]);
 
       const closed = closedRaw as ClosedAuctionForProjection[];
       const open = openRaw as OpenAuctionForProjection[];

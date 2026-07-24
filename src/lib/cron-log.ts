@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { supabaseAdmin } from "./supabase";
+import { useAzureData } from "./data-backend";
+import { azInsertCronRuns } from "./azure-tables";
 
 export type CronStatus = "success" | "partial" | "failed" | "skipped";
 
@@ -94,7 +96,11 @@ export class CronLogger {
     };
     const all = [...this.records, summary];
     try {
-      await supabaseAdmin.from("cron_runs").insert(all);
+      if (useAzureData()) {
+        await azInsertCronRuns(all);
+      } else {
+        await supabaseAdmin.from("cron_runs").insert(all);
+      }
     } catch {
       // cron logging is best-effort — never fail the run because logging failed.
     }

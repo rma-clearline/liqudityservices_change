@@ -11,7 +11,15 @@ import { fetchAllStateContracts } from "@/lib/state-contracts";
 import { sendReportEmail, type ReportEmailResult } from "@/lib/report-email";
 import { CronLogger, type SourceSummary } from "@/lib/cron-log";
 import { useAzureData } from "@/lib/data-backend";
-import { azUpsertListing } from "@/lib/azure-tables";
+import {
+  azUpsertListing,
+  azUpsertMarketplaceSellers,
+  azInsertFederalContracts,
+  azUpsertContractSnapshot,
+  azInsertSamOpportunities,
+  azUpsertStateContracts,
+  azUpsertForecastSnapshot,
+} from "@/lib/azure-tables";
 
 // Daily reconciliation also materializes the forecast after ingestion.
 export const maxDuration = 120;
@@ -116,11 +124,20 @@ export async function GET(request: Request) {
       let sellersStored = 0;
       let sellersError: string | null = null;
       if (sellerRows.length > 0) {
-        const { error } = await supabaseAdmin
-          .from("marketplace_sellers")
-          .upsert(sellerRows, { onConflict: "date,platform,account_id" });
-        sellersError = error?.message ?? null;
-        sellersStored = error ? 0 : sellerRows.length;
+        if (useAzureData()) {
+          try {
+            await azUpsertMarketplaceSellers(sellerRows);
+            sellersStored = sellerRows.length;
+          } catch (e) {
+            sellersError = e instanceof Error ? e.message : String(e);
+          }
+        } else {
+          const { error } = await supabaseAdmin
+            .from("marketplace_sellers")
+            .upsert(sellerRows, { onConflict: "date,platform,account_id" });
+          sellersError = error?.message ?? null;
+          sellersStored = error ? 0 : sellerRows.length;
+        }
       }
       // scrapeMarketplaceMetrics never throws; a total fetch failure returns
       // empty metrics (sample_size 0, no sellers). Surface that as a failed run
@@ -211,28 +228,42 @@ export async function GET(request: Request) {
       const contractSummary = await fetchContractSummary(newContracts).catch(() => null);
       let stored = 0;
       if (newContracts.length > 0) {
-        const { error } = await supabaseAdmin
-          .from("federal_contracts")
-          .upsert(newContracts.map((c) => ({ ...c, first_seen_date: date })), {
-            onConflict: "award_id",
-            ignoreDuplicates: true,
-          });
-        stored = error ? 0 : newContracts.length;
+        const rows = newContracts.map((c) => ({ ...c, first_seen_date: date }));
+        if (useAzureData()) {
+          try {
+            await azInsertFederalContracts(rows);
+            stored = newContracts.length;
+          } catch {
+            stored = 0;
+          }
+        } else {
+          const { error } = await supabaseAdmin
+            .from("federal_contracts")
+            .upsert(rows, { onConflict: "award_id", ignoreDuplicates: true });
+          stored = error ? 0 : newContracts.length;
+        }
       }
       let snapshot = false;
       if (contractSummary) {
-        const { error } = await supabaseAdmin.from("contract_snapshots").upsert(
-          {
-            date,
-            total_active_contracts: contractSummary.total_active_contracts,
-            total_obligated_amount: contractSummary.total_obligated_amount,
-            new_contracts_last_30d: contractSummary.new_contracts_last_30d,
-            new_obligation_last_30d: contractSummary.new_obligation_last_30d,
-            top_agencies: contractSummary.top_agencies,
-          },
-          { onConflict: "date" },
-        );
-        snapshot = !error;
+        const snapRow = {
+          date,
+          total_active_contracts: contractSummary.total_active_contracts,
+          total_obligated_amount: contractSummary.total_obligated_amount,
+          new_contracts_last_30d: contractSummary.new_contracts_last_30d,
+          new_obligation_last_30d: contractSummary.new_obligation_last_30d,
+          top_agencies: contractSummary.top_agencies,
+        };
+        if (useAzureData()) {
+          try {
+            await azUpsertContractSnapshot(snapRow);
+            snapshot = true;
+          } catch {
+            snapshot = false;
+          }
+        } else {
+          const { error } = await supabaseAdmin.from("contract_snapshots").upsert(snapRow, { onConflict: "date" });
+          snapshot = !error;
+        }
       }
       return { fetched: newContracts.length, stored, snapshot };
     },
@@ -264,14 +295,21 @@ export async function GET(request: Request) {
       let stored = 0;
       let error: string | null = null;
       if (samResult.opportunities.length > 0) {
-        const { error: e } = await supabaseAdmin
-          .from("sam_opportunities")
-          .upsert(samResult.opportunities.map((o) => ({ ...o, first_seen_date: date })), {
-            onConflict: "notice_id",
-            ignoreDuplicates: true,
-          });
-        error = e?.message ?? null;
-        stored = e ? 0 : samResult.opportunities.length;
+        const rows = samResult.opportunities.map((o) => ({ ...o, first_seen_date: date }));
+        if (useAzureData()) {
+          try {
+            await azInsertSamOpportunities(rows);
+            stored = samResult.opportunities.length;
+          } catch (e) {
+            error = e instanceof Error ? e.message : String(e);
+          }
+        } else {
+          const { error: e } = await supabaseAdmin
+            .from("sam_opportunities")
+            .upsert(rows, { onConflict: "notice_id", ignoreDuplicates: true });
+          error = e?.message ?? null;
+          stored = e ? 0 : samResult.opportunities.length;
+        }
       }
       return { stored, debug: samResult.debug, error, skipped: false };
     },
@@ -300,18 +338,27 @@ export async function GET(request: Request) {
           void raw_data;
           return { ...contract, first_seen_date: date, last_seen_date: date };
         });
-        const rpc = await supabaseAdmin.rpc("upsert_state_contracts_cost_aware", { p_rows: rows });
-        if (!rpc.error) {
-          stored = Number(rpc.data ?? 0);
+        if (useAzureData()) {
+          try {
+            stored = await azUpsertStateContracts(rows);
+          } catch (e) {
+            error = e instanceof Error ? e.message : String(e);
+            stored = 0;
+          }
         } else {
-          // Rolling-deploy fallback until migration 027 is installed.
-          const fallback = await supabaseAdmin.from("state_contracts").upsert(rows, {
-            onConflict:
-              "state_code,source_dataset_id,contract_id,vendor_normalized,year,quarter,customer_agency,record_type",
-            ignoreDuplicates: false,
-          });
-          error = fallback.error?.message ?? null;
-          stored = fallback.error ? 0 : rows.length;
+          const rpc = await supabaseAdmin.rpc("upsert_state_contracts_cost_aware", { p_rows: rows });
+          if (!rpc.error) {
+            stored = Number(rpc.data ?? 0);
+          } else {
+            // Rolling-deploy fallback until migration 027 is installed.
+            const fallback = await supabaseAdmin.from("state_contracts").upsert(rows, {
+              onConflict:
+                "state_code,source_dataset_id,contract_id,vendor_normalized,year,quarter,customer_agency,record_type",
+              ignoreDuplicates: false,
+            });
+            error = fallback.error?.message ?? null;
+            stored = fallback.error ? 0 : rows.length;
+          }
         }
       }
       return { stored, perState: stateResult.perState, error, skipped: false };
@@ -342,6 +389,10 @@ export async function GET(request: Request) {
       if (!runSoldCapture) return { skipped: true, stored: 0, error: null as string | null };
       try {
         const payload = await computeRevenueForecast(1);
+        if (useAzureData()) {
+          await azUpsertForecastSnapshot(payload.quarter, payload);
+          return { skipped: false, stored: 1, error: null };
+        }
         const { error } = await supabaseAdmin.from("forecast_snapshots").upsert(
           { quarter: payload.quarter, payload, generated_at: new Date().toISOString() },
           { onConflict: "quarter" },

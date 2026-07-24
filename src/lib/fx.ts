@@ -12,6 +12,8 @@
 
 import { supabaseAdmin } from "./supabase";
 import { etTodayKey } from "./time";
+import { useAzureData } from "./data-backend";
+import { azUpsertFxRates } from "./azure-tables";
 
 // Maestro currency codes → ISO codes. Superset of the per-file maps.
 export const CURRENCY_MAP: Record<string, string> = {
@@ -107,7 +109,11 @@ export async function persistFxRates(fx: FxRates): Promise<void> {
     }));
   if (rows.length === 0) return;
   try {
-    await supabaseAdmin.from("fx_rates").upsert(rows, { onConflict: "date,currency" });
+    if (useAzureData()) {
+      await azUpsertFxRates(rows);
+    } else {
+      await supabaseAdmin.from("fx_rates").upsert(rows, { onConflict: "date,currency" });
+    }
   } catch {
     // fx_rates audit is best-effort; ingestion must not fail on it.
   }
