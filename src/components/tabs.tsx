@@ -8,7 +8,6 @@ const TABS = [
   { href: "/forecast", label: "Forecast" },
   { href: "/qtd", label: "QTD" },
   { href: "/marketplace", label: "Marketplace" },
-  { href: "/contracts", label: "Contracts" },
 ] as const;
 
 export function Tabs() {

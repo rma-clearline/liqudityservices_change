@@ -9,35 +9,6 @@ export type ListingRow = {
   created_at: string;
 };
 
-export type FederalContractRow = {
-  id: number;
-  award_id: string;
-  recipient_name: string;
-  award_amount: number | null;
-  total_obligation: number | null;
-  awarding_agency: string | null;
-  funding_agency: string | null;
-  award_type: string | null;
-  start_date: string | null;
-  end_date: string | null;
-  description: string | null;
-  place_of_performance_state: string | null;
-  naics_code: string | null;
-  first_seen_date: string;
-  created_at: string;
-};
-
-export type ContractSnapshotRow = {
-  id: number;
-  date: string;
-  total_active_contracts: number | null;
-  total_obligated_amount: number | null;
-  new_contracts_last_30d: number | null;
-  new_obligation_last_30d: number | null;
-  top_agencies: { name: string; amount: number; count: number }[] | null;
-  created_at: string;
-};
-
 export type MarketplaceSellerRow = {
   id: number;
   date: string;
@@ -70,31 +41,6 @@ export type SellerDeltaRow = {
   gmv_delta: number | null;
   is_new: boolean | null;
   disappeared: boolean | null;
-};
-
-export type SamOpportunityRow = {
-  id: number;
-  notice_id: string;
-  title: string;
-  solicitation_number: string | null;
-  organization: string | null;
-  posted_date: string | null;
-  response_deadline: string | null;
-  notice_type: string | null;
-  base_type: string | null;
-  naics_code: string | null;
-  classification_code: string | null;
-  description_url: string | null;
-  ui_link: string | null;
-  awardee_name: string | null;
-  awardee_uei: string | null;
-  award_amount: number | null;
-  award_date: string | null;
-  set_aside: string | null;
-  pop_state: string | null;
-  pop_city: string | null;
-  first_seen_date: string;
-  created_at: string;
 };
 
 export type AuctionRow = {
@@ -147,31 +93,6 @@ export type AuctionDailyStatsRow = {
   avg_hammer_usd: number;
   scheduled_open_bid_usd: number;
   total_bids_closed: number;
-};
-
-export type StateContractRow = {
-  id: number;
-  state_code: string;
-  source_portal: string;
-  source_dataset_id: string;
-  contract_id: string;
-  vendor_name: string;
-  vendor_normalized: string;
-  customer_agency: string;
-  contract_title: string | null;
-  amount: number | null;
-  year: string;
-  quarter: string;
-  period_start: string | null;
-  period_end: string | null;
-  record_type: string | null;
-  source_query: string | null;
-  raw_data: Record<string, unknown> | null;
-  first_seen_date: string;
-  // Advances when the source changes this row; source-level freshness is tracked
-  // separately in cron_runs to avoid no-op updates.
-  last_seen_date: string | null;
-  created_at: string;
 };
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;

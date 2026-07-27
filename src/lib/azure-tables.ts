@@ -8,15 +8,7 @@
 import "server-only";
 import sql from "mssql";
 import { getPool } from "./azure-sql";
-import type {
-  ListingRow,
-  FederalContractRow,
-  ContractSnapshotRow,
-  SamOpportunityRow,
-  StateContractRow,
-  MarketplaceSellerRow,
-  SellerDeltaRow,
-} from "./supabase";
+import type { ListingRow, MarketplaceSellerRow, SellerDeltaRow } from "./supabase";
 
 // --- boundary helpers -------------------------------------------------------
 /** DATETIME2/DATETIMEOFFSET → ISO string (matches PostgREST's timestamptz text). */
@@ -26,11 +18,6 @@ function iso(v: unknown): string | null {
   return String(v);
 }
 /** DATE → YYYY-MM-DD (the app compares these as plain date strings). */
-function dateOnly(v: unknown): string | null {
-  if (v == null) return null;
-  if (v instanceof Date) return v.toISOString().slice(0, 10);
-  return String(v).slice(0, 10);
-}
 function num(v: unknown): number | null {
   if (v == null) return null;
   const n = Number(v);
@@ -101,82 +88,6 @@ export async function azUpsertListing(v: {
         "WHEN NOT MATCHED THEN INSERT (date, timestamp, allsurplus, govdeals) " +
         "VALUES (@date, @timestamp, @allsurplus, @govdeals);",
     );
-}
-
-// --- contracts page reads ---------------------------------------------------
-export async function azFetchFederalContracts(limit = 20): Promise<FederalContractRow[]> {
-  const pool = await getPool();
-  const res = await pool.request().query(
-    `SELECT TOP (${top(limit, 20)}) * FROM lqdt.federal_contracts ORDER BY ${descNullsFirst("start_date")}`,
-  );
-  return res.recordset.map((r) => ({
-    ...(r as unknown as FederalContractRow),
-    id: Number(r.id),
-    award_amount: num(r.award_amount),
-    total_obligation: num(r.total_obligation),
-    created_at: iso(r.created_at) as string,
-  }));
-}
-
-export async function azFetchLatestContractSnapshot(): Promise<ContractSnapshotRow | null> {
-  const pool = await getPool();
-  const res = await pool.request().query("SELECT TOP (1) * FROM lqdt.contract_snapshots ORDER BY date DESC");
-  const r = res.recordset[0];
-  if (!r) return null;
-  return {
-    ...(r as unknown as ContractSnapshotRow),
-    id: Number(r.id),
-    total_obligated_amount: num(r.total_obligated_amount),
-    new_obligation_last_30d: num(r.new_obligation_last_30d),
-    top_agencies: parseJson<ContractSnapshotRow["top_agencies"]>(r.top_agencies),
-    created_at: iso(r.created_at) as string,
-  };
-}
-
-export async function azFetchSamOpportunities(limit = 100): Promise<SamOpportunityRow[]> {
-  const pool = await getPool();
-  const res = await pool.request().query(
-    `SELECT TOP (${top(limit, 100)}) * FROM lqdt.sam_opportunities ORDER BY ${descNullsFirst("posted_date")}`,
-  );
-  return res.recordset.map((r) => ({
-    ...(r as unknown as SamOpportunityRow),
-    id: Number(r.id),
-    award_amount: num(r.award_amount),
-    created_at: iso(r.created_at) as string,
-  }));
-}
-
-const STATE_COLS =
-  "id, state_code, source_portal, source_dataset_id, contract_id, vendor_name, vendor_normalized, " +
-  "customer_agency, contract_title, amount, year, quarter, period_start, period_end, record_type, " +
-  "source_query, first_seen_date, last_seen_date, created_at";
-
-export async function azFetchStateContracts(limit = 200): Promise<StateContractRow[]> {
-  const pool = await getPool();
-  const res = await pool.request().query(
-    `SELECT TOP (${top(limit, 200)}) ${STATE_COLS} FROM lqdt.state_contracts ORDER BY year DESC, quarter DESC`,
-  );
-  return res.recordset.map((r) => ({
-    ...(r as unknown as StateContractRow),
-    id: Number(r.id),
-    amount: num(r.amount),
-    period_start: dateOnly(r.period_start),
-    period_end: dateOnly(r.period_end),
-    raw_data: null,
-    created_at: iso(r.created_at) as string,
-  }));
-}
-
-export async function azLatestSellerSnapshot(): Promise<{ date: string | null; sellers: MarketplaceSellerRow[] }> {
-  const pool = await getPool();
-  const latest = await pool.request().query("SELECT TOP (1) date FROM lqdt.marketplace_sellers ORDER BY date DESC");
-  const date = latest.recordset[0]?.date ?? null;
-  if (!date) return { date: null, sellers: [] };
-  const rows = await pool
-    .request()
-    .input("date", sql.NVarChar(10), date)
-    .query("SELECT * FROM lqdt.marketplace_sellers WHERE date = @date");
-  return { date, sellers: rows.recordset.map(mapSeller) };
 }
 
 // --- marketplace page reads -------------------------------------------------
@@ -256,25 +167,13 @@ export async function azFetchDataFreshness(): Promise<Record<string, string | nu
     "SELECT " +
       "(SELECT MAX(date) FROM lqdt.listings) AS listings, " +
       "(SELECT MAX(date) FROM lqdt.marketplace_sellers) AS marketplace_sellers, " +
-      "(SELECT MAX(last_seen_at) FROM lqdt.auctions) AS auctions, " +
-      "(SELECT MAX(first_seen_date) FROM lqdt.federal_contracts) AS federal_contracts, " +
-      "(SELECT MAX(date) FROM lqdt.contract_snapshots) AS contract_snapshots, " +
-      "(SELECT MAX(first_seen_date) FROM lqdt.sam_opportunities) AS sam_opportunities, " +
-      // Return the two state_contracts freshness sources separately and COALESCE in
-      // JS, so the fallback stays a plain YYYY-MM-DD string (matching the Supabase
-      // RPC) instead of being widened to a datetime2.
-      "(SELECT MAX(ended_at) FROM lqdt.cron_runs WHERE source = 'state_contracts' AND status IN ('success','partial')) AS state_ended_at, " +
-      "(SELECT MAX(COALESCE(last_seen_date, first_seen_date)) FROM lqdt.state_contracts) AS state_date",
+      "(SELECT MAX(last_seen_at) FROM lqdt.auctions) AS auctions",
   );
   const r = res.recordset[0] ?? {};
   return {
     listings: r.listings ?? null,
     marketplace_sellers: r.marketplace_sellers ?? null,
     auctions: iso(r.auctions),
-    federal_contracts: r.federal_contracts ?? null,
-    contract_snapshots: r.contract_snapshots ?? null,
-    sam_opportunities: r.sam_opportunities ?? null,
-    state_contracts: r.state_ended_at != null ? iso(r.state_ended_at) : (r.state_date ?? null),
   };
 }
 
@@ -386,19 +285,6 @@ function upsertMergeSql(table: string, cols: Col[], keyCols: string[]): string {
     `MERGE ${table} WITH (HOLDLOCK) AS t ` +
     `USING (SELECT * FROM OPENJSON(@rows) WITH (${openJsonSchema(cols)})) AS s ON ${on} ` +
     `WHEN MATCHED THEN UPDATE SET ${set} ` +
-    `WHEN NOT MATCHED THEN INSERT (${insCols}) VALUES (${insVals});`
-  );
-}
-
-/** Insert-only MERGE (Supabase upsert with ignoreDuplicates:true): never updates
- *  an existing row, so first_seen_date and friends are preserved. */
-function insertOnlyMergeSql(table: string, cols: Col[], keyCols: string[]): string {
-  const on = keyCols.map((k) => `t.${k} = s.${k}`).join(" AND ");
-  const insCols = cols.map(([n]) => n).join(", ");
-  const insVals = cols.map(([n]) => `s.${n}`).join(", ");
-  return (
-    `MERGE ${table} WITH (HOLDLOCK) AS t ` +
-    `USING (SELECT * FROM OPENJSON(@rows) WITH (${openJsonSchema(cols)})) AS s ON ${on} ` +
     `WHEN NOT MATCHED THEN INSERT (${insCols}) VALUES (${insVals});`
   );
 }
@@ -530,93 +416,6 @@ const SELLER_COLS: Col[] = [
 export async function azUpsertMarketplaceSellers(rows: readonly object[]): Promise<number> {
   const key = (r: unknown) => { const o = r as { date: string; platform: string; account_id: string }; return `${o.date}:${o.platform}:${o.account_id}`; };
   return runJsonWrite(upsertMergeSql("lqdt.marketplace_sellers", SELLER_COLS, ["date", "platform", "account_id"]), dedupBy(rows, key));
-}
-
-// --- federal_contracts (insert-only) ---
-const FEDERAL_COLS: Col[] = [
-  ["award_id", "NVARCHAR(256)"], ["recipient_name", "NVARCHAR(512)"], ["award_amount", "REAL"],
-  ["total_obligation", "REAL"], ["awarding_agency", "NVARCHAR(512)"], ["funding_agency", "NVARCHAR(512)"],
-  ["award_type", "NVARCHAR(128)"], ["start_date", "NVARCHAR(10)"], ["end_date", "NVARCHAR(10)"],
-  ["description", "NVARCHAR(MAX)"], ["place_of_performance_state", "NVARCHAR(128)"], ["naics_code", "NVARCHAR(32)"],
-  ["first_seen_date", "NVARCHAR(10)"],
-];
-export async function azInsertFederalContracts(rows: readonly object[]): Promise<number> {
-  return runJsonWrite(insertOnlyMergeSql("lqdt.federal_contracts", FEDERAL_COLS, ["award_id"]), dedupBy(rows, (r) => String((r as { award_id: unknown }).award_id)));
-}
-
-// --- sam_opportunities (insert-only) ---
-const SAM_COLS: Col[] = [
-  ["notice_id", "NVARCHAR(256)"], ["title", "NVARCHAR(MAX)"], ["solicitation_number", "NVARCHAR(256)"],
-  ["organization", "NVARCHAR(512)"], ["posted_date", "NVARCHAR(10)"], ["response_deadline", "NVARCHAR(32)"],
-  ["notice_type", "NVARCHAR(128)"], ["base_type", "NVARCHAR(128)"], ["naics_code", "NVARCHAR(32)"],
-  ["classification_code", "NVARCHAR(32)"], ["description_url", "NVARCHAR(MAX)"], ["ui_link", "NVARCHAR(MAX)"],
-  ["awardee_name", "NVARCHAR(512)"], ["awardee_uei", "NVARCHAR(64)"], ["award_amount", "DECIMAL(18,2)"],
-  ["award_date", "NVARCHAR(10)"], ["set_aside", "NVARCHAR(256)"], ["pop_state", "NVARCHAR(128)"],
-  ["pop_city", "NVARCHAR(256)"], ["first_seen_date", "NVARCHAR(10)"],
-];
-export async function azInsertSamOpportunities(rows: readonly object[]): Promise<number> {
-  return runJsonWrite(insertOnlyMergeSql("lqdt.sam_opportunities", SAM_COLS, ["notice_id"]), dedupBy(rows, (r) => String((r as { notice_id: unknown }).notice_id)));
-}
-
-// --- contract_snapshots upsert (single row; top_agencies is JSON) ---
-export async function azUpsertContractSnapshot(row: {
-  date: string;
-  total_active_contracts: number | null;
-  total_obligated_amount: number | null;
-  new_contracts_last_30d: number | null;
-  new_obligation_last_30d: number | null;
-  top_agencies: unknown;
-}): Promise<void> {
-  const pool = await getPool();
-  await withDeadlockRetry(() =>
-    pool
-      .request()
-      .input("date", sql.NVarChar(10), row.date)
-      .input("tac", sql.Int, row.total_active_contracts)
-      .input("toa", sql.Real, row.total_obligated_amount)
-      .input("nc30", sql.Int, row.new_contracts_last_30d)
-      .input("no30", sql.Real, row.new_obligation_last_30d)
-      .input("top", sql.NVarChar(sql.MAX), row.top_agencies == null ? null : JSON.stringify(row.top_agencies))
-      .query(
-        "MERGE lqdt.contract_snapshots WITH (HOLDLOCK) AS t USING (SELECT @date AS date) AS s ON t.date = s.date " +
-          "WHEN MATCHED THEN UPDATE SET total_active_contracts=@tac, total_obligated_amount=@toa, " +
-          "new_contracts_last_30d=@nc30, new_obligation_last_30d=@no30, top_agencies=@top " +
-          "WHEN NOT MATCHED THEN INSERT (date, total_active_contracts, total_obligated_amount, new_contracts_last_30d, new_obligation_last_30d, top_agencies) " +
-          "VALUES (@date, @tac, @toa, @nc30, @no30, @top);",
-      ),
-  );
-}
-
-// --- state_contracts cost-aware upsert (OPENJSON + IS-DISTINCT-FROM guard;
-//     preserves first_seen_date). Returns the affected row count. ---
-const STATE_MERGE_SQL =
-  "MERGE lqdt.state_contracts WITH (HOLDLOCK) AS t USING (SELECT * FROM OPENJSON(@rows) WITH (" +
-  "state_code NVARCHAR(8), source_portal NVARCHAR(256), source_dataset_id NVARCHAR(256), contract_id NVARCHAR(256), " +
-  "vendor_name NVARCHAR(512), vendor_normalized NVARCHAR(512), customer_agency NVARCHAR(512), contract_title NVARCHAR(MAX), " +
-  "amount DECIMAL(18,2), year NVARCHAR(8), quarter NVARCHAR(8), period_start DATE, period_end DATE, " +
-  "record_type NVARCHAR(32), source_query NVARCHAR(MAX), first_seen_date NVARCHAR(10), last_seen_date NVARCHAR(10))) AS s " +
-  "ON t.state_code=s.state_code AND t.source_dataset_id=s.source_dataset_id AND t.contract_id=s.contract_id " +
-  "AND t.vendor_normalized=s.vendor_normalized AND t.year=s.year AND t.quarter=s.quarter " +
-  "AND t.customer_agency=s.customer_agency AND t.record_type=COALESCE(s.record_type,'payment') " +
-  // Force a binary (case/accent-sensitive) collation on the string comparisons so
-  // the change-guard matches Postgres's `IS DISTINCT FROM` (bytewise) — the Azure
-  // DB default is case-insensitive, which would otherwise skip a case-only change.
-  "WHEN MATCHED AND EXISTS (SELECT t.source_portal COLLATE Latin1_General_BIN2, t.vendor_name COLLATE Latin1_General_BIN2, t.contract_title COLLATE Latin1_General_BIN2, t.amount, t.period_start, t.period_end, t.source_query COLLATE Latin1_General_BIN2 " +
-  "EXCEPT SELECT s.source_portal COLLATE Latin1_General_BIN2, s.vendor_name COLLATE Latin1_General_BIN2, s.contract_title COLLATE Latin1_General_BIN2, s.amount, s.period_start, s.period_end, s.source_query COLLATE Latin1_General_BIN2) " +
-  "THEN UPDATE SET source_portal=s.source_portal, vendor_name=s.vendor_name, contract_title=s.contract_title, amount=s.amount, " +
-  "period_start=s.period_start, period_end=s.period_end, source_query=s.source_query, last_seen_date=s.last_seen_date " +
-  "WHEN NOT MATCHED THEN INSERT (state_code, source_portal, source_dataset_id, contract_id, vendor_name, vendor_normalized, " +
-  "customer_agency, contract_title, amount, year, quarter, period_start, period_end, record_type, source_query, first_seen_date, last_seen_date) " +
-  "VALUES (s.state_code, s.source_portal, s.source_dataset_id, s.contract_id, s.vendor_name, s.vendor_normalized, s.customer_agency, " +
-  "s.contract_title, s.amount, s.year, s.quarter, s.period_start, s.period_end, COALESCE(s.record_type,'payment'), s.source_query, " +
-  "s.first_seen_date, s.last_seen_date);";
-
-export async function azUpsertStateContracts(rows: readonly object[]): Promise<number> {
-  const key = (r: unknown) => {
-    const o = r as Record<string, unknown>;
-    return [o.state_code, o.source_dataset_id, o.contract_id, o.vendor_normalized, o.year, o.quarter, o.customer_agency, o.record_type ?? "payment"].join("");
-  };
-  return runJsonWrite(STATE_MERGE_SQL, dedupBy(rows, key));
 }
 
 // --- fx_rates upsert ---

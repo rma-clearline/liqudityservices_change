@@ -15,21 +15,10 @@ import {
 import { fetchAdminFeePercent } from "@/lib/asset-fees";
 import { etQuarterKey } from "@/lib/time";
 import { quarterDayKeys } from "@/lib/qtd-shared";
-import { fetchNewContracts, fetchContractSummary } from "@/lib/contracts";
-import { fetchSamOpportunities } from "@/lib/sam-opportunities";
-import { fetchAllStateContracts } from "@/lib/state-contracts";
 import { sendReportEmail, type ReportEmailResult } from "@/lib/report-email";
 import { CronLogger, type SourceSummary } from "@/lib/cron-log";
 import { useAzureData } from "@/lib/data-backend";
-import {
-  azUpsertListing,
-  azUpsertMarketplaceSellers,
-  azInsertFederalContracts,
-  azUpsertContractSnapshot,
-  azInsertSamOpportunities,
-  azUpsertStateContracts,
-  azUpsertForecastSnapshot,
-} from "@/lib/azure-tables";
+import { azUpsertListing, azUpsertMarketplaceSellers, azUpsertForecastSnapshot } from "@/lib/azure-tables";
 
 // Daily reconciliation also materializes the forecast after ingestion.
 export const maxDuration = 120;
@@ -63,7 +52,6 @@ export async function GET(request: Request) {
   const isDailyRun = dailyHours.includes(now.getHours());
   const forceDaily = searchParams.get("daily") === "1" || searchParams.get("sendEmail") === "1";
   const runSoldCapture = isDailyRun || forceDaily || searchParams.get("sold") === "1";
-  const runStateContracts = isDailyRun || forceDaily || searchParams.get("state") === "1";
 
   // Preview trigger: build + send the report ONLY (to rma@clearlinecap.com),
   // running no scrapers and writing no cron_runs — for reviewing the output.
@@ -109,7 +97,7 @@ export async function GET(request: Request) {
 
   // The marketplace_metrics cards were removed from the UI; we no longer persist
   // that table. This task still scrapes the marketplace to populate
-  // marketplace_sellers, which powers the Government Sellers widget (Contracts).
+  // marketplace_sellers, which powers the Top Sellers table on the Marketplace page.
   const metricsTask = logger.track(
     "marketplace_metrics",
     async () => {
@@ -292,165 +280,12 @@ export async function GET(request: Request) {
     }),
   );
 
-  const federalTask = logger.track(
-    "federal_contracts",
-    async () => {
-      const newContracts = await fetchNewContracts(99999);
-      const contractSummary = await fetchContractSummary(newContracts).catch(() => null);
-      let stored = 0;
-      if (newContracts.length > 0) {
-        const rows = newContracts.map((c) => ({ ...c, first_seen_date: date }));
-        if (useAzureData()) {
-          try {
-            await azInsertFederalContracts(rows);
-            stored = newContracts.length;
-          } catch {
-            stored = 0;
-          }
-        } else {
-          const { error } = await supabaseAdmin
-            .from("federal_contracts")
-            .upsert(rows, { onConflict: "award_id", ignoreDuplicates: true });
-          stored = error ? 0 : newContracts.length;
-        }
-      }
-      let snapshot = false;
-      if (contractSummary) {
-        const snapRow = {
-          date,
-          total_active_contracts: contractSummary.total_active_contracts,
-          total_obligated_amount: contractSummary.total_obligated_amount,
-          new_contracts_last_30d: contractSummary.new_contracts_last_30d,
-          new_obligation_last_30d: contractSummary.new_obligation_last_30d,
-          top_agencies: contractSummary.top_agencies,
-        };
-        if (useAzureData()) {
-          try {
-            await azUpsertContractSnapshot(snapRow);
-            snapshot = true;
-          } catch {
-            snapshot = false;
-          }
-        } else {
-          const { error } = await supabaseAdmin.from("contract_snapshots").upsert(snapRow, { onConflict: "date" });
-          snapshot = !error;
-        }
-      }
-      return { fetched: newContracts.length, stored, snapshot };
-    },
-    (r): SourceSummary => ({
-      status: "success",
-      rows: r.stored,
-      detail: { fetched: r.fetched, snapshot: r.snapshot },
-    }),
-  );
-
-  // SAM.gov: a single fetch fires ~10 requests (probe + brand-title + NAICS
-  // searches). SAM personal API keys have a small DAILY quota, so running every
-  // 4h (~60 req/day) throttles the key (HTTP 429) and stores nothing — the main
-  // reason sam_opportunities stayed empty. Opportunities change slowly, so run
-  // SAM once per day (the noon ET run, matching the email) unless forced.
-  const runSam = isDailyRun || forceDaily || searchParams.get("sam") === "1";
-  const samTask = logger.track(
-    "sam",
-    async () => {
-      if (!runSam) {
-        return {
-          stored: 0,
-          debug: "skipped: SAM runs once/day (noon ET) to stay within the API daily quota",
-          error: null,
-          skipped: true,
-        };
-      }
-      const samResult = await fetchSamOpportunities(90);
-      let stored = 0;
-      let error: string | null = null;
-      if (samResult.opportunities.length > 0) {
-        const rows = samResult.opportunities.map((o) => ({ ...o, first_seen_date: date }));
-        if (useAzureData()) {
-          try {
-            await azInsertSamOpportunities(rows);
-            stored = samResult.opportunities.length;
-          } catch (e) {
-            error = e instanceof Error ? e.message : String(e);
-          }
-        } else {
-          const { error: e } = await supabaseAdmin
-            .from("sam_opportunities")
-            .upsert(rows, { onConflict: "notice_id", ignoreDuplicates: true });
-          error = e?.message ?? null;
-          stored = e ? 0 : samResult.opportunities.length;
-        }
-      }
-      return { stored, debug: samResult.debug, error, skipped: false };
-    },
-    (r): SourceSummary => ({
-      status: r.skipped ? "skipped" : r.error ? "failed" : "success",
-      rows: r.stored,
-      detail: { debug: r.debug },
-      error: r.error,
-    }),
-  );
-
-  const stateTask = logger.track(
-    "state_contracts",
-    async () => {
-      if (!runStateContracts) {
-        return { stored: 0, perState: {}, error: null, skipped: true };
-      }
-      const stateResult = await fetchAllStateContracts();
-      let stored = 0;
-      let error: string | null = null;
-      if (stateResult.contracts.length > 0) {
-        // Cost-aware merge: insert new rows and update existing rows only when a
-        // business field changes. Source freshness comes from cron_runs, avoiding
-        // a new PostgreSQL row version for every unchanged contract.
-        const rows = stateResult.contracts.map(({ raw_data, ...contract }) => {
-          void raw_data;
-          return { ...contract, first_seen_date: date, last_seen_date: date };
-        });
-        if (useAzureData()) {
-          try {
-            stored = await azUpsertStateContracts(rows);
-          } catch (e) {
-            error = e instanceof Error ? e.message : String(e);
-            stored = 0;
-          }
-        } else {
-          const rpc = await supabaseAdmin.rpc("upsert_state_contracts_cost_aware", { p_rows: rows });
-          if (!rpc.error) {
-            stored = Number(rpc.data ?? 0);
-          } else {
-            // Rolling-deploy fallback until migration 027 is installed.
-            const fallback = await supabaseAdmin.from("state_contracts").upsert(rows, {
-              onConflict:
-                "state_code,source_dataset_id,contract_id,vendor_normalized,year,quarter,customer_agency,record_type",
-              ignoreDuplicates: false,
-            });
-            error = fallback.error?.message ?? null;
-            stored = fallback.error ? 0 : rows.length;
-          }
-        }
-      }
-      return { stored, perState: stateResult.perState, error, skipped: false };
-    },
-    (r): SourceSummary => ({
-      status: r.skipped ? "skipped" : r.error ? "failed" : "success",
-      rows: r.stored,
-      detail: { perState: r.perState },
-      error: r.error,
-    }),
-  );
-
   const [listingResult] = await Promise.all([
     listingsTask,
     metricsTask,
     auctionsTask,
     soldCaptureTask,
     sellerFeeTask,
-    federalTask,
-    samTask,
-    stateTask,
   ]);
 
   // Materialize the current forecast while Azure SQL is already awake. Normal

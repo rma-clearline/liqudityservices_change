@@ -13,12 +13,6 @@ const TABLE_FRESHNESS: { table: string; column: string; fallback?: string }[] = 
   { table: "listings", column: "date" },
   { table: "marketplace_sellers", column: "date" },
   { table: "auctions", column: "last_seen_at" },
-  { table: "federal_contracts", column: "first_seen_date" },
-  { table: "contract_snapshots", column: "date" },
-  { table: "sam_opportunities", column: "first_seen_date" },
-  // last_seen_date advances every run (migration 023); fall back to first_seen_date
-  // until that migration is applied.
-  { table: "state_contracts", column: "last_seen_date", fallback: "first_seen_date" },
 ];
 
 async function latestValue(table: string, column: string, fallback?: string): Promise<string | null> {

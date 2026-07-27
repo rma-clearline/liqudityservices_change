@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "LQDT Analytics",
   description:
-    "Liquidity Services (LQDT) tracker: marketplace/auction GMV, quarterly revenue forecast, and federal/state procurement activity.",
+    "Liquidity Services (LQDT) tracker: marketplace/auction GMV and quarterly revenue forecast.",
 };
 
 export default function RootLayout({

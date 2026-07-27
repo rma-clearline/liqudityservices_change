@@ -1,27 +1,10 @@
 import "server-only";
 
 import { supabase } from "./supabase";
-import type {
-  ListingRow,
-  FederalContractRow,
-  ContractSnapshotRow,
-  SamOpportunityRow,
-  StateContractRow,
-  MarketplaceSellerRow,
-  SellerDeltaRow,
-} from "./supabase";
+import type { ListingRow, MarketplaceSellerRow, SellerDeltaRow } from "./supabase";
 import { ttlCache } from "./cache";
 import { useAzureData } from "./data-backend";
-import {
-  azFetchListings,
-  azFetchFederalContracts,
-  azFetchLatestContractSnapshot,
-  azFetchSamOpportunities,
-  azFetchStateContracts,
-  azLatestSellerSnapshot,
-  azFetchMarketplaceSellers,
-  azFetchSellerDeltas,
-} from "./azure-tables";
+import { azFetchListings, azFetchMarketplaceSellers, azFetchSellerDeltas } from "./azure-tables";
 import { getTopSoldLots, isAzureSqlConfigured, getBlendedAdminFee, upsertSellerFees } from "./azure-sql";
 import { enrichTopLots, type EnrichedLot } from "./asset-fees";
 import { etTodayKey, etQuarterKey } from "./time";
@@ -55,69 +38,6 @@ export async function getLatestListing(): Promise<ListingRow | null> {
   return rows[0] ?? null;
 }
 
-// --- Contracts page (5 reads) ---
-export type ContractsData = {
-  contracts: FederalContractRow[];
-  snapshot: ContractSnapshotRow | null;
-  sam: SamOpportunityRow[];
-  state: StateContractRow[];
-  sellerSnapshot: { date: string | null; sellers: MarketplaceSellerRow[] };
-};
-
-const contractsCache = ttlCache<ContractsData>(TTL);
-
-// Latest marketplace_sellers snapshot: newest date, then all of that day's rows
-// (both platforms) so the government-level mix is a single consistent snapshot.
-async function latestSellerSnapshot(): Promise<{ date: string | null; sellers: MarketplaceSellerRow[] }> {
-  if (useAzureData()) return azLatestSellerSnapshot();
-  const latest = await supabase
-    .from("marketplace_sellers")
-    .select("date")
-    .order("date", { ascending: false })
-    .limit(1);
-  const date = latest.data?.[0]?.date ?? null;
-  if (!date) return { date: null, sellers: [] };
-  const rows = await supabase.from("marketplace_sellers").select("*").eq("date", date);
-  return { date, sellers: rows.data ?? [] };
-}
-
-export function getContractsData(): Promise<ContractsData> {
-  return contractsCache.get("all", async () => {
-    if (useAzureData()) {
-      const [contracts, snapshot, sam, state, sellerSnapshot] = await Promise.all([
-        azFetchFederalContracts(20),
-        azFetchLatestContractSnapshot(),
-        azFetchSamOpportunities(100),
-        azFetchStateContracts(200),
-        latestSellerSnapshot(),
-      ]);
-      return { contracts, snapshot, sam, state, sellerSnapshot };
-    }
-    const [contractsRes, snapshotsRes, samRes, stateRes, sellerSnapshot] = await Promise.all([
-      supabase.from("federal_contracts").select("*").order("start_date", { ascending: false }).limit(20),
-      supabase.from("contract_snapshots").select("*").order("date", { ascending: false }).limit(1),
-      supabase.from("sam_opportunities").select("*").order("posted_date", { ascending: false }).limit(100),
-      supabase
-        .from("state_contracts")
-        .select(
-          "id,state_code,source_portal,source_dataset_id,contract_id,vendor_name,vendor_normalized," +
-            "customer_agency,contract_title,amount,year,quarter,period_start,period_end,record_type," +
-            "source_query,first_seen_date,last_seen_date,created_at",
-        )
-        .order("year", { ascending: false })
-        .order("quarter", { ascending: false })
-        .limit(200),
-      latestSellerSnapshot(),
-    ]);
-    return {
-      contracts: (contractsRes.data ?? []) as FederalContractRow[],
-      snapshot: (snapshotsRes.data?.[0] ?? null) as ContractSnapshotRow | null,
-      sam: (samRes.data ?? []) as SamOpportunityRow[],
-      state: (stateRes.data ?? []) as unknown as StateContractRow[],
-      sellerSnapshot,
-    };
-  });
-}
 
 // --- Marketplace page (2 reads) ---
 export type MarketplaceData = { sellers: MarketplaceSellerRow[]; deltas: SellerDeltaRow[] };

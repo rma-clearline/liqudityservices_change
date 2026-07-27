@@ -461,8 +461,7 @@ function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCid
     ${listingsImg}
     <p style="color:#9ca3af;font-size:11px;margin-top:24px;border-top:1px solid #eee;padding-top:8px;">
       Full detail &amp; interactivity: <a href="${APP_URL}/qtd" style="color:#2563eb;">QTD</a> ·
-      <a href="${APP_URL}/forecast" style="color:#2563eb;">Forecast</a> ·
-      <a href="${APP_URL}/contracts" style="color:#2563eb;">Contracts</a>.<br/>
+      <a href="${APP_URL}/forecast" style="color:#2563eb;">Forecast</a>.<br/>
       QTD scaled to total company at the capture rate; FQ estimate = prior-year-shape projection. Segment axes (gov/retail/intl)
       are scrape groupings, not LQDT's reported segments. Automated by the LQDT tracker.
     </p>
