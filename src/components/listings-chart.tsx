@@ -9,6 +9,7 @@ import {
   CartesianGrid,
   Tooltip,
   Legend,
+  ReferenceLine,
   ResponsiveContainer,
 } from "recharts";
 import type { ListingRow } from "@/lib/supabase";
@@ -76,8 +77,98 @@ function buildChartData(filtered: ListingRow[], allData: ListingRow[]): ChartRow
   });
 }
 
+const toMs = (d: string) => Date.parse(d + "T00:00:00Z");
+
+/** Calendar quarter-end date (YYYY-MM-DD) for a year + quarter (1..4). */
+function quarterEndOf(year: number, q: number): string {
+  const m = q * 3; // 3, 6, 9, 12
+  const lastDay = new Date(Date.UTC(year, m, 0)).getUTCDate();
+  return `${year}-${String(m).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+}
+
+/** "2025-03-31" → "3/31/25" for compact x-axis ticks. */
+function fmtTickDate(v: string): string {
+  const [y, m, d] = v.split("-");
+  return `${Number(m)}/${Number(d)}/${y.slice(2)}`;
+}
+
+/** Second-row x-axis tick: the quarter label (e.g. "Q1 '25") centered under each
+ *  quarter. Recharts injects x/y/payload; `labels` maps a data label → its text. */
+function QuarterTick(props: { x?: number; y?: number; payload?: { value?: string }; labels?: Map<string, string> }) {
+  const { x = 0, y = 0, payload, labels } = props;
+  const text = labels?.get(payload?.value ?? "") ?? "";
+  if (!text) return null;
+  return (
+    <text x={x} y={y + 12} textAnchor="middle" fontSize={11} fontWeight={600} fill="#374151">
+      {text}
+    </text>
+  );
+}
+
 export function ListingsChart({ data, allData }: { data: ListingRow[]; allData: ListingRow[] }) {
   const chartData = useMemo(() => buildChartData(data, allData), [data, allData]);
+
+  // X-axis ticks: date ticks at every quarter-end (+ the range endpoints) on the
+  // primary axis, and a second row of centered quarter labels ("Q1 '25"). Explicit
+  // ticks — no `preserveStartEnd` — so switching ranges can't leave uneven/cramped
+  // labels on the right edge.
+  const { primaryTicks, quarterEndTicks, quarterMidLabels, quarterLabelMap } = useMemo(() => {
+    const labels = chartData.map((r) => r.label);
+    if (labels.length === 0) {
+      return {
+        primaryTicks: [] as string[],
+        quarterEndTicks: [] as string[],
+        quarterMidLabels: [] as string[],
+        quarterLabelMap: new Map<string, string>(),
+      };
+    }
+    const first = labels[0];
+    const last = labels[labels.length - 1];
+    const nearest = (target: string) => {
+      const t = toMs(target);
+      let best = first;
+      let bd = Infinity;
+      for (const l of labels) {
+        const diff = Math.abs(toMs(l) - t);
+        if (diff < bd) {
+          bd = diff;
+          best = l;
+        }
+      }
+      return best;
+    };
+    const qEnds: string[] = [];
+    const midLabels: string[] = [];
+    const labelMap = new Map<string, string>();
+    let y = Number(first.slice(0, 4));
+    let q = Math.floor((Number(first.slice(5, 7)) - 1) / 3) + 1;
+    for (let guard = 0; guard < 80; guard++) {
+      const qStart = `${y}-${String((q - 1) * 3 + 1).padStart(2, "0")}-01`;
+      if (qStart > last) break;
+      const qEnd = quarterEndOf(y, q);
+      if (qEnd >= first && qEnd <= last) {
+        const t = nearest(qEnd);
+        if (!qEnds.includes(t)) qEnds.push(t);
+      }
+      // Quarter label at the data point nearest the quarter midpoint, clamped to
+      // the visible range so edge quarters still get a (shifted) label.
+      let mid = `${y}-${String((q - 1) * 3 + 2).padStart(2, "0")}-15`;
+      if (mid < first) mid = first;
+      if (mid > last) mid = last;
+      const ml = nearest(mid);
+      if (!labelMap.has(ml)) {
+        labelMap.set(ml, `Q${q} '${String(y).slice(2)}`);
+        midLabels.push(ml);
+      }
+      q++;
+      if (q > 4) {
+        q = 1;
+        y++;
+      }
+    }
+    const primary = Array.from(new Set([first, ...qEnds, last])).sort((a, b) => toMs(a) - toMs(b));
+    return { primaryTicks: primary, quarterEndTicks: qEnds, quarterMidLabels: midLabels, quarterLabelMap: labelMap };
+  }, [chartData]);
 
   if (chartData.length === 0) {
     return <p className="text-gray-500 text-center py-8">No data yet.</p>;
@@ -88,8 +179,24 @@ export function ListingsChart({ data, allData }: { data: ListingRow[]; allData: 
   return (
     <ResponsiveContainer width="100%" height={600}>
       <LineChart data={chartData} margin={{ top: 5, right: hasYoY ? 60 : 20, bottom: 5, left: 20 }}>
-        <CartesianGrid strokeDasharray="3 3" />
-        <XAxis dataKey="label" tick={{ fontSize: 11 }} interval="preserveStartEnd" />
+        <CartesianGrid strokeDasharray="3 3" vertical={false} />
+        {/* Quarter-end cutoff markers. */}
+        {quarterEndTicks.map((t) => (
+          <ReferenceLine key={t} x={t} stroke="#cbd5e1" strokeDasharray="4 3" />
+        ))}
+        {/* Primary axis: dates at quarter ends (+ range endpoints). */}
+        <XAxis dataKey="label" ticks={primaryTicks} interval={0} tickFormatter={fmtTickDate} tick={{ fontSize: 11 }} height={22} />
+        {/* Second axis row: quarter labels centered in each quarter. */}
+        <XAxis
+          dataKey="label"
+          xAxisId="quarter"
+          ticks={quarterMidLabels}
+          interval={0}
+          tickLine={false}
+          axisLine={false}
+          height={20}
+          tick={<QuarterTick labels={quarterLabelMap} />}
+        />
         <YAxis
           yAxisId="left"
           tickFormatter={(v: number) => (v / 1000).toFixed(0) + "k"}

@@ -10,6 +10,12 @@ import { SectionHeader } from "./section-header";
 const RANGES = ["All", "3Y", "1Y", "6M", "3M", "1M"] as const;
 type Range = (typeof RANGES)[number];
 
+// Both series (AllSurplus + GovDeals) were only captured from this day on, so the
+// chart/table floor here — no partial single-series stretch before it. "All"/"3Y"
+// therefore start at 1/1/2025 (the default view), which is what the quarter-tick
+// x-axis anchors to.
+const DATA_START = "2025-01-01";
+
 function fmt(n: number | null | undefined) {
   return n != null ? n.toLocaleString("en-US") : "—";
 }
@@ -23,14 +29,17 @@ function cutoffDate(range: Range): string | null {
 }
 
 export function ListingsView({ listings }: { listings: ListingRow[] }) {
+  // Default view: the full both-series history, i.e. from 1/1/2025 → now.
   const [range, setRange] = useState<Range>("All");
   const chartRef = useRef<HTMLDivElement>(null);
   const latest = listings[0] ?? null;
 
   const filtered = useMemo(() => {
     const cutoff = cutoffDate(range);
-    if (!cutoff) return listings;
-    return listings.filter((r) => r.date >= cutoff);
+    // Floor every range at DATA_START (both-series start); short ranges keep their
+    // own cutoff when it's later.
+    const floor = cutoff && cutoff > DATA_START ? cutoff : DATA_START;
+    return listings.filter((r) => r.date >= floor);
   }, [listings, range]);
 
   return (
