@@ -47,28 +47,6 @@ export function useDataStatus() {
   return useContext(DataStatusContext);
 }
 
-/** Banner listing any active data alerts (failed runs, stale data, 0-row pulls). */
-export function AlertsBanner() {
-  const status = useDataStatus();
-  const alerts = status?.alerts ?? [];
-  if (alerts.length === 0) return null;
-  const hasError = alerts.some((a) => a.level === "error");
-  return (
-    <div
-      className={`mb-6 rounded-lg border p-3 text-sm ${
-        hasError ? "border-red-200 bg-red-50 text-red-700" : "border-amber-200 bg-amber-50 text-amber-700"
-      }`}
-    >
-      <p className="mb-1 font-semibold">{hasError ? "⚠ Data issues" : "Data notices"}</p>
-      <ul className="list-disc pl-5 space-y-0.5">
-        {alerts.slice(0, 8).map((a, i) => (
-          <li key={i}>{a.message}</li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
 function ageColor(iso: string | null | undefined, failed: boolean): string {
   if (failed || !iso) return "bg-red-50 text-red-600 border-red-200";
   const t = Date.parse(iso.length <= 10 ? `${iso}T00:00:00Z` : iso);

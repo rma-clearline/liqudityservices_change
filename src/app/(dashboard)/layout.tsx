@@ -1,10 +1,10 @@
-import { AlertsBanner, DataStatusProvider } from "@/components/freshness";
+import { DataStatusProvider } from "@/components/freshness";
 import { Tabs } from "@/components/tabs";
 import { getSession } from "@/lib/auth/dal";
 
 // Shared chrome for every tab. Layouts preserve state across navigation, so
-// DataStatusProvider fetches /api/data-status once and the freshness badges +
-// alerts banner stay populated as you switch tabs.
+// DataStatusProvider fetches /api/data-status once and the per-section freshness
+// badges stay populated as you switch tabs.
 export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
   const session = await getSession();
   return (
@@ -32,7 +32,6 @@ export default async function DashboardLayout({ children }: { children: React.Re
       </header>
       <DataStatusProvider>
         <Tabs />
-        <AlertsBanner />
         {children}
       </DataStatusProvider>
     </main>
