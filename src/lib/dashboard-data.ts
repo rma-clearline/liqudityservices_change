@@ -69,19 +69,19 @@ export function getMarketplaceData(): Promise<MarketplaceData> {
 // --- Top Sold Items (current quarter) — enriched with take rate + watches ---
 // The sold store is always Azure; enrichment (per-asset Maestro detail calls) is
 // best-effort and cached with the rest so a page load makes them at most once per TTL.
-const TOP_SOLD_MIN_USD = Number(process.env.TOP_SOLD_MIN_USD) || 1_000_000;
+const TOP_SOLD_MIN_USD = Number(process.env.TOP_SOLD_MIN_USD) || 250_000;
 const TOP_SOLD_LIMIT = Number(process.env.TOP_SOLD_LIMIT) || 25;
 export type BlendedAdminFee = { blended_pct: number | null; covered_gmv: number; total_gmv: number };
-export type TopSoldData = { lots: EnrichedLot[]; total: number; blended: BlendedAdminFee | null };
+export type TopSoldData = { lots: EnrichedLot[]; total: number; blended: BlendedAdminFee | null; minUsd: number };
 
 const topSoldCache = ttlCache<TopSoldData>(TTL);
 
 export function getTopSoldItems(): Promise<TopSoldData> {
   return topSoldCache.get("qtd", async () => {
-    if (!isAzureSqlConfigured()) return { lots: [], total: 0, blended: null };
+    if (!isAzureSqlConfigured()) return { lots: [], total: 0, blended: null, minUsd: TOP_SOLD_MIN_USD };
     const today = etTodayKey();
     const start = quarterDayKeys(etQuarterKey(today))[0];
-    if (!start) return { lots: [], total: 0, blended: null };
+    if (!start) return { lots: [], total: 0, blended: null, minUsd: TOP_SOLD_MIN_USD };
     const { lots, total } = await getTopSoldLots(start, today, TOP_SOLD_MIN_USD, TOP_SOLD_LIMIT);
     const enriched = await enrichTopLots(lots);
     // Bootstrap seller_fees with the fees we just fetched (idempotent, deduped) so the
@@ -104,6 +104,6 @@ export function getTopSoldItems(): Promise<TopSoldData> {
       getBlendedAdminFee(start, today).catch(() => null),
       new Promise<BlendedAdminFee | null>((res) => setTimeout(() => res(null), 5_000)),
     ]);
-    return { lots: enriched, total, blended };
+    return { lots: enriched, total, blended, minUsd: TOP_SOLD_MIN_USD };
   });
 }

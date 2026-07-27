@@ -31,7 +31,7 @@ function getResend() {
 
 // Top sold lots shown in the report (QTD, at or above this hammer price). The
 // threshold + row cap are env-overridable so they can be tuned without a deploy.
-const TOP_LOT_MIN_USD = Number(process.env.REPORT_TOP_LOT_MIN_USD) || 1_000_000;
+const TOP_LOT_MIN_USD = Number(process.env.REPORT_TOP_LOT_MIN_USD) || 500_000;
 const TOP_LOT_LIMIT = Number(process.env.REPORT_TOP_LOT_LIMIT) || 25;
 
 /** Dashboard base URL for the report's links (no trailing slash). */

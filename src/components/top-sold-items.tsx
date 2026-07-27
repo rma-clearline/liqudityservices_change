@@ -27,7 +27,17 @@ function safeHttpUrl(u: string | null): string | null {
   return /^https?:\/\//i.test(u) ? u : null;
 }
 
-export function TopSoldItems({ rows, total, blended }: { rows: EnrichedLot[]; total: number; blended: BlendedAdminFee | null }) {
+export function TopSoldItems({
+  rows,
+  total,
+  blended,
+  minUsd,
+}: {
+  rows: EnrichedLot[];
+  total: number;
+  blended: BlendedAdminFee | null;
+  minUsd: number;
+}) {
   const [filter, setFilter] = useState<"all" | Marketplace>("all");
   const [query, setQuery] = useState("");
 
@@ -64,7 +74,7 @@ export function TopSoldItems({ rows, total, blended }: { rows: EnrichedLot[]; to
   );
 
   if (rows.length === 0) {
-    return <p className="text-gray-500 text-sm">No sold lots ≥ $1M this quarter yet.</p>;
+    return <p className="text-gray-500 text-sm">No sold lots ≥ {fmtDollar(minUsd)} this quarter yet.</p>;
   }
 
   const filters: { key: "all" | Marketplace; label: string }[] = [
@@ -177,7 +187,7 @@ export function TopSoldItems({ rows, total, blended }: { rows: EnrichedLot[]; to
       </div>
 
       <p className="text-xs text-gray-400">
-        Quarter-to-date sold lots ≥ $1M{total > rows.length ? ` (top ${rows.length} of ${total})` : ""}. Admin Fee % = LQDT&apos;s
+        Quarter-to-date sold lots ≥ {fmtDollar(minUsd)}{total > rows.length ? ` (top ${rows.length} of ${total})` : ""}. Admin Fee % = LQDT&apos;s
         seller-side admin fee on the lot — the only take-rate component the API exposes. It excludes buyer&apos;s premium (not
         exposed), so it understates full marketplace take rate on every marketplace; GovDeals government lots in particular show
         0% because they monetize via a buyer&apos;s premium instead. Watches = final watcher count. Both are fetched live per lot
