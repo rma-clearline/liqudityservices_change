@@ -834,3 +834,53 @@ export async function readSoldLots(
     };
   });
 }
+
+export type TopSoldLot = {
+  title: string;
+  url: string | null;
+  site: string; // AD/GD/GI
+  seller: string;
+  category: string;
+  state: string;
+  close_date_et: string; // YYYY-MM-DD (ET)
+  sale_amount_usd: number;
+};
+
+/**
+ * Highest-value sold lots in [from,to] at or above `minUsd`, newest-priced first.
+ * `COUNT(*) OVER ()` carries the total number ≥ threshold so the caller can note
+ * truncation when more matched than `limit`. Store rows are already deduped by
+ * row_key, so each row is a distinct lot. Read-only; used by the report email.
+ */
+export async function getTopSoldLots(
+  fromEt: string,
+  toEt: string,
+  minUsd: number,
+  limit = 25,
+): Promise<{ lots: TopSoldLot[]; total: number }> {
+  const pool = await getPool();
+  const r = await pool
+    .request()
+    .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+    .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
+    .input("min", sql.Decimal(19, 4), minUsd)
+    .input("lim", sql.Int, Math.max(1, Math.floor(limit)))
+    .query(
+      "SELECT TOP (@lim) title, url, site, seller, category, state, " +
+        "CONVERT(char(10), close_date_et, 23) AS close_date_et, sale_amount_usd, " +
+        "COUNT(*) OVER () AS total_matching " +
+        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to AND sale_amount_usd >= @min " +
+        "ORDER BY sale_amount_usd DESC",
+    );
+  const lots: TopSoldLot[] = r.recordset.map((x) => ({
+    title: String(x.title ?? ""),
+    url: x.url == null ? null : String(x.url),
+    site: String(x.site ?? ""),
+    seller: String(x.seller ?? ""),
+    category: String(x.category ?? ""),
+    state: String(x.state ?? ""),
+    close_date_et: String(x.close_date_et ?? ""),
+    sale_amount_usd: x.sale_amount_usd == null ? 0 : Number(x.sale_amount_usd),
+  }));
+  return { lots, total: Number(r.recordset[0]?.total_matching ?? 0) };
+}

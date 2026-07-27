@@ -11,7 +11,7 @@
 
 import { Resend } from "resend";
 import { computeRevenueForecast } from "@/lib/auctions";
-import { getSoldDailyByBucket, isAzureSqlConfigured } from "@/lib/azure-sql";
+import { getSoldDailyByBucket, getTopSoldLots, isAzureSqlConfigured, type TopSoldLot } from "@/lib/azure-sql";
 import { renderChartPng } from "@/lib/chart-utils";
 import { getListings } from "@/lib/dashboard-data";
 import { generateChartImage } from "@/lib/email";
@@ -21,12 +21,18 @@ import { fmtM, fmtPct } from "@/lib/qtd-shared";
 import { supabaseAdmin } from "@/lib/supabase";
 import { useAzureData } from "@/lib/data-backend";
 import { azFetchRecentEmailRuns } from "@/lib/azure-tables";
-import { addDaysKey } from "@/lib/qtd-shared";
+import { addDaysKey, quarterDayKeys } from "@/lib/qtd-shared";
+import { siteLabel } from "@/lib/sites";
 import { etQuarterKey, formatQuarterLabel } from "@/lib/time";
 
 function getResend() {
   return new Resend(process.env.RESEND_API_KEY);
 }
+
+// Top sold lots shown in the report (QTD, at or above this hammer price). The
+// threshold + row cap are env-overridable so they can be tuned without a deploy.
+const TOP_LOT_MIN_USD = Number(process.env.REPORT_TOP_LOT_MIN_USD) || 1_000_000;
+const TOP_LOT_LIMIT = Number(process.env.REPORT_TOP_LOT_LIMIT) || 25;
 
 /** Dashboard base URL for the report's links (no trailing slash). */
 const APP_URL = (process.env.APP_URL || process.env.NEXT_PUBLIC_APP_URL || "https://lqdt.clearlineflow.com").replace(/\/+$/, "");
@@ -85,6 +91,8 @@ type ReportData = {
   daysBehind: number | null;
   /** Current headline, returned so the cron can log it for next time's deltas. */
   snapshot: HeadlineSnapshot | null;
+  /** Highest-value QTD sold lots (≥ threshold), newest-priced first, + total ≥ threshold. */
+  topLots: { lots: TopSoldLot[]; total: number } | null;
 };
 
 async function loadReportData(todayKey: string): Promise<ReportData> {
@@ -102,11 +110,20 @@ async function loadReportData(todayKey: string): Promise<ReportData> {
   ]);
 
   let buckets: Awaited<ReturnType<typeof getSoldDailyByBucket>> | undefined;
+  let topLots: ReportData["topLots"] = null;
   if (isAzureSqlConfigured()) {
     try {
       buckets = await getSoldDailyByBucket(base.earliest_data_date, todayKey);
     } catch {
       // store slow/unreachable → segment/txn tables degrade to unavailable
+    }
+    // Top QTD lots (current calendar quarter through today). Independent of the
+    // buckets fetch so one failing doesn't drop the other.
+    try {
+      const quarterStart = quarterDayKeys(currentQuarter)[0];
+      if (quarterStart) topLots = await getTopSoldLots(quarterStart, todayKey, TOP_LOT_MIN_USD, TOP_LOT_LIMIT);
+    } catch {
+      // store slow/unreachable → top-lots table omitted
     }
   }
 
@@ -181,6 +198,7 @@ async function loadReportData(todayKey: string): Promise<ReportData> {
     sinceLast,
     daysBehind,
     snapshot,
+    topLots,
   };
 }
 
@@ -272,6 +290,13 @@ function buildQtdYoyChartConfig(h: QtdHeadline) {
 const FONT = "font-family:'Segoe UI',system-ui,Arial,sans-serif;";
 const chgColor = (v: number | null | undefined) => (v == null ? "#6b7280" : v >= 0 ? "#15803d" : "#b91c1c");
 const chg = (v: number | null | undefined) => (v == null ? "—" : `<span style="color:${chgColor(v)}">${fmtPct(v)}</span>`);
+// Lot titles/sellers are marketplace-provided free text going into email HTML —
+// escape them, and only linkify genuine http(s) URLs (no javascript: etc.).
+const escapeHtml = (s: string | null | undefined) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string);
+const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+const fmtUsd = (n: number) => "$" + Math.round(n).toLocaleString("en-US");
+const safeHttpUrl = (u: string | null) => (u && /^https?:\/\//i.test(u) ? u : null);
 
 function tile(label: string, value: string, sub?: string) {
   return `<td style="padding:6px;vertical-align:top;">
@@ -322,8 +347,6 @@ function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCid
         <td style="padding:3px 8px;border-bottom:1px solid #eee;">${s.name} <span style="color:#9ca3af;">(vs ${s.vs})</span></td>
         <td style="padding:3px 8px;border-bottom:1px solid #eee;text-align:right;">${fmtM(s.qtdGmv)}</td>
         <td style="padding:3px 8px;border-bottom:1px solid #eee;text-align:right;">${chg(s.yoy)}</td>
-        <td style="padding:3px 8px;border-bottom:1px solid #eee;text-align:right;">${s.capture ? (s.capture.rate * 100).toFixed(0) + "%" : "—"}</td>
-        <td style="padding:3px 8px;border-bottom:1px solid #eee;text-align:right;">${s.impliedTotal != null ? fmtM(s.impliedTotal) : "—"}</td>
       </tr>`,
       )
       .join("");
@@ -331,8 +354,42 @@ function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCid
       <table style="border-collapse:collapse;font-size:12px;width:100%;">
         <tr style="text-align:left;border-bottom:2px solid #333;">
           <th style="padding:4px 8px;">Segment</th><th style="padding:4px 8px;text-align:right;">QTD GMV</th>
-          <th style="padding:4px 8px;text-align:right;">Y/Y</th><th style="padding:4px 8px;text-align:right;">Capture</th>
-          <th style="padding:4px 8px;text-align:right;">Implied total</th>
+          <th style="padding:4px 8px;text-align:right;">Y/Y</th>
+        </tr>${rows}
+      </table>`;
+  }
+
+  // Top QTD items sold (≥ threshold), each linked to its auction listing.
+  let topLotsTable = "";
+  if (d.topLots && d.topLots.lots.length) {
+    const rows = d.topLots.lots
+      .map((l, i) => {
+        const title = escapeHtml(truncate(l.title || "(untitled lot)", 70));
+        const href = safeHttpUrl(l.url);
+        const item = href
+          ? `<a href="${escapeHtml(href)}" style="color:#2563eb;text-decoration:none;">${title}</a>`
+          : title;
+        const meta = [l.seller, l.category].filter(Boolean).map(escapeHtml).join(" · ");
+        const where = [l.state, siteLabel(l.site)].filter(Boolean).join(" · ");
+        return `<tr>
+          <td style="padding:3px 8px;border-bottom:1px solid #eee;text-align:right;color:#9ca3af;">${i + 1}</td>
+          <td style="padding:3px 8px;border-bottom:1px solid #eee;">${item}${meta ? `<div style="color:#9ca3af;font-size:11px;">${meta}</div>` : ""}</td>
+          <td style="padding:3px 8px;border-bottom:1px solid #eee;white-space:nowrap;">${escapeHtml(where)}</td>
+          <td style="padding:3px 8px;border-bottom:1px solid #eee;white-space:nowrap;">${l.close_date_et}</td>
+          <td style="padding:3px 8px;border-bottom:1px solid #eee;text-align:right;font-weight:600;white-space:nowrap;">${fmtUsd(l.sale_amount_usd)}</td>
+        </tr>`;
+      })
+      .join("");
+    const more =
+      d.topLots.total > d.topLots.lots.length
+        ? ` <span style="color:#9ca3af;font-weight:400;">(top ${d.topLots.lots.length} of ${d.topLots.total})</span>`
+        : "";
+    topLotsTable = `<h3 style="margin:20px 0 6px;font-size:14px;">Top QTD items sold — ≥ ${fmtM(TOP_LOT_MIN_USD)}${more}</h3>
+      <table style="border-collapse:collapse;font-size:12px;width:100%;">
+        <tr style="text-align:left;border-bottom:2px solid #333;">
+          <th style="padding:4px 8px;text-align:right;">#</th><th style="padding:4px 8px;">Item</th>
+          <th style="padding:4px 8px;">Location · Site</th><th style="padding:4px 8px;">Closed</th>
+          <th style="padding:4px 8px;text-align:right;">Hammer</th>
         </tr>${rows}
       </table>`;
   }
@@ -390,6 +447,7 @@ function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCid
     ${sinceLine}
     ${qtdImg}
     ${segmentTable}
+    ${topLotsTable}
     ${previewTable}
     <h3 style="margin:22px 0 6px;font-size:14px;">Active listings</h3>
     <p style="font-size:13px;margin:0 0 4px;"><strong>AllSurplus:</strong> ${d.latest.allsurplus?.toLocaleString("en-US") ?? "N/A"} &nbsp;·&nbsp; <strong>GovDeals:</strong> ${d.latest.govdeals?.toLocaleString("en-US") ?? "N/A"}</p>
