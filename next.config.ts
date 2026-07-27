@@ -9,6 +9,12 @@ const nextConfig: NextConfig = {
       "./scripts/historical-gmv-daily-*.csv",
       "./scripts/historical-gmv-daily-market-*.csv",
     ],
+    // The GMV export reads the same historical daily CSV so its historical months
+    // reconcile to the forecast's monthly table exactly (loadHistoricalDailyTotalsForExport).
+    "/api/export/gmv": [
+      "./scripts/historical-gmv-daily-*.csv",
+      "./scripts/historical-gmv-daily-market-*.csv",
+    ],
   },
 };
 

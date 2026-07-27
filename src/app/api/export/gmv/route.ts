@@ -3,15 +3,18 @@ import {
   aggregateExport,
   applyExportFilters,
   fetchSoldRange,
+  periodKey,
   RangeTooLargeError,
   type ExportFilters,
   type ExportMarket,
   type ExportPeriod,
   type ExportSite,
   type ExportType,
+  type PivotRow,
   type SoldExportRow,
 } from "@/lib/sold-export";
 import { countSoldLots, isAzureSqlConfigured, readSoldLots, storeCoversRange } from "@/lib/azure-sql";
+import { loadHistoricalDailyTotalsForExport } from "@/lib/auctions";
 import { toCsv } from "@/lib/format";
 import { siteLabel } from "@/lib/sites";
 import { etTodayKey, quarterBounds } from "@/lib/time";
@@ -133,6 +136,94 @@ function num(v: string | null): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+const nextDayKey = (d: string) => {
+  const t = new Date(`${d}T00:00:00Z`);
+  t.setUTCDate(t.getUTCDate() + 1);
+  return t.toISOString().slice(0, 10);
+};
+
+type HistExport = Awaited<ReturnType<typeof loadHistoricalDailyTotalsForExport>>;
+
+// The historical CSV is a daily AGGREGATE: it carries the deduped ALL total and a
+// per-site (AD/GD/GI) split and a domestic/international split — but NO gov/retail
+// type, NO category, NO per-lot rows, and no site×market cross. So it can only
+// honor a site-only OR market-only filter; anything finer excludes historical.
+function historicalHonorsFilters(f: ExportFilters): boolean {
+  if (f.type !== "all" || f.category || f.state || f.country || f.minUsd != null || f.maxUsd != null) return false;
+  if (f.site !== "all" && f.market !== "all") return false; // no site×market cross in the CSV
+  return true;
+}
+
+// Resolve the (gmv, lots, site, market) a historical day contributes under the
+// current filter. Uses the deduped ALL total when unfiltered (what the monthly
+// table sums), a single site's total when site-filtered, or the domestic/intl
+// split when market-filtered. Null when the day/site isn't present.
+function histDay(hist: HistExport, date: string, f: ExportFilters): { gmv: number; lots: number; site: string; market: string } | null {
+  const t = hist.byDate.get(date);
+  if (!t) return null;
+  // Round PER DAY, exactly as the forecast's daily series does (Math.round on each
+  // realized_gmv_usd), so summed periods reconcile to the monthly table to the dollar.
+  if (f.site !== "all") {
+    const p = hist.platforms.get(f.site)?.get(date);
+    if (!p) return null;
+    return { gmv: Math.round(p.gmv), lots: p.lots, site: f.site, market: "all" };
+  }
+  if (f.market === "domestic") return { gmv: Math.round(t.domestic), lots: 0, site: "all", market: "domestic" };
+  if (f.market === "international") return { gmv: Math.round(t.international), lots: 0, site: "all", market: "international" };
+  return { gmv: Math.round(t.gmv), lots: t.lots, site: "all", market: "all" };
+}
+
+// Historical pivot rows for [from,to] — one aggregate row per period at the CSV's
+// granularity, so the historical totals reconcile to the monthly table exactly.
+function historicalPivot(hist: HistExport, from: string, to: string, period: ExportPeriod, f: ExportFilters): PivotRow[] {
+  const map = new Map<string, PivotRow>();
+  for (const [date] of hist.byDate) {
+    if (date < from || date > to) continue;
+    const d = histDay(hist, date, f);
+    if (!d) continue;
+    const pk = periodKey(date, period);
+    const key = `${pk}|${d.site}|all|${d.market}`;
+    const cur = map.get(key);
+    if (cur) {
+      cur.gmv_usd += d.gmv;
+      cur.lots += d.lots;
+    } else {
+      map.set(key, { period: pk, site: d.site, type: "all", market: d.market, gmv_usd: d.gmv, lots: d.lots });
+    }
+  }
+  return [...map.values()];
+}
+
+// Historical RAW rows: per-day aggregate. Per-lot detail predates the store (aged
+// out of Maestro), so these are clearly-labeled daily totals, not individual lots.
+function historicalRaw(hist: HistExport, from: string, to: string, f: ExportFilters): Record<string, unknown>[] {
+  const dates = [...hist.byDate.keys()].filter((d) => d >= from && d <= to).sort();
+  const rows: Record<string, unknown>[] = [];
+  for (const date of dates) {
+    const d = histDay(hist, date, f);
+    if (!d) continue;
+    rows.push({
+      close_date_et: date,
+      site: d.site === "all" ? "All sites" : siteLabel(d.site),
+      seller_type: "all",
+      market: d.market,
+      title: "Daily total (pre-store — per-lot detail unavailable)",
+      sale_amount_usd: Math.round(d.gmv * 100) / 100,
+    });
+  }
+  return rows;
+}
+
+function histLotsInRange(hist: HistExport, from: string, to: string, f: ExportFilters): number {
+  let n = 0;
+  for (const [date] of hist.byDate) {
+    if (date < from || date > to) continue;
+    const d = histDay(hist, date, f);
+    if (d) n += d.lots;
+  }
+  return n;
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const mode = searchParams.get("mode") === "pivot" ? "pivot" : "raw";
@@ -166,40 +257,77 @@ export async function GET(request: Request) {
     maxUsd: num(searchParams.get("maxUsd")),
   };
 
-  let fetched: SoldSource;
-  try {
-    fetched = await loadSoldRows(from, to, filters);
-  } catch (e) {
-    // A range too large to fetch live in one request → clean, retryable 503 so the
-    // client re-requests it as smaller complete slices (never a sample). Anything
-    // else (e.g. a Maestro outage) is a 502.
-    if (e instanceof RangeTooLargeError) {
-      return NextResponse.json({ error: e.message, code: e.code }, { status: 503 });
+  // Split at the historical-CSV boundary. Historical days come from the SAME daily
+  // CSV the monthly forecast table reads (so totals reconcile to the dollar, and a
+  // month the store only partially covers — e.g. 2025-07 — is whole again instead
+  // of collapsing to aged-out Maestro's last few days). The live tail after the CSV
+  // comes from the per-lot store, which the monthly table's live days also use.
+  const hist = await loadHistoricalDailyTotalsForExport();
+  const csvEnd = hist.maxDate;
+  const useHist = Boolean(csvEnd) && from <= csvEnd && historicalHonorsFilters(filters);
+  const histTo = to <= csvEnd ? to : csvEnd;
+  const liveFrom = !csvEnd || from > csvEnd ? from : nextDayKey(csvEnd);
+  const hasLive = !csvEnd || liveFrom <= to;
+
+  let live: SoldSource = { rows: [], total_in_range: 0, fetched: 0, truncated: false, source: "sold_lots" };
+  if (hasLive) {
+    try {
+      live = await loadSoldRows(liveFrom, to, filters);
+    } catch (e) {
+      // A range too large to fetch live in one request → clean, retryable 503 so the
+      // client re-requests it as smaller complete slices. Anything else → 502.
+      if (e instanceof RangeTooLargeError) {
+        return NextResponse.json({ error: e.message, code: e.code }, { status: 503 });
+      }
+      return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 502 });
     }
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : String(e) },
-      { status: 502 },
-    );
   }
+  const liveFiltered = applyExportFilters(live.rows, filters);
 
-  const filteredRows = applyExportFilters(fetched.rows, filters);
-
+  const source = useHist ? (hasLive ? "csv+store" : "csv") : live.source;
+  const matched = liveFiltered.length + (useHist ? histLotsInRange(hist, from, histTo, filters) : 0);
   const headers = new Headers({
     "Content-Type": "text/csv; charset=utf-8",
-    // Coverage metadata the export modal surfaces to the analyst.
-    "X-Export-Total-In-Range": String(fetched.total_in_range),
-    "X-Export-Fetched": String(fetched.fetched),
-    "X-Export-Matched": String(filteredRows.length),
-    "X-Export-Truncated": String(fetched.truncated),
+    "X-Export-Total-In-Range": String(live.total_in_range),
+    "X-Export-Fetched": String(live.fetched),
+    "X-Export-Matched": String(matched),
+    "X-Export-Truncated": String(live.truncated),
     "X-Export-From": from,
     "X-Export-To": to,
-    "X-Export-Source": fetched.source,
+    "X-Export-Source": source,
   });
 
   if (mode === "pivot") {
     const period = parsePeriod(searchParams.get("period"));
-    // Show the full site name (AllSurplus/GovDeals/Industrial) rather than the code.
-    const pivot = aggregateExport(filteredRows, period).map((r) => ({ ...r, site: siteLabel(r.site) }));
+    const pivotMap = new Map<string, PivotRow>();
+    for (const r of aggregateExport(liveFiltered, period)) {
+      pivotMap.set(`${r.period}|${r.site}|${r.type}|${r.market}`, r);
+    }
+    if (useHist) {
+      for (const r of historicalPivot(hist, from, histTo, period, filters)) {
+        const key = `${r.period}|${r.site}|${r.type}|${r.market}`;
+        const c = pivotMap.get(key);
+        if (c) {
+          c.gmv_usd += r.gmv_usd;
+          c.lots += r.lots;
+        } else {
+          pivotMap.set(key, r);
+        }
+      }
+    }
+    const pivot = [...pivotMap.values()]
+      .map((r) => ({
+        ...r,
+        site: r.site === "all" ? "All sites" : siteLabel(r.site),
+        gmv_usd: Math.round(r.gmv_usd * 100) / 100,
+      }))
+      .sort(
+        (a, b) =>
+          a.period.localeCompare(b.period) ||
+          a.site.localeCompare(b.site) ||
+          a.type.localeCompare(b.type) ||
+          a.market.localeCompare(b.market),
+      );
     const csv = toCsv(pivot, [
       { key: "period", label: "Period" },
       { key: "site", label: "Site" },
@@ -212,7 +340,10 @@ export async function GET(request: Request) {
     return new Response(csv, { headers });
   }
 
-  const rawRows = filteredRows.map((r) => ({ ...r, site: siteLabel(r.site) }));
+  const rawRows: Record<string, unknown>[] = [
+    ...(useHist ? historicalRaw(hist, from, histTo, filters) : []),
+    ...liveFiltered.map((r) => ({ ...r, site: siteLabel(r.site) })),
+  ];
   const csv = toCsv(rawRows, [
     { key: "close_date_et", label: "Close Date (ET)" },
     { key: "close_time_utc", label: "Close (UTC)" },

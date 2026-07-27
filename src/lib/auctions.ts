@@ -61,7 +61,7 @@ type HistoricalPlatformDailyGmv = {
 
 // Source (true marketplace) keys carried in the daily series so the chart can
 // toggle by source. GI (industrial) is historical-only — it isn't tracked live.
-type SourceKey = "AD" | "GD" | "GI";
+export type SourceKey = "AD" | "GD" | "GI";
 const SOURCE_KEYS: SourceKey[] = ["AD", "GD", "GI"];
 
 type HistoricalDailyGmvData = {
@@ -184,6 +184,39 @@ async function loadHistoricalDailyGmv(): Promise<HistoricalDailyGmvData> {
 
   cachedHistoricalDailyGmv = rows;
   return rows;
+}
+
+export type HistoricalDailyTotal = { date: string; gmv: number; lots: number; domestic: number; international: number };
+
+/**
+ * Historical daily GMV — the SAME frozen CSV the monthly forecast table reads —
+ * exposed for the GMV export so its historical months reconcile to that table to
+ * the dollar. `byDate` is the per-day deduped ALL total (what the table sums);
+ * `platforms` is the per-site (AD/GD/GI) map (may double-count cross-listings, so
+ * it's only used when a single site is selected); `maxDate` is the last covered
+ * ET day — the boundary past which the export switches to the live per-lot store.
+ */
+export async function loadHistoricalDailyTotalsForExport(): Promise<{
+  byDate: Map<string, HistoricalDailyTotal>;
+  platforms: Map<SourceKey, Map<string, { gmv: number; lots: number }>>;
+  maxDate: string;
+}> {
+  const data = await loadHistoricalDailyGmv();
+  const byDate = new Map<string, HistoricalDailyTotal>();
+  let maxDate = "";
+  for (const [date, t] of data.totals) {
+    byDate.set(date, { date, gmv: t.all, lots: t.soldLots, domestic: t.domestic, international: t.international });
+    if (date > maxDate) maxDate = date;
+  }
+  const platforms = new Map<SourceKey, Map<string, { gmv: number; lots: number }>>();
+  for (const site of SOURCE_KEYS) {
+    const src = data.platforms.get(site);
+    if (!src) continue;
+    const m = new Map<string, { gmv: number; lots: number }>();
+    for (const [date, v] of src) m.set(date, { gmv: v.gmv, lots: v.soldLots });
+    platforms.set(site, m);
+  }
+  return { byDate, platforms, maxDate };
 }
 
 // ---------------------------------------------------------------------------

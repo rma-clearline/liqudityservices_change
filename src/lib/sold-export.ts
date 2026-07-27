@@ -302,7 +302,7 @@ export function applyExportFilters(rows: SoldExportRow[], f: ExportFilters): Sol
   });
 }
 
-function periodKey(dateKey: string, period: ExportPeriod): string {
+export function periodKey(dateKey: string, period: ExportPeriod): string {
   if (period === "week") return etWeekKey(dateKey);
   if (period === "month") return etMonthKey(dateKey);
   if (period === "quarter") return etQuarterKey(dateKey);
