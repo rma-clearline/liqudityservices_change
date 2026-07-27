@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { downloadCsv, toCsv } from "@/lib/format";
+import { downloadCsv } from "@/lib/format";
 import { formatQuarterLabel } from "@/lib/time";
 
 const SITES = [
@@ -32,15 +32,9 @@ const PERIODS = [
 
 const MAX_SUBRANGES = 40; // guard: at most ~3 years of months per export
 
-const PIVOT_COLUMNS = [
-  { key: "period" as const, label: "Period" },
-  { key: "site" as const, label: "Site" },
-  { key: "type" as const, label: "Type" },
-  { key: "market" as const, label: "Market" },
-  { key: "gmv_usd" as const, label: "GMV (USD)" },
-  { key: "lots" as const, label: "Lots" },
-];
-type PivotRow = { period: string; site: string; type: string; market: string; gmv_usd: number; lots: number };
+// Wide-pivot site columns (matches the analyst's Excel pivot: month rows × site columns).
+const SITE_COLUMNS = ["AllSurplus", "GovDeals", "Industrial"] as const;
+type PivotRow = { period: string; site: string; gmv_usd: number };
 
 /**
  * Calendar-month sub-ranges overlapping [from, to], each clamped. We split by
@@ -94,20 +88,13 @@ function splitWindow(win: { from: string; to: string }): [{ from: string; to: st
   ];
 }
 
-/** Parse a pivot CSV (safe columns: no embedded commas) into rows. */
+/** Parse the long pivot CSV (Period,Site,GMV — safe columns, no embedded commas). */
 function parsePivotCsv(csv: string): PivotRow[] {
   const rows: PivotRow[] = [];
   for (const line of csv.split("\n").slice(1)) {
     if (!line.trim()) continue;
-    const [period, site, type, market, gmv, lots] = line.split(",");
-    rows.push({
-      period,
-      site,
-      type,
-      market,
-      gmv_usd: parseFloat(gmv) || 0,
-      lots: parseInt(lots, 10) || 0,
-    });
+    const [period, site, gmv] = line.split(",");
+    rows.push({ period, site, gmv_usd: parseFloat(gmv) || 0 });
   }
   return rows;
 }
@@ -115,7 +102,7 @@ function parsePivotCsv(csv: string): PivotRow[] {
 /**
  * Analyst-facing filter panel that drives /api/export/gmv. Two actions:
  *  • Raw transactions — one row per sold lot (Excel-ready detail).
- *  • Pivot summary — GMV + lot count by period × site × type × market.
+ *  • Pivot summary — GMV by period × site (wide: AllSurplus / GovDeals / Industrial + Grand Total).
  * Wide ranges are split into per-month requests (each complete) and assembled,
  * so the export doesn't lose data; a month too dense to serve whole is binary-split
  * further and retried. Date inputs are clamped to the data range.
@@ -174,7 +161,7 @@ export function GmvExportModal({
     setBusy(mode);
     try {
       const rawParts: string[] = []; // raw mode: per-window CSV text (date-disjoint)
-      const pivotMap = new Map<string, PivotRow>(); // pivot mode: merged by period×site×type×market
+      const pivotBySite = new Map<string, Map<string, number>>(); // pivot: period -> site -> gmv
       const acc = { matched: 0, truncated: false };
 
       // Same-window retries for the whole export run (all windows share it, so a
@@ -271,16 +258,12 @@ export function GmvExportModal({
           // Windows are date-disjoint → keep the header from the first part only.
           rawParts.push(rawParts.length === 0 ? csv : csv.split("\n").slice(1).join("\n"));
         } else {
-          // A period (quarter/week) can straddle window boundaries, so merge by key.
+          // Accumulate GMV by period × site (a quarter/week period can straddle
+          // month windows); the wide table is assembled once all windows are in.
           for (const r of parsePivotCsv(csv)) {
-            const key = `${r.period}|${r.site}|${r.type}|${r.market}`;
-            const cur = pivotMap.get(key);
-            if (cur) {
-              cur.gmv_usd += r.gmv_usd;
-              cur.lots += r.lots;
-            } else {
-              pivotMap.set(key, { ...r });
-            }
+            let m = pivotBySite.get(r.period);
+            if (!m) pivotBySite.set(r.period, (m = new Map()));
+            m.set(r.site, (m.get(r.site) ?? 0) + r.gmv_usd);
           }
         }
       };
@@ -296,20 +279,24 @@ export function GmvExportModal({
       if (mode === "raw") {
         outCsv = rawParts.join("");
       } else {
-        const rows = [...pivotMap.values()]
-          .map((r) => ({ ...r, gmv_usd: Math.round(r.gmv_usd * 100) / 100 }))
-          .sort(
-            (a, b) =>
-              a.period.localeCompare(b.period) ||
-              a.site.localeCompare(b.site) ||
-              a.type.localeCompare(b.type) ||
-              a.market.localeCompare(b.market),
-          )
-          // Sort on the raw calendar key (chronological), then relabel quarter
-          // periods to LQDT fiscal only (e.g. "2026Q3" -> "26FQ4"). Day/week/month
-          // keys pass through unchanged.
-          .map((r) => ({ ...r, period: formatQuarterLabel(r.period, "fq") }));
-        outCsv = toCsv(rows, PIVOT_COLUMNS);
+        // Reshape long (period × site) into the wide table: one row per period with
+        // a column per site + a Grand Total column, then a Grand Total row summing
+        // every period. Values are plain numbers → no CSV escaping needed.
+        const round2 = (n: number) => Math.round(n * 100) / 100;
+        const periods = [...pivotBySite.keys()].sort((a, b) => a.localeCompare(b));
+        const totals: Record<string, number> = { AllSurplus: 0, GovDeals: 0, Industrial: 0 };
+        const lines = [["Period", ...SITE_COLUMNS, "Grand Total"].join(",")];
+        for (const p of periods) {
+          const m = pivotBySite.get(p)!;
+          const vals = SITE_COLUMNS.map((s) => round2(m.get(s) ?? 0));
+          vals.forEach((v, i) => (totals[SITE_COLUMNS[i]] += v));
+          const grand = round2(vals.reduce((s, v) => s + v, 0));
+          // Quarter keys relabel to LQDT fiscal (e.g. "2026Q3" -> "26FQ4"); day/week/month pass through.
+          lines.push([formatQuarterLabel(p, "fq"), ...vals, grand].join(","));
+        }
+        const grandVals = SITE_COLUMNS.map((s) => round2(totals[s]));
+        lines.push(["Grand Total", ...grandVals, round2(grandVals.reduce((s, v) => s + v, 0))].join(","));
+        outCsv = lines.join("\n") + "\n";
       }
 
       downloadCsv(`lqdt-gmv-${mode}-${f}_to_${t}.csv`, outCsv);
@@ -448,9 +435,9 @@ export function GmvExportModal({
         {notice && <p className="mt-3 rounded bg-gray-50 p-2 text-xs text-gray-600">{notice}</p>}
         {error && <p className="mt-3 rounded bg-red-50 p-2 text-xs text-red-600">Error: {error}</p>}
         <p className="mt-3 text-[11px] leading-relaxed text-gray-400">
-          Source: Maestro sold archive (realized hammer, USD via daily FX). Each month is fetched completely (every page),
-          so totals reconcile with the GMV chart. Pivot columns: Period · Site · Type · Market · GMV · Lots
-          (quarter periods are labeled as LQDT fiscal quarters, e.g. 26FQ4 — FY ends Sep 30).
+          Historical months come from the same daily series as the forecast&rsquo;s monthly GMV table (so totals match to
+          the dollar); the live tail uses the per-lot store. Pivot: Period × AllSurplus · GovDeals · Industrial + Grand
+          Total (quarter periods are labeled as LQDT fiscal quarters, e.g. 26FQ4 — FY ends Sep 30).
         </p>
       </div>
     </div>

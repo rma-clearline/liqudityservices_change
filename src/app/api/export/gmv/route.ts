@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import {
-  aggregateExport,
   applyExportFilters,
   fetchSoldRange,
   periodKey,
@@ -10,7 +9,6 @@ import {
   type ExportPeriod,
   type ExportSite,
   type ExportType,
-  type PivotRow,
   type SoldExportRow,
 } from "@/lib/sold-export";
 import { countSoldLots, isAzureSqlConfigured, readSoldLots, storeCoversRange } from "@/lib/azure-sql";
@@ -176,27 +174,6 @@ function histDay(hist: HistExport, date: string, f: ExportFilters): { gmv: numbe
   return { gmv: Math.round(t.gmv), lots: t.lots, site: "all", market: "all" };
 }
 
-// Historical pivot rows for [from,to] — one aggregate row per period at the CSV's
-// granularity, so the historical totals reconcile to the monthly table exactly.
-function historicalPivot(hist: HistExport, from: string, to: string, period: ExportPeriod, f: ExportFilters): PivotRow[] {
-  const map = new Map<string, PivotRow>();
-  for (const [date] of hist.byDate) {
-    if (date < from || date > to) continue;
-    const d = histDay(hist, date, f);
-    if (!d) continue;
-    const pk = periodKey(date, period);
-    const key = `${pk}|${d.site}|all|${d.market}`;
-    const cur = map.get(key);
-    if (cur) {
-      cur.gmv_usd += d.gmv;
-      cur.lots += d.lots;
-    } else {
-      map.set(key, { period: pk, site: d.site, type: "all", market: d.market, gmv_usd: d.gmv, lots: d.lots });
-    }
-  }
-  return [...map.values()];
-}
-
 // Historical RAW rows: per-day aggregate. Per-lot detail predates the store (aged
 // out of Maestro), so these are clearly-labeled daily totals, not individual lots.
 function historicalRaw(hist: HistExport, from: string, to: string, f: ExportFilters): Record<string, unknown>[] {
@@ -306,42 +283,39 @@ export async function GET(request: Request) {
 
   if (mode === "pivot") {
     const period = parsePeriod(searchParams.get("period"));
-    const pivotMap = new Map<string, PivotRow>();
-    for (const r of aggregateExport(liveFiltered, period)) {
-      pivotMap.set(`${r.period}|${r.site}|${r.type}|${r.market}`, r);
-    }
-    if (useHist) {
-      for (const r of historicalPivot(hist, from, histTo, period, filters)) {
-        const key = `${r.period}|${r.site}|${r.type}|${r.market}`;
-        const c = pivotMap.get(key);
-        if (c) {
-          c.gmv_usd += r.gmv_usd;
-          c.lots += r.lots;
-        } else {
-          pivotMap.set(key, r);
+    // GMV by period × site (AllSurplus / GovDeals / Industrial). Live days come from
+    // the per-lot store (summed by site); historical days from the CSV's per-site
+    // series (rounded per day, mirroring the forecast's per-source rounding) — which
+    // sums to the CSV ALL total == the monthly table. The modal reshapes this long
+    // output into the wide site-column table.
+    const cells = new Map<string, Map<string, number>>(); // period -> siteLabel -> gmv
+    const add = (pk: string, label: string, gmv: number) => {
+      let m = cells.get(pk);
+      if (!m) cells.set(pk, (m = new Map()));
+      m.set(label, (m.get(label) ?? 0) + gmv);
+    };
+    for (const r of liveFiltered) add(periodKey(r.close_date_et, period), siteLabel(r.site), r.sale_amount_usd ?? 0);
+    // The CSV has a per-site split but no site×market cross, so only use it for the
+    // per-site pivot when there's no market filter (site-only filter narrows to one).
+    if (useHist && filters.market === "all") {
+      for (const site of ["AD", "GD", "GI"] as const) {
+        if (filters.site !== "all" && filters.site !== site) continue;
+        const byDate = hist.platforms.get(site);
+        if (!byDate) continue;
+        const label = siteLabel(site);
+        for (const [date, v] of byDate) {
+          if (date < from || date > histTo) continue;
+          add(periodKey(date, period), label, Math.round(v.gmv));
         }
       }
     }
-    const pivot = [...pivotMap.values()]
-      .map((r) => ({
-        ...r,
-        site: r.site === "all" ? "All sites" : siteLabel(r.site),
-        gmv_usd: Math.round(r.gmv_usd * 100) / 100,
-      }))
-      .sort(
-        (a, b) =>
-          a.period.localeCompare(b.period) ||
-          a.site.localeCompare(b.site) ||
-          a.type.localeCompare(b.type) ||
-          a.market.localeCompare(b.market),
-      );
-    const csv = toCsv(pivot, [
+    const rows: { period: string; site: string; gmv_usd: number }[] = [];
+    for (const [pk, m] of cells) for (const [label, gmv] of m) rows.push({ period: pk, site: label, gmv_usd: Math.round(gmv * 100) / 100 });
+    rows.sort((a, b) => a.period.localeCompare(b.period) || a.site.localeCompare(b.site));
+    const csv = toCsv(rows, [
       { key: "period", label: "Period" },
       { key: "site", label: "Site" },
-      { key: "type", label: "Type" },
-      { key: "market", label: "Market" },
       { key: "gmv_usd", label: "GMV (USD)" },
-      { key: "lots", label: "Lots" },
     ]);
     headers.set("Content-Disposition", `attachment; filename="lqdt-gmv-pivot-${period}-${from}_to_${to}.csv"`);
     return new Response(csv, { headers });
