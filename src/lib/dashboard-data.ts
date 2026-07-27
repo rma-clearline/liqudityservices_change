@@ -5,8 +5,9 @@ import type { ListingRow, MarketplaceSellerRow, SellerDeltaRow } from "./supabas
 import { ttlCache } from "./cache";
 import { useAzureData } from "./data-backend";
 import { azFetchListings, azFetchMarketplaceSellers, azFetchSellerDeltas } from "./azure-tables";
-import { getTopSoldLots, isAzureSqlConfigured, getBlendedAdminFee, upsertSellerFees } from "./azure-sql";
+import { getTopSoldLots, isAzureSqlConfigured, getBlendedAdminFee, getAdminFeeBySite, upsertSellerFees } from "./azure-sql";
 import { enrichTopLots, type EnrichedLot } from "./asset-fees";
+import { loadModelMetrics } from "./reported-gmv";
 import { etTodayKey, etQuarterKey } from "./time";
 import { quarterDayKeys } from "./qtd-shared";
 
@@ -105,5 +106,86 @@ export function getTopSoldItems(): Promise<TopSoldData> {
       new Promise<BlendedAdminFee | null>((res) => setTimeout(() => res(null), 5_000)),
     ]);
     return { lots: enriched, total, blended, minUsd: TOP_SOLD_MIN_USD };
+  });
+}
+
+// --- Take Rate Composition page ---
+// Reconstructs reported revenue from the workbook's business-segment take rates and
+// overlays the independently-MEASURED seller admin fee, so the split between the
+// seller-side fee and the (inferred) buyer premium + services is explicit.
+export type TakeRateQuarter = {
+  quarter: string;
+  govdealsGmv: number; govdealsTake: number; govdealsRev: number;
+  rscgGmv: number; rscgTake: number; rscgRev: number;
+  cagGmv: number; cagTake: number; cagRev: number;
+  consignmentTake: number; // AllSurplus/consignment commission rate (for the composition pairing)
+  machinio: number;
+  reconstructed: number;
+  reported: number;
+  deltaUsd: number;
+  totalGmv: number;
+  blendedTake: number; // reconstructed / (govdeals+rscg+cag GMV)
+};
+export type MeasuredFeeSite = { site: string; blended_pct: number | null; covered_gmv: number; total_gmv: number; covered_sellers: number };
+export type TakeRateComposition = {
+  quarters: TakeRateQuarter[];
+  latest: TakeRateQuarter | null;
+  measured: { overall_pct: number | null; covered_gmv: number; total_gmv: number; bySite: MeasuredFeeSite[]; from: string; to: string } | null;
+};
+
+const takeRateCache = ttlCache<TakeRateComposition>(TTL);
+
+export function getTakeRateComposition(): Promise<TakeRateComposition> {
+  return takeRateCache.get("all", async () => {
+    const metrics = await loadModelMetrics();
+    const reported = metrics.filter((m) => m.kind === "reported");
+    const val = (q: string, metric: string): number | null =>
+      reported.find((m) => m.quarter === q && m.metric === metric)?.value ?? null;
+    const quartersWithRev = [...new Set(reported.filter((m) => m.metric === "revenue").map((m) => m.quarter))].sort();
+    const rows: TakeRateQuarter[] = [];
+    for (const q of quartersWithRev.slice(-6)) {
+      const gGmv = val(q, "govdeals_gmv") ?? 0, gT = val(q, "govdeals_take_rate") ?? 0;
+      const rGmv = val(q, "rscg_gmv") ?? 0, rT = val(q, "rscg_take_rate") ?? 0;
+      const cGmv = val(q, "cag_gmv") ?? 0, cT = val(q, "cag_take_rate") ?? 0;
+      const consT = val(q, "consignment_take_rate") ?? 0;
+      const mach = val(q, "machinio_revs") ?? 0;
+      const gRev = gGmv * gT, rRev = rGmv * rT, cRev = cGmv * cT;
+      const recon = gRev + rRev + cRev + mach;
+      const rep = val(q, "revenue") ?? 0;
+      const totalGmv = gGmv + rGmv + cGmv;
+      rows.push({
+        quarter: q,
+        govdealsGmv: gGmv, govdealsTake: gT, govdealsRev: gRev,
+        rscgGmv: rGmv, rscgTake: rT, rscgRev: rRev,
+        cagGmv: cGmv, cagTake: cT, cagRev: cRev,
+        consignmentTake: consT,
+        machinio: mach,
+        reconstructed: recon, reported: rep, deltaUsd: recon - rep,
+        totalGmv, blendedTake: totalGmv > 0 ? recon / totalGmv : 0,
+      });
+    }
+    const latest = rows[rows.length - 1] ?? null;
+
+    let measured: TakeRateComposition["measured"] = null;
+    if (isAzureSqlConfigured()) {
+      // Seller fees are per-seller and stable, so a 90-day trailing window gives a
+      // robust GMV-weighted read (and better seller_fees coverage) than QTD alone.
+      const to = etTodayKey();
+      const from = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
+      const bySite = await getAdminFeeBySite(from, to).catch(() => [] as MeasuredFeeSite[]);
+      // Derive the overall blend FROM the per-site rows so they can never disagree.
+      const coveredGmv = bySite.reduce((a, s) => a + s.covered_gmv, 0);
+      const totalGmv = bySite.reduce((a, s) => a + s.total_gmv, 0);
+      const feeUsd = bySite.reduce((a, s) => a + ((s.blended_pct ?? 0) / 100) * s.covered_gmv, 0);
+      measured = {
+        overall_pct: coveredGmv > 0 ? (feeUsd / coveredGmv) * 100 : null,
+        covered_gmv: coveredGmv,
+        total_gmv: totalGmv,
+        bySite,
+        from,
+        to,
+      };
+    }
+    return { quarters: rows, latest, measured };
   });
 }

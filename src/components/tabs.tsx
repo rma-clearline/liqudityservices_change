@@ -8,6 +8,7 @@ const TABS = [
   { href: "/forecast", label: "Forecast" },
   { href: "/qtd", label: "QTD" },
   { href: "/marketplace", label: "Marketplace" },
+  { href: "/take-rate", label: "Take Rate" },
 ] as const;
 
 export function Tabs() {

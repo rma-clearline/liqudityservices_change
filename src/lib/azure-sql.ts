@@ -1003,3 +1003,37 @@ export async function getBlendedAdminFee(
     total_gmv: Number(x.total_gmv ?? 0),
   };
 }
+
+/** GMV-weighted seller admin fee per marketplace (site) in [from,to], with coverage. */
+export async function getAdminFeeBySite(
+  fromEt: string,
+  toEt: string,
+): Promise<{ site: string; blended_pct: number | null; covered_gmv: number; total_gmv: number; covered_sellers: number }[]> {
+  const pool = await getPool();
+  await ensureSellerFeesTable(pool);
+  const r = await pool
+    .request()
+    .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+    .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
+    .query(
+      "SELECT l.site, " +
+        "SUM(CASE WHEN f.admin_fee_percent IS NOT NULL THEN l.sale_amount_usd * f.admin_fee_percent / 100.0 ELSE 0 END) AS fee_usd, " +
+        "SUM(CASE WHEN f.admin_fee_percent IS NOT NULL THEN l.sale_amount_usd ELSE 0 END) AS covered_gmv, " +
+        "SUM(l.sale_amount_usd) AS total_gmv, " +
+        "COUNT(DISTINCT CASE WHEN f.admin_fee_percent IS NOT NULL THEN l.account_id END) AS covered_sellers " +
+        "FROM lqdt.sold_lots l LEFT JOIN lqdt.seller_fees f ON f.site = l.site AND f.account_id = l.account_id " +
+        "WHERE l.close_date_et BETWEEN @from AND @to " +
+        "GROUP BY l.site",
+    );
+  return r.recordset.map((x) => {
+    const covered = Number(x.covered_gmv ?? 0);
+    const feeUsd = Number(x.fee_usd ?? 0);
+    return {
+      site: String(x.site ?? ""),
+      blended_pct: covered > 0 ? (feeUsd / covered) * 100 : null,
+      covered_gmv: covered,
+      total_gmv: Number(x.total_gmv ?? 0),
+      covered_sellers: Number(x.covered_sellers ?? 0),
+    };
+  });
+}
