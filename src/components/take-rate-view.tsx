@@ -15,6 +15,16 @@ function fq(quarter: string): string {
   return m2 ? `${m2[1]} Q${m2[2]}` : quarter;
 }
 
+// Published buyer's-premium ranges by marketplace (the buyer pays these on top of the
+// winning bid). Seller-set, so not precisely measurable — these are the published
+// schedules: GovDeals cap 12.5% / typ 7.5-12.5%; AllSurplus ~10-15%. Edit as schedules
+// change. Percentages, not fractions.
+const BP_RANGE: Record<string, [number, number]> = {
+  GD: [7.5, 12.5],
+  GI: [10, 15],
+  BLENDED: [9, 13],
+};
+
 export function TakeRateView({ data }: { data: TakeRateComposition }) {
   const { latest, quarters, measured } = data;
   if (!latest) {
@@ -29,6 +39,13 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
   const compRows: { label: string; site: string; take: number }[] = [
     { label: "GovDeals", site: "GD", take: latest.govdealsTake },
     { label: "Industrial (CAG)", site: "GI", take: latest.cagTake },
+  ];
+
+  // Independent cross-check: fee-implied band = measured seller fee + published buyer premium.
+  const bandRows: { label: string; reported: number; fee: number | null; bp: [number, number]; note?: string }[] = [
+    { label: "GovDeals", reported: latest.govdealsTake, fee: feePct("GD"), bp: BP_RANGE.GD },
+    { label: "Industrial (CAG)", reported: latest.cagTake, fee: feePct("GI"), bp: BP_RANGE.GI, note: "+ Machinio services" },
+    { label: "Blended marketplace", reported: latest.consignmentTake, fee: measured?.overall_pct ?? null, bp: BP_RANGE.BLENDED },
   ];
 
   return (
@@ -168,6 +185,90 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
             : "—"}
           % of the blended marketplace commission; the rest is buyer-side + services. RSCG/purchase GMV is an ownership model (no
           seller fee, no buyer premium) and is excluded from this marketplace split.
+        </p>
+      </section>
+
+      {/* Independent cross-check: fee-implied band */}
+      <section>
+        <h3 className="mb-1 text-sm font-semibold">Independent cross-check — fee-implied take-rate band</h3>
+        <div className="mb-3 rounded-md border border-blue-100 bg-blue-50/60 px-3 py-2 text-xs text-gray-600">
+          <p className="mb-1 font-semibold text-gray-700">How this is calculated</p>
+          <ul className="list-disc space-y-0.5 pl-4">
+            <li>
+              Take rate = the cut LSI keeps on a sale ÷ the sale price (GMV). It comes from two fees.
+            </li>
+            <li>
+              <strong>Seller admin fee</strong> — the seller pays LSI. We read this directly from the marketplace, per lot
+              (measured, not assumed).
+            </li>
+            <li>
+              <strong>Buyer&apos;s premium</strong> — the buyer pays on top of the winning bid. It&apos;s set by each seller, so we
+              use the marketplaces&apos; <em>published ranges</em> instead of a single number.
+            </li>
+            <li>
+              <strong>Fee-implied band = measured seller fee + published buyer-premium range.</strong> If the reported take rate
+              (from LSI&apos;s filings) lands <strong>inside</strong> the band, it&apos;s consistent with how the fees actually
+              work — a check that doesn&apos;t rely on the financial model.
+            </li>
+          </ul>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse">
+            <thead>
+              <tr className="border-b-2 border-gray-300 text-left">
+                <th className="py-1.5 pr-4">Marketplace</th>
+                <th className="py-1.5 pr-4 text-right">Reported take</th>
+                <th className="py-1.5 pr-4 text-right">Measured seller fee</th>
+                <th className="py-1.5 pr-4 text-right">Buyer premium (published)</th>
+                <th className="py-1.5 pr-4 text-right">Fee-implied band</th>
+                <th className="py-1.5 text-right">Reported vs. band</th>
+              </tr>
+            </thead>
+            <tbody className="tabular-nums">
+              {bandRows.map((r) => {
+                const feeVal = r.fee ?? 0;
+                const lo = feeVal + r.bp[0];
+                const hi = feeVal + r.bp[1];
+                const rep = r.reported > 0 ? r.reported * 100 : null;
+                let label = "—";
+                let color = "text-gray-400";
+                if (rep != null) {
+                  if (rep >= lo && rep <= hi) {
+                    label = "✓ consistent";
+                    color = "text-green-700";
+                  } else if (rep > hi) {
+                    label = `above band${r.note ? ` (${r.note})` : ""}`;
+                    color = "text-amber-700";
+                  } else {
+                    label = "below band";
+                    color = "text-amber-700";
+                  }
+                }
+                return (
+                  <tr key={r.label} className="border-b border-gray-100">
+                    <td className="py-1 pr-4">{r.label}</td>
+                    <td className="py-1 pr-4 text-right">{rep == null ? "—" : rep.toFixed(2) + "%"}</td>
+                    <td className="py-1 pr-4 text-right">{pp(r.fee)}</td>
+                    <td className="py-1 pr-4 text-right text-gray-500">
+                      {r.bp[0].toFixed(1)}–{r.bp[1].toFixed(1)}%
+                    </td>
+                    <td className="py-1 pr-4 text-right">
+                      {lo.toFixed(1)}–{hi.toFixed(1)}%
+                    </td>
+                    <td className={`py-1 text-right ${color}`}>{label}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p className="mt-2 text-xs text-gray-400">
+          Buyer-premium ranges are published, seller-set schedules (not precisely measurable). Industrial/CAG sits above its
+          buyer-premium band because that segment also books Machinio subscription + valuation <strong>services</strong> revenue on
+          top of auction fees — expected, not a discrepancy. Example: GovDeals reported {pf(latest.govdealsTake)} = measured seller
+          fee {pp(feePct("GD"))} + an implied buyer premium of{" "}
+          {feePct("GD") != null ? (latest.govdealsTake * 100 - (feePct("GD") as number)).toFixed(2) + "%" : "—"}, squarely inside
+          the published 7.5–12.5% range.
         </p>
       </section>
 
