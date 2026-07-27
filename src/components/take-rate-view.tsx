@@ -325,7 +325,8 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
       <section>
         <h3 className="mb-1 text-sm font-semibold">Revenue reconciliation — how close each quarter lands</h3>
         <p className="mb-3 text-xs text-gray-500">
-          The segment build-up (GovDeals + RSCG + CAG + Machinio) vs. actual reported revenue, last {quarters.length} quarters.
+          The segment build-up (GovDeals + RSCG + CAG + Machinio) vs. actual reported revenue, last {quarters.length} quarters. The
+          small Δ is a known model line, not an error — see the note below the table.
         </p>
         <div className="overflow-x-auto">
           <table className="w-full border-collapse">
@@ -359,6 +360,11 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
             </tbody>
           </table>
         </div>
+        <p className="mt-2 text-xs text-gray-400">
+          Δ = the model&apos;s &quot;Corporate &amp; other / eliminations&quot; revenue line, which the four-segment build-up
+          doesn&apos;t include — verified to the dollar against v15 (a flat ≈ −$17k in FY24Q4–25Q3, and $0 in the two latest
+          quarters, where Δ ≈ 0). At ≤0.01% of revenue it&apos;s the reconciliation residual, not an error.
+        </p>
       </section>
 
       <p className="max-w-3xl text-xs text-gray-400">
