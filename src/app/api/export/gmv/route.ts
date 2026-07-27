@@ -168,8 +168,11 @@ function histDay(hist: HistExport, date: string, f: ExportFilters): { gmv: numbe
     if (!p) return null;
     return { gmv: Math.round(p.gmv), lots: p.lots, site: f.site, market: "all" };
   }
-  if (f.market === "domestic") return { gmv: Math.round(t.domestic), lots: 0, site: "all", market: "domestic" };
-  if (f.market === "international") return { gmv: Math.round(t.international), lots: 0, site: "all", market: "international" };
+  // The CSV doesn't split lot counts by market, so report the day's total lots
+  // alongside the market GMV (non-zero, so the modal doesn't cry "no lots matched"
+  // on a valid domestic/international export; the GMV itself is exact).
+  if (f.market === "domestic") return { gmv: Math.round(t.domestic), lots: t.lots, site: "all", market: "domestic" };
+  if (f.market === "international") return { gmv: Math.round(t.international), lots: t.lots, site: "all", market: "international" };
   return { gmv: Math.round(t.gmv), lots: t.lots, site: "all", market: "all" };
 }
 
@@ -266,7 +269,11 @@ export async function GET(request: Request) {
   const csvEnd = hist.maxDate;
   const useHist = Boolean(csvEnd) && from <= csvEnd && historicalHonorsFilters(filters);
   const histTo = to <= csvEnd ? to : csvEnd;
-  const liveFrom = !csvEnd || from > csvEnd ? from : nextDayKey(csvEnd);
+  // Only carve the historical days out of the live query when the CSV is actually
+  // serving them (useHist). When a filter the CSV can't honor makes useHist=false,
+  // the store must serve the WHOLE range — otherwise those days fall through both
+  // paths and the export is silently empty (the store already covered them).
+  const liveFrom = !csvEnd || from > csvEnd || !useHist ? from : nextDayKey(csvEnd);
   const hasLive = !csvEnd || liveFrom <= to;
 
   let live: SoldSource = { rows: [], total_in_range: 0, fetched: 0, truncated: false, source: "sold_lots" };
