@@ -844,6 +844,9 @@ export type TopSoldLot = {
   state: string;
   close_date_et: string; // YYYY-MM-DD (ET)
   sale_amount_usd: number;
+  asset_id: string;
+  account_id: string;
+  auction_id: string;
 };
 
 /**
@@ -868,6 +871,7 @@ export async function getTopSoldLots(
     .query(
       "SELECT TOP (@lim) title, url, site, seller, category, state, " +
         "CONVERT(char(10), close_date_et, 23) AS close_date_et, sale_amount_usd, " +
+        "asset_id, account_id, auction_id, " +
         "COUNT(*) OVER () AS total_matching " +
         "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to AND sale_amount_usd >= @min " +
         "ORDER BY sale_amount_usd DESC",
@@ -881,6 +885,9 @@ export async function getTopSoldLots(
     state: String(x.state ?? ""),
     close_date_et: String(x.close_date_et ?? ""),
     sale_amount_usd: x.sale_amount_usd == null ? 0 : Number(x.sale_amount_usd),
+    asset_id: String(x.asset_id ?? ""),
+    account_id: String(x.account_id ?? ""),
+    auction_id: String(x.auction_id ?? ""),
   }));
   return { lots, total: Number(r.recordset[0]?.total_matching ?? 0) };
 }

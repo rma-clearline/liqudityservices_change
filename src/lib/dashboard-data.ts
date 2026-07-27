@@ -22,6 +22,10 @@ import {
   azFetchMarketplaceSellers,
   azFetchSellerDeltas,
 } from "./azure-tables";
+import { getTopSoldLots, isAzureSqlConfigured } from "./azure-sql";
+import { enrichTopLots, type EnrichedLot } from "./asset-fees";
+import { etTodayKey, etQuarterKey } from "./time";
+import { quarterDayKeys } from "./qtd-shared";
 
 // Cached loaders for the dashboard's Server-Component reads. Every query here is
 // GLOBAL and read-only (identical for all authenticated users), so a shared
@@ -139,5 +143,26 @@ export function getMarketplaceData(): Promise<MarketplaceData> {
       sellers: (sellersRes.data ?? []) as MarketplaceSellerRow[],
       deltas: (deltasRes.data ?? []) as SellerDeltaRow[],
     };
+  });
+}
+
+// --- Top Sold Items (current quarter) — enriched with take rate + watches ---
+// The sold store is always Azure; enrichment (per-asset Maestro detail calls) is
+// best-effort and cached with the rest so a page load makes them at most once per TTL.
+const TOP_SOLD_MIN_USD = Number(process.env.TOP_SOLD_MIN_USD) || 1_000_000;
+const TOP_SOLD_LIMIT = Number(process.env.TOP_SOLD_LIMIT) || 25;
+export type TopSoldData = { lots: EnrichedLot[]; total: number };
+
+const topSoldCache = ttlCache<TopSoldData>(TTL);
+
+export function getTopSoldItems(): Promise<TopSoldData> {
+  return topSoldCache.get("qtd", async () => {
+    if (!isAzureSqlConfigured()) return { lots: [], total: 0 };
+    const today = etTodayKey();
+    const start = quarterDayKeys(etQuarterKey(today))[0];
+    if (!start) return { lots: [], total: 0 };
+    const { lots, total } = await getTopSoldLots(start, today, TOP_SOLD_MIN_USD, TOP_SOLD_LIMIT);
+    const enriched = await enrichTopLots(lots);
+    return { lots: enriched, total };
   });
 }
