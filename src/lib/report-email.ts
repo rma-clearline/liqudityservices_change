@@ -110,20 +110,11 @@ async function loadReportData(todayKey: string): Promise<ReportData> {
   ]);
 
   let buckets: Awaited<ReturnType<typeof getSoldDailyByBucket>> | undefined;
-  let topLots: ReportData["topLots"] = null;
   if (isAzureSqlConfigured()) {
     try {
       buckets = await getSoldDailyByBucket(base.earliest_data_date, todayKey);
     } catch {
       // store slow/unreachable → segment/txn tables degrade to unavailable
-    }
-    // Top QTD lots (current calendar quarter through today). Independent of the
-    // buckets fetch so one failing doesn't drop the other.
-    try {
-      const quarterStart = quarterDayKeys(currentQuarter)[0];
-      if (quarterStart) topLots = await getTopSoldLots(quarterStart, todayKey, TOP_LOT_MIN_USD, TOP_LOT_LIMIT);
-    } catch {
-      // store slow/unreachable → top-lots table omitted
     }
   }
 
@@ -141,6 +132,22 @@ async function loadReportData(todayKey: string): Promise<ReportData> {
   };
 
   const headline = computeQtdHeadline(qtdData, { todayKey });
+
+  // Top QTD lots — bounded at the headline's data-through day (last COMPLETE
+  // captured day), NOT todayKey, so the table can never list an item dated after
+  // the email's "data through <date>" line. Own try/catch so a slow store just
+  // omits this one table.
+  let topLots: ReportData["topLots"] = null;
+  if (isAzureSqlConfigured()) {
+    try {
+      const quarterStart = quarterDayKeys(currentQuarter)[0];
+      const through = headline?.dataThrough ?? todayKey;
+      if (quarterStart) topLots = await getTopSoldLots(quarterStart, through, TOP_LOT_MIN_USD, TOP_LOT_LIMIT);
+    } catch {
+      // store slow/unreachable → top-lots table omitted
+    }
+  }
+
   const model = buildModel(qtdData, todayKey, currentQuarter);
   const viewNow = model ? buildQuarterView(model, currentQuarter) : null;
   const listings: ListingsDay[] = listingRows.map((r) => ({
