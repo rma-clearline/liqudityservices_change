@@ -48,8 +48,75 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
     { label: "Blended marketplace", reported: latest.consignmentTake, fee: measured?.overall_pct ?? null, bp: BP_RANGE.BLENDED },
   ];
 
+  // Recommended take rate per category: trailing-4-quarter GMV-weighted (smooths the
+  // quarterly seasonality — CAG in particular swings). Latest quarter shown alongside.
+  const ttm = quarters.slice(-4);
+  const wt = (rev: (q: TakeRateQuarter) => number, gmv: (q: TakeRateQuarter) => number): number => {
+    const g = ttm.reduce((a, q) => a + gmv(q), 0);
+    return g > 0 ? ttm.reduce((a, q) => a + rev(q), 0) / g : 0;
+  };
+  const consignRates = ttm.filter((q) => q.consignmentTake > 0).map((q) => q.consignmentTake);
+  const ttmConsign = consignRates.length ? consignRates.reduce((a, b) => a + b, 0) / consignRates.length : latest.consignmentTake;
+  type RecItem =
+    | { kind: "group"; label: string; key: string }
+    | { kind: "row"; key: string; label: string; rec: number; latest: number; basis: string };
+  const recItems: RecItem[] = [
+    { kind: "group", key: "g1", label: "Marketplace commission — the auction take rate" },
+    { kind: "row", key: "gd", label: "GovDeals", rec: wt((q) => q.govdealsRev, (q) => q.govdealsGmv), latest: latest.govdealsTake, basis: "reported actual (SEC-verified); inside the fee-implied band" },
+    { kind: "row", key: "cag", label: "Industrial / CAG", rec: wt((q) => q.cagRev, (q) => q.cagGmv), latest: latest.cagTake, basis: "reported; includes Machinio subscription + valuation services" },
+    { kind: "row", key: "cons", label: "Blended consignment", rec: ttmConsign, latest: latest.consignmentTake, basis: "reported blended marketplace commission" },
+    { kind: "group", key: "g2", label: "Non-commission — for context, not an auction fee" },
+    { kind: "row", key: "rscg", label: "RSCG (purchase / ownership)", rec: wt((q) => q.rscgRev, (q) => q.rscgGmv), latest: latest.rscgTake, basis: "gross margin on goods LSI buys and resells" },
+    { kind: "row", key: "total", label: "Total company (revenue ÷ GMV)", rec: wt((q) => q.reconstructed, (q) => q.totalGmv), latest: latest.blendedTake, basis: "includes the purchase/ownership line — not a marketplace rate" },
+  ];
+
   return (
     <div className="space-y-10 text-sm">
+      {/* Recommended take rates — headline summary */}
+      <section className="rounded-lg border border-gray-300 bg-gray-50/70 p-4">
+        <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+          <h3 className="text-sm font-semibold">Recommended take rates by category</h3>
+          <span className="text-xs text-gray-500">trailing 4 quarters, GMV-weighted · latest reported {fq(latest.quarter)}</span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse">
+            <thead>
+              <tr className="border-b border-gray-300 text-left text-xs text-gray-500">
+                <th className="py-1 pr-4">Category</th>
+                <th className="py-1 pr-4 text-right">Recommended</th>
+                <th className="py-1 pr-4 text-right">Latest</th>
+                <th className="py-1">Basis</th>
+              </tr>
+            </thead>
+            <tbody className="tabular-nums">
+              {recItems.map((it) =>
+                it.kind === "group" ? (
+                  <tr key={it.key}>
+                    <td colSpan={4} className="pt-2.5 pb-0.5 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+                      {it.label}
+                    </td>
+                  </tr>
+                ) : (
+                  <tr key={it.key} className="border-b border-gray-100">
+                    <td className="py-1 pr-4">{it.label}</td>
+                    <td className="py-1 pr-4 text-right font-semibold">{pf(it.rec)}</td>
+                    <td className="py-1 pr-4 text-right text-gray-500">{pf(it.latest)}</td>
+                    <td className="py-1 text-xs text-gray-500">{it.basis}</td>
+                  </tr>
+                ),
+              )}
+            </tbody>
+          </table>
+        </div>
+        <p className="mt-2 text-xs text-gray-400">
+          Reported rates are LSI&apos;s filed actuals — verified to the decimal against SEC filings and consistent with published
+          fee mechanics. Within each marketplace rate the seller admin fee is <em>measured</em>{" "}
+          ({pp(measured?.overall_pct ?? null)} blended) and the buyer&apos;s premium is <em>inferred</em>. Use the marketplace
+          commissions (~10–17%) as the auction take rate; the total (~{pf(latest.blendedTake)}) mixes in the purchase/ownership
+          line and isn&apos;t a fee.
+        </p>
+      </section>
+
       {/* Thesis */}
       <p className="max-w-3xl text-gray-600">
         LSI&apos;s take is overwhelmingly a <strong>buyer-premium and services</strong> story, not a seller-commission one. The
