@@ -148,8 +148,36 @@ type HistExport = Awaited<ReturnType<typeof loadHistoricalDailyTotalsForExport>>
 // honor a site-only OR market-only filter; anything finer excludes historical.
 function historicalHonorsFilters(f: ExportFilters): boolean {
   if (f.type !== "all" || f.category || f.state || f.country || f.minUsd != null || f.maxUsd != null) return false;
-  if (f.site !== "all" && f.market !== "all") return false; // no site×market cross in the CSV
+  // The wide pivot needs a per-site split, which the CSV has only at market=all
+  // (no site×market cross). Any market filter → the store serves the whole range
+  // (via the !useHist path in liveFrom) so a market-filtered export isn't empty.
+  if (f.market !== "all") return false;
   return true;
+}
+
+// Split `target` whole dollars across `sites` (cents-precision GMV) by floor +
+// largest remainder, so the integer per-site values sum EXACTLY to `target`. Used
+// so each day's per-site columns sum to the same Math.round(ALL) the monthly table
+// uses — keeping the wide Grand Total exact and internally consistent.
+function allocateWholeDollars(target: number, sites: Map<string, number>): Map<string, number> {
+  const out = new Map<string, number>();
+  const fracs: { label: string; frac: number }[] = [];
+  let sumFloor = 0;
+  for (const [label, g] of sites) {
+    const f = Math.floor(g);
+    out.set(label, f);
+    sumFloor += f;
+    fracs.push({ label, frac: g - f });
+  }
+  const residual = target - sumFloor;
+  if (residual > 0) {
+    fracs.sort((a, b) => b.frac - a.frac);
+    for (let k = 0; k < residual && k < fracs.length; k++) out.set(fracs[k].label, (out.get(fracs[k].label) as number) + 1);
+  } else if (residual < 0) {
+    fracs.sort((a, b) => a.frac - b.frac);
+    for (let k = 0; k < -residual && k < fracs.length; k++) out.set(fracs[k].label, (out.get(fracs[k].label) as number) - 1);
+  }
+  return out;
 }
 
 // Resolve the (gmv, lots, site, market) a historical day contributes under the
@@ -283,34 +311,48 @@ export async function GET(request: Request) {
 
   if (mode === "pivot") {
     const period = parsePeriod(searchParams.get("period"));
-    // GMV by period × site (AllSurplus / GovDeals / Industrial). Live days come from
-    // the per-lot store (summed by site); historical days from the CSV's per-site
-    // series (rounded per day, mirroring the forecast's per-source rounding) — which
-    // sums to the CSV ALL total == the monthly table. The modal reshapes this long
-    // output into the wide site-column table.
-    const cells = new Map<string, Map<string, number>>(); // period -> siteLabel -> gmv
-    const add = (pk: string, label: string, gmv: number) => {
-      let m = cells.get(pk);
-      if (!m) cells.set(pk, (m = new Map()));
-      m.set(label, (m.get(label) ?? 0) + gmv);
+    // GMV by period × site (AllSurplus / GovDeals / Industrial). To reconcile to the
+    // monthly table EXACTLY we mirror how it rounds — it sums Math.round(ALL) per
+    // day — so we build a per-day per-site map and split each day's round(ALL) across
+    // sites by largest remainder. The per-site columns then sum, to the dollar, to
+    // the same round(ALL) the table uses. Historical days: CSV per-site + CSV ALL.
+    // Live days: store per-lot by site (unknown site folded to Industrial, matching
+    // the forecast). Historical & live days are disjoint across the CSV boundary.
+    type Day = { sites: Map<string, number>; all: number | null };
+    const perDay = new Map<string, Day>();
+    const dayOf = (date: string): Day => {
+      let e = perDay.get(date);
+      if (!e) perDay.set(date, (e = { sites: new Map(), all: null }));
+      return e;
     };
-    for (const r of liveFiltered) add(periodKey(r.close_date_et, period), siteLabel(r.site), r.sale_amount_usd ?? 0);
-    // The CSV has a per-site split but no site×market cross, so only use it for the
-    // per-site pivot when there's no market filter (site-only filter narrows to one).
-    if (useHist && filters.market === "all") {
-      for (const site of ["AD", "GD", "GI"] as const) {
-        if (filters.site !== "all" && filters.site !== site) continue;
-        const byDate = hist.platforms.get(site);
-        if (!byDate) continue;
-        const label = siteLabel(site);
-        for (const [date, v] of byDate) {
-          if (date < from || date > histTo) continue;
-          add(periodKey(date, period), label, Math.round(v.gmv));
+    for (const r of liveFiltered) {
+      const e = dayOf(r.close_date_et);
+      const label = siteLabel(r.site === "AD" || r.site === "GD" || r.site === "GI" ? r.site : "GI");
+      e.sites.set(label, (e.sites.get(label) ?? 0) + (r.sale_amount_usd ?? 0));
+    }
+    if (useHist) {
+      const sites: ("AD" | "GD" | "GI")[] = filters.site !== "all" ? [filters.site] : ["AD", "GD", "GI"];
+      for (const [date, t] of hist.byDate) {
+        if (date < from || date > histTo) continue;
+        const e = dayOf(date);
+        for (const s of sites) {
+          const v = hist.platforms.get(s)?.get(date);
+          if (v) e.sites.set(siteLabel(s), (e.sites.get(siteLabel(s)) ?? 0) + v.gmv);
         }
+        // The deduped ALL total the table rounds; a single-site filter targets that site.
+        e.all = filters.site !== "all" ? hist.platforms.get(filters.site)?.get(date)?.gmv ?? 0 : t.gmv;
       }
     }
+    const cells = new Map<string, Map<string, number>>();
+    for (const [date, e] of perDay) {
+      const target = Math.round(e.all ?? [...e.sites.values()].reduce((a, b) => a + b, 0));
+      const pk = periodKey(date, period);
+      let m = cells.get(pk);
+      if (!m) cells.set(pk, (m = new Map()));
+      for (const [label, g] of allocateWholeDollars(target, e.sites)) m.set(label, (m.get(label) ?? 0) + g);
+    }
     const rows: { period: string; site: string; gmv_usd: number }[] = [];
-    for (const [pk, m] of cells) for (const [label, gmv] of m) rows.push({ period: pk, site: label, gmv_usd: Math.round(gmv * 100) / 100 });
+    for (const [pk, m] of cells) for (const [label, gmv] of m) rows.push({ period: pk, site: label, gmv_usd: gmv });
     rows.sort((a, b) => a.period.localeCompare(b.period) || a.site.localeCompare(b.site));
     const csv = toCsv(rows, [
       { key: "period", label: "Period" },
