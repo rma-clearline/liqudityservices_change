@@ -57,11 +57,16 @@ export async function fetchAdminFeePercent(
   auctionId: string,
   endDateEt: string,
   timeoutMs = 8_000,
+  force = false,
 ): Promise<number | null> {
   if (!assetId || !accountId) return null;
   const key = `${site}:${accountId}`;
-  const hit = feeCache.get(key);
-  if (fresh(hit)) return hit!.v;
+  // force skips the read cache (used by the cron, whose 8s budget shouldn't inherit a
+  // transient null a short dashboard call may have cached); it still writes its result.
+  if (!force) {
+    const hit = feeCache.get(key);
+    if (fresh(hit)) return hit!.v;
+  }
   const running = feeInflight.get(key);
   if (running) return running;
   const p = (async () => {

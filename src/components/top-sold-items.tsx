@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import type { EnrichedLot } from "@/lib/asset-fees";
+import type { BlendedAdminFee } from "@/lib/dashboard-data";
 import { ExportButton } from "./export-button";
 
 type Marketplace = "AD" | "GD" | "GI";
@@ -26,7 +27,7 @@ function safeHttpUrl(u: string | null): string | null {
   return /^https?:\/\//i.test(u) ? u : null;
 }
 
-export function TopSoldItems({ rows, total }: { rows: EnrichedLot[]; total: number }) {
+export function TopSoldItems({ rows, total, blended }: { rows: EnrichedLot[]; total: number; blended: BlendedAdminFee | null }) {
   const [filter, setFilter] = useState<"all" | Marketplace>("all");
   const [query, setQuery] = useState("");
 
@@ -73,8 +74,24 @@ export function TopSoldItems({ rows, total }: { rows: EnrichedLot[]; total: numb
     { key: "GI", label: `Industrial (${counts.GI})` },
   ];
 
+  const coverage = blended && blended.total_gmv > 0 ? blended.covered_gmv / blended.total_gmv : 0;
+
   return (
     <div className="space-y-3">
+      {blended && blended.blended_pct != null && coverage > 0 ? (
+        <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm">
+          <span className="font-semibold">QTD blended seller admin fee: {blended.blended_pct.toFixed(2)}%</span>
+          <span className="text-gray-500">
+            {" "}
+            · GMV-weighted across sold lots with a known fee ({(coverage * 100).toFixed(0)}% of QTD GMV covered). Seller-side
+            only — excludes buyer&apos;s premium, so it understates full take rate.
+          </span>
+        </div>
+      ) : (
+        <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-500">
+          Blended seller admin fee: building coverage — per-seller fees populate as the daily job runs.
+        </div>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-1.5">
           {filters.map((f) => (

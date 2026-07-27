@@ -891,3 +891,115 @@ export async function getTopSoldLots(
   }));
   return { lots, total: Number(r.recordset[0]?.total_matching ?? 0) };
 }
+
+// --- seller admin fees (the capturable take-rate component) -------------------
+// LQDT's seller-side admin fee %, a per-seller contracted rate captured from
+// Maestro's per-asset detail endpoint (see asset-fees.ts). NOT the model's total
+// take rate (which is buyer-premium-dominated). Kept in a small lookup keyed by
+// (site, account_id) so it can be GMV-weighted across sold lots for a reference.
+export type SellerFeeRow = { site: string; account_id: string; admin_fee_percent: number };
+
+let sellerFeesTableEnsured = false;
+/** Create lqdt.seller_fees on first use (idempotent, once per process). */
+async function ensureSellerFeesTable(pool: sql.ConnectionPool): Promise<void> {
+  if (sellerFeesTableEnsured) return;
+  await pool
+    .request()
+    .batch(
+      "IF OBJECT_ID('lqdt.seller_fees', 'U') IS NULL " +
+        "CREATE TABLE lqdt.seller_fees (" +
+        "site nvarchar(8) NOT NULL, " +
+        "account_id nvarchar(64) NOT NULL, " +
+        "admin_fee_percent decimal(9,4) NOT NULL, " +
+        "fetched_at datetime2(0) NOT NULL DEFAULT sysutcdatetime(), " +
+        "CONSTRAINT PK_seller_fees PRIMARY KEY (site, account_id))",
+    );
+  sellerFeesTableEnsured = true;
+}
+
+/** Distinct sellers with sold lots since `fromEt`, each with a representative asset to price the fee. */
+export async function getDistinctSellersForFees(
+  fromEt: string,
+): Promise<{ site: string; account_id: string; asset_id: string; auction_id: string; close_date_et: string }[]> {
+  const pool = await getPool();
+  const r = await pool
+    .request()
+    .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+    .query(
+      "SELECT site, account_id, MIN(asset_id) AS asset_id, MIN(auction_id) AS auction_id, " +
+        "CONVERT(char(10), MAX(close_date_et), 23) AS close_date_et " +
+        "FROM lqdt.sold_lots " +
+        "WHERE close_date_et >= @from AND account_id IS NOT NULL AND account_id <> '' AND asset_id IS NOT NULL " +
+        "GROUP BY site, account_id " +
+        // Biggest sellers first: coverage is GMV-weighted, so the top-GMV sellers
+        // matter most and must never be starved by a tail of persistently-failing ones.
+        "ORDER BY SUM(sale_amount_usd) DESC",
+    );
+  return r.recordset.map((x) => ({
+    site: String(x.site ?? ""),
+    account_id: String(x.account_id ?? ""),
+    asset_id: String(x.asset_id ?? ""),
+    auction_id: String(x.auction_id ?? ""),
+    close_date_et: String(x.close_date_et ?? ""),
+  }));
+}
+
+/** `site:account_id` -> admin_fee_percent for fees fetched within `maxAgeDays`. */
+export async function getSellerFeesFresh(maxAgeDays = 30): Promise<Map<string, number>> {
+  const pool = await getPool();
+  await ensureSellerFeesTable(pool);
+  const r = await pool
+    .request()
+    .input("cutoff", sql.DateTime2, new Date(Date.now() - maxAgeDays * 86_400_000))
+    .query("SELECT site, account_id, admin_fee_percent FROM lqdt.seller_fees WHERE fetched_at >= @cutoff");
+  const m = new Map<string, number>();
+  for (const x of r.recordset) m.set(`${String(x.site)}:${String(x.account_id)}`, Number(x.admin_fee_percent));
+  return m;
+}
+
+export async function upsertSellerFees(rows: SellerFeeRow[]): Promise<number> {
+  if (rows.length === 0) return 0;
+  const pool = await getPool();
+  await ensureSellerFeesTable(pool);
+  await pool
+    .request()
+    .input("json", sql.NVarChar(sql.MAX), JSON.stringify(rows))
+    .query(
+      "MERGE lqdt.seller_fees WITH (HOLDLOCK) AS t USING (" +
+        "SELECT site, account_id, admin_fee_percent FROM OPENJSON(@json) WITH (" +
+        "site nvarchar(8) '$.site', account_id nvarchar(64) '$.account_id', admin_fee_percent decimal(9,4) '$.admin_fee_percent'" +
+        ")) AS s ON t.site = s.site AND t.account_id = s.account_id " +
+        "WHEN MATCHED THEN UPDATE SET admin_fee_percent = s.admin_fee_percent, fetched_at = sysutcdatetime() " +
+        "WHEN NOT MATCHED THEN INSERT (site, account_id, admin_fee_percent) VALUES (s.site, s.account_id, s.admin_fee_percent);",
+    );
+  return rows.length;
+}
+
+/** GMV-weighted blended admin fee across sold lots in [from,to], with coverage. */
+export async function getBlendedAdminFee(
+  fromEt: string,
+  toEt: string,
+): Promise<{ blended_pct: number | null; covered_gmv: number; total_gmv: number }> {
+  const pool = await getPool();
+  await ensureSellerFeesTable(pool);
+  const r = await pool
+    .request()
+    .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+    .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
+    .query(
+      "SELECT " +
+        "SUM(CASE WHEN f.admin_fee_percent IS NOT NULL THEN l.sale_amount_usd * f.admin_fee_percent / 100.0 ELSE 0 END) AS fee_usd, " +
+        "SUM(CASE WHEN f.admin_fee_percent IS NOT NULL THEN l.sale_amount_usd ELSE 0 END) AS covered_gmv, " +
+        "SUM(l.sale_amount_usd) AS total_gmv " +
+        "FROM lqdt.sold_lots l LEFT JOIN lqdt.seller_fees f ON f.site = l.site AND f.account_id = l.account_id " +
+        "WHERE l.close_date_et BETWEEN @from AND @to",
+    );
+  const x = r.recordset[0] ?? {};
+  const covered = Number(x.covered_gmv ?? 0);
+  const feeUsd = Number(x.fee_usd ?? 0);
+  return {
+    blended_pct: covered > 0 ? (feeUsd / covered) * 100 : null,
+    covered_gmv: covered,
+    total_gmv: Number(x.total_gmv ?? 0),
+  };
+}

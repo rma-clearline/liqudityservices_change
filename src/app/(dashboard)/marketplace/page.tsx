@@ -38,5 +38,5 @@ export default async function MarketplacePage() {
 
 async function TopSoldSection() {
   const topSold = await getTopSoldItems();
-  return <TopSoldItems rows={topSold.lots} total={topSold.total} />;
+  return <TopSoldItems rows={topSold.lots} total={topSold.total} blended={topSold.blended} />;
 }

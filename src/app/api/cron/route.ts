@@ -4,7 +4,17 @@ import { scrapeListings } from "@/lib/scraper";
 import { scrapeMarketplaceMetrics, type SellerInfo } from "@/lib/marketplace-metrics";
 import { computeRevenueForecast, ingestAuctions } from "@/lib/auctions";
 import { fetchSoldRange } from "@/lib/sold-export";
-import { writeSoldLots, isAzureSqlConfigured } from "@/lib/azure-sql";
+import {
+  writeSoldLots,
+  isAzureSqlConfigured,
+  getDistinctSellersForFees,
+  getSellerFeesFresh,
+  upsertSellerFees,
+  type SellerFeeRow,
+} from "@/lib/azure-sql";
+import { fetchAdminFeePercent } from "@/lib/asset-fees";
+import { etQuarterKey } from "@/lib/time";
+import { quarterDayKeys } from "@/lib/qtd-shared";
 import { fetchNewContracts, fetchContractSummary } from "@/lib/contracts";
 import { fetchSamOpportunities } from "@/lib/sam-opportunities";
 import { fetchAllStateContracts } from "@/lib/state-contracts";
@@ -221,6 +231,67 @@ export async function GET(request: Request) {
     }),
   );
 
+  // Capture each seller's LQDT admin (seller) fee % — a per-seller contracted rate
+  // from Maestro's per-asset detail endpoint. Only sellers not already fresh in the
+  // store are fetched, capped per run, so coverage of the quarter's sellers fills in
+  // over successive daily runs without hammering Maestro. Own time budget so it can
+  // never push the shared cron past maxDuration. Best-effort: failures are logged,
+  // never fatal to the rest of the cron.
+  const sellerFeeTask = logger.track(
+    "seller_fees",
+    async () => {
+      if (!runSoldCapture || !isAzureSqlConfigured()) {
+        return { fetched: 0, remaining: 0, skipped: true, error: null as string | null };
+      }
+      const timeoutMs = Number(process.env.SELLER_FEE_TIMEOUT_MS) || 30000;
+      const maxPerRun = Number(process.env.SELLER_FEE_MAX_PER_RUN) || 150;
+      try {
+        return await Promise.race([
+          (async () => {
+            const quarterStart = quarterDayKeys(etQuarterKey(date))[0] ?? date;
+            const sellers = await getDistinctSellersForFees(quarterStart); // top-GMV first
+            const fresh = await getSellerFeesFresh(30);
+            const missing = sellers.filter((s) => s.account_id && !fresh.has(`${s.site}:${s.account_id}`));
+            const todo = missing.slice(0, maxPerRun);
+            // Internal deadline with headroom under the hard timeout; flush each batch so a
+            // slow tail never discards the whole run's fetched fees (partial progress persists).
+            const deadline = Date.now() + timeoutMs - 4000;
+            const BATCH = 40;
+            let fetched = 0;
+            let attempted = 0;
+            for (let start = 0; start < todo.length && Date.now() < deadline; start += BATCH) {
+              const batch = todo.slice(start, start + BATCH);
+              attempted += batch.length;
+              const rows: SellerFeeRow[] = [];
+              let i = 0;
+              const worker = async () => {
+                while (i < batch.length && Date.now() < deadline) {
+                  const s = batch[i++];
+                  const to = Math.min(8000, deadline - Date.now());
+                  if (to <= 250) break;
+                  const pct = await fetchAdminFeePercent(s.site, s.asset_id, s.account_id, s.auction_id, s.close_date_et, to, true);
+                  if (pct != null) rows.push({ site: s.site, account_id: s.account_id, admin_fee_percent: pct });
+                }
+              };
+              await Promise.all(Array.from({ length: 8 }, worker));
+              if (rows.length) fetched += await upsertSellerFees(rows);
+            }
+            return { fetched, remaining: Math.max(0, missing.length - attempted), skipped: false, error: null as string | null };
+          })(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("seller_fees capture timeout")), timeoutMs)),
+        ]);
+      } catch (e) {
+        return { fetched: 0, remaining: 0, skipped: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+    (r): SourceSummary => ({
+      status: r.skipped ? "skipped" : r.error ? "failed" : "success",
+      rows: r.fetched,
+      detail: { remaining: r.remaining },
+      error: r.error,
+    }),
+  );
+
   const federalTask = logger.track(
     "federal_contracts",
     async () => {
@@ -376,6 +447,7 @@ export async function GET(request: Request) {
     metricsTask,
     auctionsTask,
     soldCaptureTask,
+    sellerFeeTask,
     federalTask,
     samTask,
     stateTask,
