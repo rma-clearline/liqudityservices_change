@@ -6,6 +6,7 @@ import { ListingsChart } from "./listings-chart";
 import { ListingsTable } from "./listings-table";
 import { EmailSnapshot } from "./email-snapshot";
 import { SectionHeader } from "./section-header";
+import { downloadCsv, toCsv } from "@/lib/format";
 
 const RANGES = ["All", "3Y", "1Y", "6M", "3M", "1M"] as const;
 type Range = (typeof RANGES)[number];
@@ -41,6 +42,21 @@ export function ListingsView({ listings }: { listings: ListingRow[] }) {
     const floor = cutoff && cutoff > DATA_START ? cutoff : DATA_START;
     return listings.filter((r) => r.date >= floor);
   }, [listings, range]);
+
+  // Export the full raw listings history (all days) as CSV, oldest→newest.
+  const exportListings = () => {
+    const asc = [...listings].sort((a, b) => a.date.localeCompare(b.date));
+    const csv = toCsv(
+      asc.map((r) => ({ date: r.date, timestamp: r.timestamp, allsurplus: r.allsurplus ?? 0, govdeals: r.govdeals ?? 0 })),
+      [
+        { key: "date", label: "Date" },
+        { key: "timestamp", label: "Time (ET)" },
+        { key: "allsurplus", label: "AllSurplus" },
+        { key: "govdeals", label: "GovDeals" },
+      ],
+    );
+    downloadCsv(`lqdt-listings-${asc[0]?.date ?? "all"}_to_${asc[asc.length - 1]?.date ?? "all"}.csv`, csv);
+  };
 
   return (
     <div>
@@ -84,8 +100,18 @@ export function ListingsView({ listings }: { listings: ListingRow[] }) {
       </section>
 
       <section>
-        <h2 className="text-lg font-semibold mb-4">History</h2>
-        <ListingsTable data={filtered} />
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h2 className="text-lg font-semibold">
+            History <span className="text-sm font-normal text-gray-400">(last 30 days)</span>
+          </h2>
+          <button
+            onClick={exportListings}
+            className="rounded border border-gray-300 bg-white px-3 py-1 text-sm font-medium text-gray-700 hover:bg-gray-50"
+          >
+            Export to Excel
+          </button>
+        </div>
+        <ListingsTable listings={listings} />
       </section>
     </div>
   );
