@@ -48,4 +48,11 @@ export type MCol = {
   lyReported?: number | null;
   hl?: boolean;
   total?: boolean;
+  // Cumulative quarter-to-date Y/Y as it stood at this period's END (resets each
+  // fiscal quarter). Presence of this field (even null) makes MetricsTable render a
+  // "QTD Y/Y as of" column — so only the Months/T7D trend tables opt in.
+  qtdYoy?: number | null;
+  // Multi-year annualized growth vs the same window N years earlier: [2Y, 3Y, 4Y].
+  // A horizon column renders only if some row has a non-null value ("as available").
+  cagr?: (number | null)[];
 };

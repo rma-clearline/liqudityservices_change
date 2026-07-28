@@ -31,14 +31,45 @@ export function MetricsTable({
 }) {
   const shown = groups.filter((g) => g.cols.length > 0);
   if (shown.length === 0) return null;
+  const anyCol = (pred: (c: MCol) => boolean) => shown.some((g) => g.cols.some(pred));
+  // Opt-in extra columns (only the Months/T7D trend tables set these fields):
+  const showQtd = anyCol((c) => c.qtdYoy !== undefined);
+  const cagrHz = [2, 3, 4].filter((h) => anyCol((c) => c.cagr?.[h - 2] != null));
+  const nCols = 3 + (showQtd ? 1 : 0) + cagrHz.length;
+  const pctCell = (v: number | null | undefined, star = false) =>
+    v == null ? (
+      <span className="text-gray-300">—</span>
+    ) : (
+      <span className={v >= 0 ? "text-green-600" : "text-red-600"}>
+        {fmtPct(v)}
+        {star && <span className="text-gray-400">*</span>}
+      </span>
+    );
   return (
-    <div className="rounded-lg border">
+    <div className="rounded-lg border overflow-x-auto">
       <table className="w-full border-collapse text-xs">
         <thead>
           <tr className="border-b-2 border-gray-300 text-left">
             <th className="px-2.5 py-1 font-semibold text-gray-600">Period</th>
             <th className="px-2.5 py-1 text-right font-semibold text-gray-600">USDmm</th>
+            {showQtd && (
+              <th
+                className="px-2.5 py-1 text-right font-semibold text-gray-600"
+                title="Cumulative quarter-to-date Y/Y as it stood at the end of this period; resets each fiscal quarter"
+              >
+                QTD Y/Y as of
+              </th>
+            )}
             <th className="px-2.5 py-1 text-right font-semibold text-gray-600">Y/Y</th>
+            {cagrHz.map((h) => (
+              <th
+                key={h}
+                className="px-2.5 py-1 text-right font-semibold text-gray-600"
+                title={`Annualized growth (CAGR) vs the same window ${h} years earlier`}
+              >
+                {h}Y
+              </th>
+            ))}
           </tr>
         </thead>
         <tbody>
@@ -46,7 +77,7 @@ export function MetricsTable({
             <Fragment key={g.name}>
               {shown.length > 1 && (
                 <tr className="border-b bg-gray-50/60">
-                  <td colSpan={3} className="px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                  <td colSpan={nCols} className="px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
                     {g.name}
                   </td>
                 </tr>
@@ -67,16 +98,13 @@ export function MetricsTable({
                     <td className="px-2.5 py-1 text-right tabular-nums font-semibold text-gray-900">
                       {((c.total ? c.nominal : c.nominal * scale) / 1e6).toFixed(1)}
                     </td>
-                    <td className="px-2.5 py-1 text-right tabular-nums">
-                      {v == null ? (
-                        <span className="text-gray-300">—</span>
-                      ) : (
-                        <span className={v >= 0 ? "text-green-600" : "text-red-600"}>
-                          {fmtPct(v)}
-                          {derived != null && <span className="text-gray-400">*</span>}
-                        </span>
-                      )}
-                    </td>
+                    {showQtd && <td className="px-2.5 py-1 text-right tabular-nums">{pctCell(c.qtdYoy)}</td>}
+                    <td className="px-2.5 py-1 text-right tabular-nums">{pctCell(v, derived != null)}</td>
+                    {cagrHz.map((h) => (
+                      <td key={h} className="px-2.5 py-1 text-right tabular-nums">
+                        {pctCell(c.cagr?.[h - 2])}
+                      </td>
+                    ))}
                   </tr>
                 );
               })}

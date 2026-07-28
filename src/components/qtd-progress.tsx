@@ -8,7 +8,7 @@
 // All math is client-side on the /api/forecast?quarter=ALL payload (full daily
 // history + reported/estimate series).
 
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ComposedChart,
   Line,
@@ -24,7 +24,7 @@ import {
 } from "recharts";
 import type { NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
 import { downloadCsv } from "@/lib/format";
-import { etQuarterKey, formatQuarterLabel } from "@/lib/time";
+import { etQuarterKey, formatQuarterLabel, lqdtFiscalQuarter } from "@/lib/time";
 import {
   buildModel,
   buildQuarterView,
@@ -254,6 +254,123 @@ function DefinitionsBox() {
   );
 }
 
+type TapeQ = {
+  q: string;
+  fyBand: string; // fiscal-year band header, e.g. "FY26"
+  fqLabel: string; // fiscal quarter, e.g. "FQ4"
+  cqLabel: string; // calendar-quarter hint, e.g. "CQ3 '26"
+  endDate: string;
+  live: boolean;
+  reportedActual: boolean;
+  gmv: number | null;
+  gmvYoy: number | null;
+  qtdYoy: number | null;
+  guideMid: number | null;
+  consensus: number | null;
+  clearline: number | null;
+};
+
+/** Horizontal quarter tape (ODP-style): quarters are COLUMNS under a year band,
+ *  metrics are ROWS with a sticky left label column; oldest→newest left→right, auto-
+ *  scrolled to the newest (right) edge. The live/unreported quarter is the rightmost
+ *  column and reads top→bottom as a bridge: our GMV/estimate → growth → guidance /
+ *  Street consensus / Clearline. Blue = reported actual, purple = ours/live, red = CL. */
+function QuarterTape({ cols }: { cols: TapeQ[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Scroll to the newest (right) edge when the column set first appears or changes
+  // size — keyed on length, NOT the array identity (rebuilt every parent render), so
+  // unrelated re-renders (toggles, capture-rate typing) don't yank a user who
+  // scrolled left back to the right. useLayoutEffect applies it before paint (no flash).
+  useLayoutEffect(() => {
+    const elx = scrollRef.current;
+    if (elx) elx.scrollLeft = elx.scrollWidth;
+  }, [cols.length]);
+  if (cols.length === 0) return null;
+  const money = (v: number | null) => (v == null ? "—" : `$${(v / 1e6).toFixed(1)}`);
+  const pct = (v: number | null): ReactNode =>
+    v == null ? (
+      <span className="text-gray-300">—</span>
+    ) : (
+      <span className={v >= 0 ? "text-green-600" : "text-red-600"}>{fmtPct(v)}</span>
+    );
+  const bands: { label: string; span: number }[] = [];
+  for (const c of cols) {
+    const b = bands[bands.length - 1];
+    if (b && b.label === c.fyBand) b.span++;
+    else bands.push({ label: c.fyBand, span: 1 });
+  }
+  const rows: { label: string; strong?: boolean; render: (c: TapeQ) => ReactNode }[] = [
+    { label: "Period end", render: (c) => <span className="text-gray-500">{shortDate(c.endDate)}/{c.endDate.slice(2, 4)}</span> },
+    {
+      label: "GMV ($M)",
+      strong: true,
+      render: (c) => (
+        <span className={c.reportedActual ? "text-blue-700" : c.live ? "text-purple-700" : "text-gray-900"}>
+          {money(c.gmv)}
+          {c.live ? "°" : ""}
+        </span>
+      ),
+    },
+    { label: "GMV Y/Y", render: (c) => pct(c.gmvYoy) },
+    { label: "QTD pace Y/Y", render: (c) => (c.qtdYoy == null ? <span className="text-gray-300">—</span> : pct(c.qtdYoy)) },
+    { label: "Guidance mid", render: (c) => <span className="text-gray-700">{money(c.guideMid)}</span> },
+    { label: "Consensus (CH)", render: (c) => <span className="text-gray-700">{money(c.consensus)}</span> },
+    {
+      label: "Clearline",
+      render: (c) => (
+        <span className={c.clearline != null ? "text-red-600" : "text-gray-300"}>
+          {money(c.clearline)}
+          {c.clearline != null ? "e" : ""}
+        </span>
+      ),
+    },
+  ];
+  return (
+    <div ref={scrollRef} className="overflow-x-auto rounded-lg border">
+      <table className="border-collapse text-xs">
+        <thead>
+          <tr className="border-b text-left">
+            <th className="sticky left-0 z-10 bg-white px-2.5 py-1" />
+            {bands.map((b, i) => (
+              <th key={i} colSpan={b.span} className={`px-2.5 py-1 text-center font-semibold text-gray-400 ${i > 0 ? "border-l" : ""}`}>
+                {b.label}
+              </th>
+            ))}
+          </tr>
+          <tr className="border-b-2 border-gray-300 text-left">
+            <th className="sticky left-0 z-10 bg-white px-2.5 py-1 font-semibold text-gray-600">Fiscal period</th>
+            {cols.map((c) => (
+              <th
+                key={c.q}
+                className={`whitespace-nowrap px-2.5 py-1 text-right font-semibold ${c.live ? "text-purple-700" : "text-gray-600"}`}
+                style={{ minWidth: 74 }}
+              >
+                <div>
+                  {c.fqLabel}
+                  {c.live ? " · QTD°" : ""}
+                </div>
+                <div className="text-[10px] font-normal text-gray-400">{c.cqLabel}</div>
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.label} className="border-b border-gray-100">
+              <th className="sticky left-0 z-10 whitespace-nowrap bg-white px-2.5 py-1 text-left font-medium text-gray-600">{r.label}</th>
+              {cols.map((c) => (
+                <td key={c.q} className={`px-2.5 py-1 text-right tabular-nums ${r.strong ? "font-semibold" : ""} ${c.live ? "bg-purple-50/40" : ""}`}>
+                  {r.render(c)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function QtdTooltip({ active, payload }: TooltipContentProps<ValueType, NameType>) {
   if (!active || !payload?.length) return null;
   const row = payload[0]?.payload as ChartRow | undefined;
@@ -444,6 +561,35 @@ export function QtdProgress() {
     const lySum = sumRange(lyFrom, lyTo);
     return lySum > 0 ? cur / lySum - 1 : null;
   };
+  const addYearsKey = (key: string, n: number) => {
+    const [y, m, dd] = key.split("-").map(Number);
+    return new Date(Date.UTC(y + n, m - 1, dd)).toISOString().slice(0, 10);
+  };
+  // Cumulative quarter-to-date Y/Y as of `end` (day-of-quarter aligned to the prior
+  // year, like the chart). Resets at each fiscal-quarter boundary. null if uncovered.
+  const qtdYoyAsOf = (end: string): number | null => {
+    const q = etQuarterKey(end);
+    const qk = quarterDayKeys(q);
+    if (!qk.length) return null;
+    const elapsed = qk.filter((k) => k <= end).length;
+    if (elapsed <= 0 || !coveredFrom(qk[0])) return null;
+    const cur = sumRange(qk[0], end);
+    const lyqk = quarterDayKeys(priorYearQuarter(q));
+    if (lyqk.length < elapsed) return null;
+    return yoyOf(cur, lyqk[0], lyqk[elapsed - 1]);
+  };
+  // Annualized growth (CAGR) of `nominal` over [start,end] vs the same window N
+  // years earlier. null until the data reaches back that far ("as available").
+  const cagrOf = (nominal: number, start: string, end: string, years: number): number | null => {
+    const from = addYearsKey(start, -years);
+    if (!coveredFrom(from)) return null;
+    // Match the base window's LENGTH to [start,end] rather than shifting BOTH endpoints
+    // by a literal calendar year — otherwise a leap day (Feb 29) inside one window but
+    // not the other adds/drops a day and skews the ratio.
+    const spanDays = Math.round((Date.parse(end) - Date.parse(start)) / 86_400_000);
+    const base = sumRange(from, addDaysKey(from, spanDays));
+    return base > 0 ? Math.pow(nominal / base, 1 / years) - 1 : null;
+  };
 
   // Months: rolling year of complete months + MTD (LY month aligned to same day-of-month).
   const mtdYm = last.slice(0, 7);
@@ -461,6 +607,8 @@ export function QtdProgress() {
       top: monthLabel(ym),
       nominal,
       yoy: yoyOf(nominal, `${lyYm}-01`, `${lyYm}-${String(lastDayOfMonth(lyYm)).padStart(2, "0")}`),
+      qtdYoy: qtdYoyAsOf(end),
+      cagr: [cagrOf(nominal, start, end, 2), cagrOf(nominal, start, end, 3), cagrOf(nominal, start, end, 4)],
     });
   }
   {
@@ -471,6 +619,8 @@ export function QtdProgress() {
       top: `MTD ${shortDate(last)}`,
       nominal,
       yoy: yoyOf(nominal, `${lyYm}-01`, `${lyYm}-${String(Math.min(lastDom, lastDayOfMonth(lyYm))).padStart(2, "0")}`),
+      qtdYoy: qtdYoyAsOf(last),
+      cagr: [cagrOf(nominal, `${mtdYm}-01`, last, 2), cagrOf(nominal, `${mtdYm}-01`, last, 3), cagrOf(nominal, `${mtdYm}-01`, last, 4)],
       hl: true,
     });
   }
@@ -548,10 +698,73 @@ export function QtdProgress() {
     t7dCols.push({
       key: `t7d-${end}`, top: shortDate(end), nominal,
       yoy: yoyOf(nominal, addDaysKey(start, -364), addDaysKey(end, -364)),
+      qtdYoy: qtdYoyAsOf(end),
+      cagr: [cagrOf(nominal, start, end, 2), cagrOf(nominal, start, end, 3), cagrOf(nominal, start, end, 4)],
       hl: off === 0,
     });
   }
   const t7dYoyNow = t7dCols[t7dCols.length - 1]?.yoy ?? null;
+
+  // Horizontal quarter "tape" (ODP-style): quarters as COLUMNS, the live/unreported
+  // quarter on the right, folding in guidance / Street consensus / Clearline. Total-
+  // company basis — reported totals for completed quarters, scaled FQE for the live
+  // one — so it's comparable to guidance/consensus/CL regardless of the $/scaled toggle.
+  const metricVal = (metric: string, q: string): number | null => {
+    const r = (state.data?.model_metrics ?? []).find((x) => x.metric === metric && x.quarter === q);
+    return r && Number.isFinite(Number(r.value)) ? Number(r.value) : null;
+  };
+  // Live-column FQE pinned to nowQ (the quarter of the LATEST data, which can lag
+  // currentQuarter) — never fall back to the selected quarter. nowQ always has >=1
+  // data day, so this view is non-null in practice; the null branch is defensive.
+  const viewNowQ = buildQuarterView(model, nowQ);
+  const scaledFqeNow = viewNowQ ? viewNowQ.primaryFqe / captureRate : null;
+  const tapeCols: TapeQ[] = [];
+  for (const q of completedQs) {
+    const pKeys = quarterDayKeys(q);
+    if (!pKeys.length) continue;
+    const rep = model.reported.get(q) ?? null;
+    // Skip a not-yet-real quarter: unreported AND not fully elapsed (end past our
+    // last data day). Reported past quarters stay even if they predate capture;
+    // the live/partial quarter is rendered separately as the rightmost column.
+    if (rep == null && pKeys[pKeys.length - 1] > last) continue;
+    // Total-company basis regardless of the $/scaled toggle: reported total when
+    // available, else the captured sum grossed up by the capture rate (like the live
+    // column's scaledFqeNow) — NOT `* scale`, which would leave it captured-basis in
+    // the default As-captured view and understate it next to the total-company columns.
+    const gmv = rep ?? sumRange(pKeys[0], pKeys[pKeys.length - 1]) / captureRate;
+    const lyRep = model.reported.get(priorYearQuarter(q)) ?? null;
+    const e = model.estimates.get(q);
+    const { fy, fq } = lqdtFiscalQuarter(Number(q.slice(0, 4)), Number(q.slice(5)));
+    tapeCols.push({
+      q,
+      fyBand: `FY${String(fy).slice(-2)}`,
+      fqLabel: `FQ${fq}`,
+      cqLabel: `CQ${q.slice(5)} '${q.slice(2, 4)}`,
+      endDate: pKeys[pKeys.length - 1], live: false, reportedActual: rep != null,
+      gmv, gmvYoy: rep != null && lyRep ? rep / lyRep - 1 : quarterCols.find((c) => c.key === q)?.yoy ?? null,
+      qtdYoy: null,
+      guideMid: e?.guidance_low_usd && e?.guidance_high_usd ? (e.guidance_low_usd + e.guidance_high_usd) / 2 : null,
+      consensus: metricVal("gmv_consensus", q),
+      clearline: e?.clearline_estimate_usd ?? null,
+    });
+  }
+  {
+    const e = model.estimates.get(nowQ);
+    const lyRep = model.reported.get(priorYearQuarter(nowQ)) ?? null;
+    const { fy, fq } = lqdtFiscalQuarter(Number(nowQ.slice(0, 4)), Number(nowQ.slice(5)));
+    tapeCols.push({
+      q: nowQ,
+      fyBand: `FY${String(fy).slice(-2)}`,
+      fqLabel: `FQ${fq}`,
+      cqLabel: `CQ${nowQ.slice(5)} '${nowQ.slice(2, 4)}`,
+      endDate: nowQKeys[nowQKeys.length - 1], live: true, reportedActual: false,
+      gmv: scaledFqeNow, gmvYoy: lyRep && scaledFqeNow != null ? scaledFqeNow / lyRep - 1 : null,
+      qtdYoy: qtdYoyAsOf(last),
+      guideMid: e?.guidance_low_usd && e?.guidance_high_usd ? (e.guidance_low_usd + e.guidance_high_usd) / 2 : null,
+      consensus: metricVal("gmv_consensus", nowQ),
+      clearline: e?.clearline_estimate_usd ?? null,
+    });
+  }
 
   // One-click Excel-friendly export: labeled blocks (summary, key metrics, daily
   // progression, then the model sections — segments, earnings preview, transactions
@@ -1186,35 +1399,38 @@ export function QtdProgress() {
         </ComposedChart>
       </ResponsiveContainer>
 
-      {/* Key metrics tables (Yipit-style, vertical) — pinned to the latest data */}
+      {/* Key metrics — Months & T7D vertical trend tables, then the horizontal quarter
+          tape below (all pinned to the latest data, independent of the chart selector). */}
       <p className="-mb-2 text-xs font-semibold text-gray-600">
-        Key metrics <span className="font-normal text-gray-400">({scaled ? `scaled @ ${(captureRate * 100).toFixed(1)}%` : "as captured"})</span>
+        Key metrics{" "}
+        <span className="font-normal text-gray-400">
+          · QTD as of {last} ({scaled ? `scaled @ ${(captureRate * 100).toFixed(1)}%` : "as captured"})
+        </span>
       </p>
-      <div className="grid items-start gap-3 md:grid-cols-2 xl:grid-cols-3">
+      <div className="grid items-start gap-3 md:grid-cols-2">
         <div>
           <p className="mb-1 text-xs font-medium text-gray-500">Months</p>
           <MetricsTable groups={[{ name: "Months", cols: monthCols }]} scale={scale} scaled={scaled} />
-        </div>
-        <div>
-          <p className="mb-1 text-xs font-medium text-gray-500">Quarters{modelCols.length > 0 ? " & model" : ""}</p>
-          <MetricsTable
-            groups={[
-              { name: "Quarters", cols: quarterCols },
-              { name: "Model (total co.)", cols: modelCols },
-            ]}
-            scale={scale}
-            scaled={scaled}
-          />
         </div>
         <div>
           <p className="mb-1 text-xs font-medium text-gray-500">T7D (trailing 7 days, week ending)</p>
           <MetricsTable groups={[{ name: "Trailing 7 days", cols: t7dCols }]} scale={scale} scaled={scaled} />
         </div>
       </div>
-      <p className="text-xs text-gray-400 -mt-1">
-        Y/Y shows &ldquo;—&rdquo; where prior-year daily data doesn&rsquo;t exist yet (begins {model.earliest}).
-        *Scaled QTD/quarter vs LY <em>reported</em> total.
-        {!scaled && " Switch to Scaled to total to compare against guidance / the Clearline model."}
+      <div>
+        <p className="mb-1 text-xs font-medium text-gray-500">
+          Quarters{" "}
+          <span className="text-gray-400">
+            — fiscal periods across, newest at right; the live quarter (°) folds in guidance / consensus / Clearline
+          </span>
+        </p>
+        <QuarterTape cols={tapeCols} />
+      </div>
+      <p className="-mt-1 text-xs text-gray-400">
+        &ldquo;QTD Y/Y as of&rdquo; = the cumulative quarter-to-date read as it stood at each period-end (resets each fiscal
+        quarter); 2Y/3Y/4Y are annualized and appear as history reaches back that far. Tape is total-company basis —
+        blue = reported actual, purple = our live estimate (°), red = Clearline (e); &ldquo;—&rdquo; where prior-year data
+        doesn&rsquo;t exist yet (begins {model.earliest}).
       </p>
 
       {/* Model-driven sections: segments, earnings preview, transactions, supply/demand */}
