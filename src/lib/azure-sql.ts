@@ -1111,6 +1111,75 @@ export async function getFeePatterns(fromEt: string): Promise<{ bySize: FeeBucke
   return { bySize, bySellerType, byCategory };
 }
 
+// --- precomputed fee analytics -----------------------------------------------
+// The fee aggregations join 786k sold_lots to seller_fees; on the S2 tier that is a
+// ~2-minute query (the scan alone is ~9s), far past any page budget. The inputs change
+// at most once a day, so the cron computes them and stashes the result as JSON here and
+// the page reads a single row. Never compute these on a request path.
+export type FeeAnalytics = {
+  quarterlyFees: QuarterlyFee[];
+  measuredByQuarter: MeasuredQuarterTake[];
+  patterns: { bySize: FeeBucket[]; bySellerType: FeeBucket[]; byCategory: FeeBucket[] };
+  computed_at: string;
+};
+
+let analyticsTableEnsured = false;
+async function ensureAnalyticsTable(pool: sql.ConnectionPool): Promise<void> {
+  if (analyticsTableEnsured) return;
+  await pool
+    .request()
+    .batch(
+      "IF OBJECT_ID('lqdt.analytics_cache', 'U') IS NULL " +
+        "CREATE TABLE lqdt.analytics_cache (" +
+        "cache_key nvarchar(64) NOT NULL PRIMARY KEY, " +
+        "payload nvarchar(max) NOT NULL, " +
+        "computed_at datetime2(0) NOT NULL DEFAULT sysutcdatetime())",
+    );
+  analyticsTableEnsured = true;
+}
+
+const FEE_ANALYTICS_KEY = "fee_analytics_v1";
+
+/** Read the precomputed fee analytics (fast — one row). null if never computed. */
+export async function readFeeAnalytics(): Promise<FeeAnalytics | null> {
+  const pool = await getPool();
+  await ensureAnalyticsTable(pool);
+  const r = await pool
+    .request()
+    .input("k", sql.NVarChar(64), FEE_ANALYTICS_KEY)
+    .query("SELECT payload, CONVERT(char(19), computed_at, 126) AS computed_at FROM lqdt.analytics_cache WHERE cache_key = @k");
+  const row = r.recordset[0];
+  if (!row?.payload) return null;
+  try {
+    const p = JSON.parse(String(row.payload)) as FeeAnalytics;
+    return { ...p, computed_at: String(row.computed_at ?? "") };
+  } catch {
+    return null;
+  }
+}
+
+/** Recompute the heavy fee aggregations and store them. Cron-only — takes minutes. */
+export async function refreshFeeAnalytics(fromEt: string): Promise<{ ok: boolean; ms: number }> {
+  const t0 = Date.now();
+  const [quarterlyFees, measuredByQuarter, patterns] = await Promise.all([
+    getQuarterlyFeesBySite(fromEt),
+    getMeasuredTakeByQuarter(fromEt),
+    getFeePatterns(fromEt),
+  ]);
+  const pool = await getPool();
+  await ensureAnalyticsTable(pool);
+  await pool
+    .request()
+    .input("k", sql.NVarChar(64), FEE_ANALYTICS_KEY)
+    .input("p", sql.NVarChar(sql.MAX), JSON.stringify({ quarterlyFees, measuredByQuarter, patterns }))
+    .query(
+      "MERGE lqdt.analytics_cache WITH (HOLDLOCK) AS t USING (SELECT @k AS cache_key) AS s ON t.cache_key = s.cache_key " +
+        "WHEN MATCHED THEN UPDATE SET payload = @p, computed_at = sysutcdatetime() " +
+        "WHEN NOT MATCHED THEN INSERT (cache_key, payload) VALUES (@k, @p);",
+    );
+  return { ok: true, ms: Date.now() - t0 };
+}
+
 /** One marketplace's measured fees for one calendar quarter. Rates are GMV-weighted over
  *  the lots with a measured premium; `take_pct` is premium-inclusive (comparable to a
  *  reported take rate), `premium_pct`/`admin_pct` are percents of the hammer price. */

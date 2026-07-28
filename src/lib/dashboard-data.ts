@@ -11,9 +11,7 @@ import {
   getBlendedAdminFee,
   getAdminFeeBySite,
   upsertSellerFees,
-  getFeePatterns,
-  getMeasuredTakeByQuarter,
-  getQuarterlyFeesBySite,
+  readFeeAnalytics,
   type FeeBucket,
   type MeasuredQuarterTake,
   type QuarterlyFee,
@@ -220,21 +218,20 @@ export function getTakeRateComposition(): Promise<TakeRateComposition> {
     let measuredByQuarter: MeasuredQuarterTake[] = [];
     let quarterlyFees: QuarterlyFee[] = [];
     if (isAzureSqlConfigured()) {
-      // Analytics reads are best-effort AND bounded: these are wide aggregations over the
-      // sold-lot join, so each is capped by a date floor and raced against a timeout. On
-      // timeout we render without the section rather than holding the page (the .catch
-      // alone only covers rejection, not latency).
-      const analyticsFrom = new Date(Date.now() - 730 * 86_400_000).toISOString().slice(0, 10);
-      const bounded = <T,>(p: Promise<T>, fallback: T, ms = 6_000): Promise<T> =>
-        Promise.race([p.catch(() => fallback), new Promise<T>((res) => setTimeout(() => res(fallback), ms))]);
-      [patterns, measuredByQuarter, quarterlyFees] = await Promise.all([
-        bounded(getFeePatterns(analyticsFrom), null as TakeRateComposition["patterns"]),
-        bounded(getMeasuredTakeByQuarter(analyticsFrom), [] as MeasuredQuarterTake[]),
-        bounded(getQuarterlyFeesBySite(analyticsFrom), [] as QuarterlyFee[]),
+      // Fee analytics are PRECOMPUTED by the cron (the underlying join is a ~2-minute
+      // query on this tier) — the page just reads one JSON row. Best-effort + bounded:
+      // if it's missing or slow, those sections simply don't render.
+      const analytics = await Promise.race([
+        readFeeAnalytics().catch(() => null),
+        new Promise<null>((res) => setTimeout(() => res(null), 4_000)),
       ]);
-      // Flag the in-progress quarter so partial coverage is never read as a full-quarter rate.
-      const nowQ = etQuarterKey(etTodayKey());
-      quarterlyFees = quarterlyFees.map((x) => (x.quarter === nowQ ? { ...x, partial: true } : x));
+      if (analytics) {
+        patterns = analytics.patterns ?? null;
+        measuredByQuarter = analytics.measuredByQuarter ?? [];
+        // Flag the in-progress quarter so partial coverage isn't read as a full-quarter rate.
+        const nowQ = etQuarterKey(etTodayKey());
+        quarterlyFees = (analytics.quarterlyFees ?? []).map((x) => (x.quarter === nowQ ? { ...x, partial: true } : x));
+      }
       // Seller fees are per-seller and stable, so a 90-day trailing window gives a
       // robust GMV-weighted read (and better seller_fees coverage) than QTD alone.
       const to = etTodayKey();
