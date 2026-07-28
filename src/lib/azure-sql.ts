@@ -1111,6 +1111,58 @@ export async function getFeePatterns(fromEt: string): Promise<{ bySize: FeeBucke
   return { bySize, bySellerType, byCategory };
 }
 
+/** One marketplace's measured fees for one calendar quarter. Rates are GMV-weighted over
+ *  the lots with a measured premium; `take_pct` is premium-inclusive (comparable to a
+ *  reported take rate), `premium_pct`/`admin_pct` are percents of the hammer price. */
+export type QuarterlyFee = {
+  quarter: string;
+  site: string;
+  premium_pct: number | null;
+  admin_pct: number | null;
+  take_pct: number | null;
+  covered_gmv: number;
+  total_gmv: number;
+  lots: number;
+  partial?: boolean;
+};
+
+/** Per-quarter, per-marketplace buyer premium / seller fee / take rate — the headline
+ *  measured series. Bounded to lots closing on/after `fromEt`. */
+export async function getQuarterlyFeesBySite(fromEt: string): Promise<QuarterlyFee[]> {
+  const pool = await getPool();
+  await ensureSellerFeesTable(pool);
+  const r = await pool
+    .request()
+    .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+    .query(
+      "SELECT CONCAT(YEAR(l.close_date_et),'Q',DATEPART(QUARTER,l.close_date_et)) AS quarter, l.site, " +
+        "SUM(CASE WHEN f.buyer_premium_percent IS NOT NULL THEN l.sale_amount_usd ELSE 0 END) AS cov, " +
+        "SUM(l.sale_amount_usd) AS tot, " +
+        "SUM(CASE WHEN f.buyer_premium_percent IS NOT NULL THEN l.sale_amount_usd*f.buyer_premium_percent/100.0 ELSE 0 END) AS prem, " +
+        "SUM(CASE WHEN f.buyer_premium_percent IS NOT NULL THEN l.sale_amount_usd*COALESCE(f.admin_fee_percent,0)/100.0 ELSE 0 END) AS adm, " +
+        "SUM(CASE WHEN f.buyer_premium_percent IS NOT NULL THEN l.sale_amount_usd*(1+f.buyer_premium_percent/100.0) ELSE 0 END) AS incl, " +
+        "COUNT(*) AS lots " +
+        "FROM lqdt.sold_lots l LEFT JOIN lqdt.seller_fees f ON f.site=l.site AND f.account_id=l.account_id " +
+        "WHERE l.close_date_et >= @from " +
+        "GROUP BY CONCAT(YEAR(l.close_date_et),'Q',DATEPART(QUARTER,l.close_date_et)), l.site " +
+        "ORDER BY quarter, l.site",
+    );
+  return r.recordset.map((x) => {
+    const cov = Number(x.cov ?? 0), incl = Number(x.incl ?? 0);
+    const prem = Number(x.prem ?? 0), adm = Number(x.adm ?? 0);
+    return {
+      quarter: String(x.quarter ?? ""),
+      site: String(x.site ?? ""),
+      premium_pct: cov > 0 ? (prem / cov) * 100 : null,
+      admin_pct: cov > 0 ? (adm / cov) * 100 : null,
+      take_pct: incl > 0 ? ((prem + adm) / incl) * 100 : null,
+      covered_gmv: cov,
+      total_gmv: Number(x.tot ?? 0),
+      lots: Number(x.lots ?? 0),
+    };
+  });
+}
+
 /** Measured (model-free) marketplace take per calendar quarter, premium-inclusive basis,
  *  split GovDeals vs the commercial/industrial marketplace so each can be applied to the
  *  matching reported segment GMV. Bounded to lots closing on/after `fromEt`. */

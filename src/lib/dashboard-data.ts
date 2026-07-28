@@ -13,8 +13,10 @@ import {
   upsertSellerFees,
   getFeePatterns,
   getMeasuredTakeByQuarter,
+  getQuarterlyFeesBySite,
   type FeeBucket,
   type MeasuredQuarterTake,
+  type QuarterlyFee,
 } from "./azure-sql";
 import { enrichTopLots, type EnrichedLot } from "./asset-fees";
 import { loadModelMetrics } from "./reported-gmv";
@@ -175,6 +177,8 @@ export type TakeRateComposition = {
   // measured marketplace take per calendar quarter (drives the revenue back-test).
   patterns: { bySize: FeeBucket[]; bySellerType: FeeBucket[]; byCategory: FeeBucket[] } | null;
   measuredByQuarter: MeasuredQuarterTake[];
+  // Headline series: buyer premium / seller fee / take rate per quarter per marketplace.
+  quarterlyFees: QuarterlyFee[];
 };
 
 const takeRateCache = ttlCache<TakeRateComposition>(TTL);
@@ -214,6 +218,7 @@ export function getTakeRateComposition(): Promise<TakeRateComposition> {
     let measured: TakeRateComposition["measured"] = null;
     let patterns: TakeRateComposition["patterns"] = null;
     let measuredByQuarter: MeasuredQuarterTake[] = [];
+    let quarterlyFees: QuarterlyFee[] = [];
     if (isAzureSqlConfigured()) {
       // Analytics reads are best-effort AND bounded: these are wide aggregations over the
       // sold-lot join, so each is capped by a date floor and raced against a timeout. On
@@ -222,10 +227,14 @@ export function getTakeRateComposition(): Promise<TakeRateComposition> {
       const analyticsFrom = new Date(Date.now() - 730 * 86_400_000).toISOString().slice(0, 10);
       const bounded = <T,>(p: Promise<T>, fallback: T, ms = 6_000): Promise<T> =>
         Promise.race([p.catch(() => fallback), new Promise<T>((res) => setTimeout(() => res(fallback), ms))]);
-      [patterns, measuredByQuarter] = await Promise.all([
+      [patterns, measuredByQuarter, quarterlyFees] = await Promise.all([
         bounded(getFeePatterns(analyticsFrom), null as TakeRateComposition["patterns"]),
         bounded(getMeasuredTakeByQuarter(analyticsFrom), [] as MeasuredQuarterTake[]),
+        bounded(getQuarterlyFeesBySite(analyticsFrom), [] as QuarterlyFee[]),
       ]);
+      // Flag the in-progress quarter so partial coverage is never read as a full-quarter rate.
+      const nowQ = etQuarterKey(etTodayKey());
+      quarterlyFees = quarterlyFees.map((x) => (x.quarter === nowQ ? { ...x, partial: true } : x));
       // Seller fees are per-seller and stable, so a 90-day trailing window gives a
       // robust GMV-weighted read (and better seller_fees coverage) than QTD alone.
       const to = etTodayKey();
@@ -248,6 +257,6 @@ export function getTakeRateComposition(): Promise<TakeRateComposition> {
         to,
       };
     }
-    return { quarters: rows, latest, measured, patterns, measuredByQuarter };
+    return { quarters: rows, latest, measured, patterns, measuredByQuarter, quarterlyFees };
   });
 }

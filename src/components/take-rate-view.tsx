@@ -1,5 +1,6 @@
+import { Fragment } from "react";
 import type { TakeRateComposition, TakeRateQuarter, MeasuredFeeSite } from "@/lib/dashboard-data";
-import type { FeeBucket } from "@/lib/azure-sql";
+import type { FeeBucket, QuarterlyFee } from "@/lib/azure-sql";
 
 const SITE_LABEL: Record<string, string> = { AD: "AllSurplus", GD: "GovDeals", GI: "Industrial" };
 
@@ -74,8 +75,92 @@ function PatternTable({ title, rows, note }: { title: string; rows: FeeBucket[];
   );
 }
 
+/** Headline series: buyer premium / seller fee / take rate, quarters across, grouped by
+ *  marketplace. This is the top-of-page table — everything below explains or corroborates it. */
+function QuarterlyFeeTable({ rows }: { rows: QuarterlyFee[] }) {
+  if (rows.length === 0) return null;
+  const quarters = [...new Set(rows.map((r) => r.quarter))].sort();
+  const partial = new Set(rows.filter((r) => r.partial).map((r) => r.quarter));
+  const at = (site: string, q: string) => rows.find((r) => r.site === site && r.quarter === q) ?? null;
+  // "All marketplaces" is derived from the site rows so it can never disagree with them.
+  const allAt = (q: string): QuarterlyFee | null => {
+    const rs = rows.filter((r) => r.quarter === q);
+    if (rs.length === 0) return null;
+    const cov = rs.reduce((a, r) => a + r.covered_gmv, 0);
+    const tot = rs.reduce((a, r) => a + r.total_gmv, 0);
+    const prem = rs.reduce((a, r) => a + ((r.premium_pct ?? 0) / 100) * r.covered_gmv, 0);
+    const adm = rs.reduce((a, r) => a + ((r.admin_pct ?? 0) / 100) * r.covered_gmv, 0);
+    const incl = cov + prem; // premium-inclusive GMV over the covered lots
+    return {
+      quarter: q, site: "ALL",
+      premium_pct: cov > 0 ? (prem / cov) * 100 : null,
+      admin_pct: cov > 0 ? (adm / cov) * 100 : null,
+      take_pct: incl > 0 ? ((prem + adm) / incl) * 100 : null,
+      covered_gmv: cov, total_gmv: tot, lots: rs.reduce((a, r) => a + r.lots, 0),
+    };
+  };
+  const groups: { label: string; get: (q: string) => QuarterlyFee | null; strong?: boolean; note?: string }[] = [
+    { label: "GovDeals", get: (q) => at("GD", q), note: "~85% of measured GMV · highest confidence" },
+    { label: "AllSurplus", get: (q) => at("AD", q) },
+    { label: "Industrial", get: (q) => at("GI", q) },
+    { label: "All marketplaces", get: allAt, strong: true },
+  ];
+  const cell = (v: number | null | undefined) => (v == null ? <span className="text-gray-300">—</span> : v.toFixed(2) + "%");
+  return (
+    <div className="overflow-x-auto rounded-lg border">
+      <table className="w-full border-collapse text-sm">
+        <thead>
+          <tr className="border-b-2 border-gray-300 bg-gray-50/70 text-left">
+            <th className="px-3 py-1.5 font-semibold text-gray-700">Marketplace / metric</th>
+            {quarters.map((q) => (
+              <th key={q} className="px-3 py-1.5 text-right font-semibold text-gray-700 whitespace-nowrap">
+                {fq(q)}
+                {partial.has(q) && <span className="ml-0.5 font-normal text-amber-600" title="quarter in progress — partial">*</span>}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="tabular-nums">
+          {groups.map((g) => (
+            <Fragment key={g.label}>
+              <tr className="border-b bg-gray-50/40">
+                <td colSpan={quarters.length + 1} className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+                  {g.label}
+                  {g.note && <span className="ml-2 font-normal normal-case tracking-normal text-gray-400">{g.note}</span>}
+                </td>
+              </tr>
+              <tr className="border-b border-gray-100">
+                <td className="px-3 py-1 pl-6 text-gray-600">Buyer&apos;s premium</td>
+                {quarters.map((q) => <td key={q} className="px-3 py-1 text-right">{cell(g.get(q)?.premium_pct)}</td>)}
+              </tr>
+              <tr className="border-b border-gray-100">
+                <td className="px-3 py-1 pl-6 text-gray-600">Seller admin fee</td>
+                {quarters.map((q) => <td key={q} className="px-3 py-1 text-right text-gray-500">{cell(g.get(q)?.admin_pct)}</td>)}
+              </tr>
+              <tr className="border-b border-gray-100">
+                <td className={`px-3 py-1 pl-6 ${g.strong ? "font-semibold text-gray-800" : "text-gray-700"}`}>Take rate (of GMV)</td>
+                {quarters.map((q) => (
+                  <td key={q} className={`px-3 py-1 text-right ${g.strong ? "font-semibold" : "font-medium"}`}>{cell(g.get(q)?.take_pct)}</td>
+                ))}
+              </tr>
+              <tr className="border-b border-gray-100">
+                <td className="px-3 py-1 pl-6 text-xs text-gray-400">Measured GMV coverage</td>
+                {quarters.map((q) => {
+                  const r = g.get(q);
+                  const cov = r && r.total_gmv > 0 ? (r.covered_gmv / r.total_gmv) * 100 : null;
+                  return <td key={q} className="px-3 py-1 text-right text-xs text-gray-400">{cov == null ? "—" : cov.toFixed(0) + "%"}</td>;
+                })}
+              </tr>
+            </Fragment>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export function TakeRateView({ data }: { data: TakeRateComposition }) {
-  const { latest, quarters, measured, patterns, measuredByQuarter } = data;
+  const { latest, quarters, measured, patterns, measuredByQuarter, quarterlyFees } = data;
   if (!latest) {
     return <p className="text-sm text-gray-500">Model metrics unavailable — the reported take-rate workbook isn&apos;t loaded.</p>;
   }
@@ -167,6 +252,28 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
 
   return (
     <div className="space-y-10 text-sm">
+      {/* Headline: measured buyer premium / seller fee / take rate by quarter. Everything
+          below this explains, corroborates or decomposes these numbers. */}
+      {quarterlyFees.length > 0 && (
+        <section>
+          <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+            <h3 className="text-sm font-semibold">Buyer premium, seller fee &amp; take rate — by quarter</h3>
+            <span className="text-xs text-gray-500">measured per lot from the marketplace · GMV-weighted</span>
+          </div>
+          <QuarterlyFeeTable rows={quarterlyFees} />
+          <p className="mt-2 max-w-4xl text-xs text-gray-400">
+            Read directly from each lot&apos;s marketplace bid box and GMV-weighted across every sold lot we capture — no model
+            inputs. <strong>Buyer&apos;s premium</strong> and <strong>seller admin fee</strong> are percents of the hammer price;{" "}
+            <strong>take rate</strong> is (premium + fee) ÷ premium-inclusive GMV, the basis LSI reports on, so it is directly
+            comparable to a filed take rate. The two fees are substitutes — most sellers charge one or the other.{" "}
+            <strong>Confidence:</strong> GovDeals is ~85% of measured GMV at 97–98% fee coverage and reproduces the filed GovDeals
+            take rate to within 0.11pp, so treat it as the reliable series; Industrial covers ~70% of the lots we capture and we
+            capture only ~40% of that segment&apos;s GMV, so its rate is indicative. Quarters marked{" "}
+            <span className="text-amber-600">*</span> are still in progress.
+          </p>
+        </section>
+      )}
+
       {/* Recommended take rates — headline summary */}
       <section className="rounded-lg border border-gray-300 bg-gray-50/70 p-4">
         <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
