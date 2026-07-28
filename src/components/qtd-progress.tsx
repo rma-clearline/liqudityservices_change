@@ -226,11 +226,19 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
 ];
 
 function DefinitionsBox() {
+  const [open, setOpen] = useState(false);
   return (
     <div className="rounded-lg border">
-      <p className="border-b bg-gray-50 px-3 py-2 text-xs font-semibold text-gray-700">
-        Definitions &amp; methodology — how each number is derived
-      </p>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className={`flex w-full items-center justify-between gap-2 bg-gray-50 px-3 py-2 text-left text-xs font-semibold text-gray-700 hover:bg-gray-100 ${open ? "border-b" : ""}`}
+      >
+        <span>Definitions &amp; methodology — how each number is derived</span>
+        <span className="font-normal text-gray-400">{open ? "▾ Hide" : "▸ Show"}</span>
+      </button>
+      {open && (
       <table className="w-full border-collapse text-xs">
         <tbody>
           {DEFINITIONS.map((g) => (
@@ -250,6 +258,7 @@ function DefinitionsBox() {
           ))}
         </tbody>
       </table>
+      )}
     </div>
   );
 }
@@ -1400,38 +1409,41 @@ export function QtdProgress() {
       </ResponsiveContainer>
 
       {/* Key metrics — Months & T7D vertical trend tables, then the horizontal quarter
-          tape below (all pinned to the latest data, independent of the chart selector). */}
-      <p className="-mb-2 text-xs font-semibold text-gray-600">
-        Key metrics{" "}
-        <span className="font-normal text-gray-400">
-          · QTD as of {last} ({scaled ? `scaled @ ${(captureRate * 100).toFixed(1)}%` : "as captured"})
-        </span>
-      </p>
-      <div className="grid items-start gap-3 md:grid-cols-2">
-        <div>
-          <p className="mb-1 text-xs font-medium text-gray-500">Months</p>
-          <MetricsTable groups={[{ name: "Months", cols: monthCols }]} scale={scale} scaled={scaled} />
-        </div>
-        <div>
-          <p className="mb-1 text-xs font-medium text-gray-500">T7D (trailing 7 days, week ending)</p>
-          <MetricsTable groups={[{ name: "Trailing 7 days", cols: t7dCols }]} scale={scale} scaled={scaled} />
-        </div>
-      </div>
-      <div>
-        <p className="mb-1 text-xs font-medium text-gray-500">
-          Quarters{" "}
-          <span className="text-gray-400">
-            — fiscal periods across, newest at right; the live quarter (°) folds in guidance / consensus / Clearline
+          tape below (all pinned to the latest data, independent of the chart selector).
+          Grouped in its own space-y so the header can't overlap the tables below it. */}
+      <div className="space-y-3">
+        <p className="text-xs font-semibold text-gray-600">
+          Key metrics{" "}
+          <span className="font-normal text-gray-400">
+            · QTD as of {last} ({scaled ? `scaled @ ${(captureRate * 100).toFixed(1)}%` : "as captured"})
           </span>
         </p>
-        <QuarterTape cols={tapeCols} />
+        <div className="grid items-start gap-3 md:grid-cols-2">
+          <div>
+            <p className="mb-1 text-xs font-medium text-gray-500">Months</p>
+            <MetricsTable groups={[{ name: "Months", cols: monthCols }]} scale={scale} scaled={scaled} />
+          </div>
+          <div>
+            <p className="mb-1 text-xs font-medium text-gray-500">T7D (trailing 7 days, week ending)</p>
+            <MetricsTable groups={[{ name: "Trailing 7 days", cols: t7dCols }]} scale={scale} scaled={scaled} />
+          </div>
+        </div>
+        <div>
+          <p className="mb-1 text-xs font-medium text-gray-500">
+            Quarters{" "}
+            <span className="text-gray-400">
+              — fiscal periods across, newest at right; the live quarter (°) folds in guidance / consensus / Clearline
+            </span>
+          </p>
+          <QuarterTape cols={tapeCols} />
+        </div>
+        <p className="text-xs text-gray-400">
+          &ldquo;QTD Y/Y as of&rdquo; = the cumulative quarter-to-date read as it stood at each period-end (resets each fiscal
+          quarter); 2Y/3Y/4Y are annualized and appear as history reaches back that far. Tape is total-company basis —
+          blue = reported actual, purple = our live estimate (°), red = Clearline (e); &ldquo;—&rdquo; where prior-year data
+          doesn&rsquo;t exist yet (begins {model.earliest}).
+        </p>
       </div>
-      <p className="-mt-1 text-xs text-gray-400">
-        &ldquo;QTD Y/Y as of&rdquo; = the cumulative quarter-to-date read as it stood at each period-end (resets each fiscal
-        quarter); 2Y/3Y/4Y are annualized and appear as history reaches back that far. Tape is total-company basis —
-        blue = reported actual, purple = our live estimate (°), red = Clearline (e); &ldquo;—&rdquo; where prior-year data
-        doesn&rsquo;t exist yet (begins {model.earliest}).
-      </p>
 
       {/* Model-driven sections: segments, earnings preview, transactions, supply/demand */}
       <QtdModelSections
