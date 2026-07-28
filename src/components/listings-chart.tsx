@@ -185,10 +185,6 @@ export function ListingsChart({ data, allData }: { data: ListingRow[]; allData: 
     <ResponsiveContainer width="100%" height={600}>
       <LineChart data={chartData} margin={{ top: 5, right: hasYoY ? 60 : 20, bottom: 5, left: 20 }}>
         <CartesianGrid strokeDasharray="3 3" vertical={false} />
-        {/* Quarter-end gridlines — light grey dotted verticals at each quarter cutoff. */}
-        {quarterEndTicks.map((t) => (
-          <ReferenceLine key={t} x={t} stroke="#cbd5e1" strokeDasharray="2 4" strokeWidth={1} />
-        ))}
         {/* Primary axis: dates at quarter ends (+ range endpoints). */}
         <XAxis dataKey="label" ticks={primaryTicks} interval={0} tickFormatter={fmtTickDate} tick={{ fontSize: 11 }} height={22} />
         {/* Second axis row: quarter labels centered in each quarter. */}
@@ -215,6 +211,12 @@ export function ListingsChart({ data, allData }: { data: ListingRow[]; allData: 
             tick={{ fontSize: 12 }}
           />
         )}
+        {/* Quarter-boundary gridlines — light-grey dotted verticals at each quarter
+            cutoff. Bound to yAxisId="left" and placed AFTER the axes: the chart has no
+            default id-0 y-axis, so an unbound ReferenceLine silently fails to render. */}
+        {quarterEndTicks.map((t) => (
+          <ReferenceLine key={t} x={t} yAxisId="left" stroke="#cbd5e1" strokeDasharray="4 3" strokeWidth={1} />
+        ))}
         <Tooltip
           formatter={(v, name) =>
             typeof v === "number"
