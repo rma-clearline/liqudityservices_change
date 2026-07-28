@@ -4,25 +4,23 @@ import { randomUUID } from "node:crypto";
 import { MAESTRO_URL, MAESTRO_KEY } from "./maestro";
 import type { TopSoldLot } from "./azure-sql";
 
-// Per-asset detail enrichment from Maestro (the same endpoints the AllSurplus web
-// app calls on an asset page — NOT exposed by the bulk search/sold feeds):
-//   POST /assets/{assetId}/{accountId}/assetadditionalfees -> { adminFeePercent, ... }
-//   GET  /assets/{assetId}/{accountId}/bidwatchcount        -> integer watch count
-// adminFeePercent is LQDT's admin (seller) fee % — a per-seller contracted rate,
-// empirically constant per accountId and independent of the auction date/id — so we
-// cache it per seller. Watch count is per-asset. These are one HTTP call each, so
-// callers enrich only a bounded set (top lots), best-effort.
+// Per-asset detail enrichment from Maestro (the same call the AllSurplus/GovDeals web
+// apps make for an asset's bid box — NOT exposed by the bulk search/sold feeds):
+//   GET /bids/bidbox/{businessId}/{assetId}/{accountId}/{auctionId}
+//     -> { premiumPercent, adminFeePercent, watcherCount, visitors, percentCharged, ... }
+// premiumPercent is the BUYER's premium (buyer-paid, on top of the hammer) — event/seller
+// set, so it varies by listing; adminFeePercent is LQDT's seller-side admin fee. Together
+// they are the take-rate components; watcherCount/visitors are demand signals. It's a
+// single anonymous call per lot, so callers enrich only a bounded set (top lots), best-effort.
 
 const OK_TTL = Number(process.env.ASSET_FEE_TTL_MS) || 24 * 60 * 60_000; // cache successful values a day
 const NEG_TTL = 10 * 60_000; // cache failures only briefly, so a transient Maestro error doesn't hide a lot's data all day
 
-type Cell = { v: number | null; at: number };
-const feeCache = new Map<string, Cell>(); // key: site:accountId
-const watchCache = new Map<string, Cell>(); // key: assetId:accountId
-const feeInflight = new Map<string, Promise<number | null>>();
-const watchInflight = new Map<string, Promise<number | null>>();
+type Cell<T> = { v: T | null; at: number };
+const bidboxCache = new Map<string, Cell<Bidbox>>(); // key: biz:assetId:accountId:auctionId
+const bidboxInflight = new Map<string, Promise<Bidbox | null>>();
 
-function fresh(cell: Cell | undefined): boolean {
+function fresh<T>(cell: Cell<T> | undefined): boolean {
   if (!cell) return false;
   return Date.now() - cell.at < (cell.v == null ? NEG_TTL : OK_TTL);
 }
@@ -49,108 +47,91 @@ async function detailFetch(path: string, init: RequestInit, timeoutMs: number): 
   }
 }
 
-/** LQDT admin (seller) fee % for a lot's seller. Cached per (site, accountId). null on failure. */
-export async function fetchAdminFeePercent(
-  site: string,
+const num = (x: unknown): number | null => (typeof x === "number" && Number.isFinite(x) ? x : null);
+
+/** Bid-box detail for one lot: buyer's premium + seller admin fee + demand signals. */
+export type Bidbox = {
+  premiumPercent: number | null; // buyer's premium % (buyer pays, on the hammer)
+  adminFeePercent: number | null; // LQDT seller-side admin fee %
+  watchCount: number | null;
+  visitors: number | null;
+};
+
+/**
+ * Bid-box detail for a lot: GET /bids/bidbox/{biz}/{assetId}/{accountId}/{auctionId}.
+ * `biz` is the marketplace (site: AD/GD/GI). Cached per lot (premium varies by listing,
+ * so this is NOT a per-seller cache); null on failure. `force` skips the read cache — the
+ * cron's tight budget shouldn't inherit a transient null a dashboard call may have cached.
+ */
+export async function fetchBidbox(
+  biz: string,
   assetId: string,
   accountId: string,
   auctionId: string,
-  endDateEt: string,
   timeoutMs = 8_000,
   force = false,
-): Promise<number | null> {
-  if (!assetId || !accountId) return null;
-  const key = `${site}:${accountId}`;
-  // force skips the read cache (used by the cron, whose 8s budget shouldn't inherit a
-  // transient null a short dashboard call may have cached); it still writes its result.
+): Promise<Bidbox | null> {
+  if (!biz || !assetId || !accountId) return null;
+  const auc = auctionId || "1";
+  const key = `${biz}:${assetId}:${accountId}:${auc}`;
   if (!force) {
-    const hit = feeCache.get(key);
+    const hit = bidboxCache.get(key);
     if (fresh(hit)) return hit!.v;
   }
-  const running = feeInflight.get(key);
+  const running = bidboxInflight.get(key);
   if (running) return running;
   const p = (async () => {
-    const res = await detailFetch(
-      `/assets/${assetId}/${accountId}/assetadditionalfees`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          assetAuctionEndDate: endDateEt ? `${endDateEt}T00:00:00` : null,
-          auctionId: auctionId || null,
-          includeShipping: false,
-          excludeAdminFees: false,
-        }),
-      },
-      timeoutMs,
-    );
-    let pct: number | null = null;
+    const res = await detailFetch(`/bids/bidbox/${biz}/${assetId}/${accountId}/${auc}`, { method: "GET" }, timeoutMs);
+    let out: Bidbox | null = null;
     if (res?.ok) {
       try {
-        const d = (await res.json()) as { adminFeePercent?: unknown };
-        if (typeof d?.adminFeePercent === "number" && Number.isFinite(d.adminFeePercent)) pct = d.adminFeePercent;
+        const d = (await res.json()) as Record<string, unknown>;
+        out = {
+          premiumPercent: num(d.premiumPercent),
+          adminFeePercent: num(d.adminFeePercent),
+          watchCount: num(d.watcherCount),
+          visitors: num(d.visitors),
+        };
       } catch {
-        /* leave null */
+        out = null; // leave null → NEG_TTL retry
       }
     }
-    feeCache.set(key, { v: pct, at: Date.now() });
-    return pct;
+    bidboxCache.set(key, { v: out, at: Date.now() });
+    return out;
   })();
-  feeInflight.set(key, p);
+  bidboxInflight.set(key, p);
   try {
     return await p;
   } finally {
-    feeInflight.delete(key);
+    bidboxInflight.delete(key);
   }
 }
 
-/** Final watch count for an asset. Cached per asset. null on failure or empty body. */
-export async function fetchWatchCount(assetId: string, accountId: string, timeoutMs = 8_000): Promise<number | null> {
-  if (!assetId || !accountId) return null;
-  const key = `${assetId}:${accountId}`;
-  const hit = watchCache.get(key);
-  if (fresh(hit)) return hit!.v;
-  const running = watchInflight.get(key);
-  if (running) return running;
-  const p = (async () => {
-    const res = await detailFetch(`/assets/${assetId}/${accountId}/bidwatchcount`, { method: "GET" }, timeoutMs);
-    let n: number | null = null;
-    if (res?.ok) {
-      try {
-        const t = (await res.text()).trim();
-        if (t) {
-          const v = Number(t);
-          if (Number.isFinite(v)) n = v; // empty/whitespace body stays null (not a spurious 0)
-        }
-      } catch {
-        /* leave null */
-      }
-    }
-    watchCache.set(key, { v: n, at: Date.now() });
-    return n;
-  })();
-  watchInflight.set(key, p);
-  try {
-    return await p;
-  } finally {
-    watchInflight.delete(key);
-  }
-}
-
-export type EnrichedLot = TopSoldLot & { admin_fee_percent: number | null; watch_count: number | null };
+export type EnrichedLot = TopSoldLot & {
+  admin_fee_percent: number | null;
+  buyer_premium_percent: number | null;
+  watch_count: number | null;
+  visitors: number | null;
+};
 
 /**
- * Attach admin-fee take rate + watch count to each lot, best-effort. Bounded
- * concurrency + an overall deadline; each fetch's timeout is clamped to the
- * remaining budget so the whole call returns within ~deadlineMs even when Maestro
- * hangs. Unresolved lots keep null ("—"). Callers should render this behind a
- * Suspense boundary so it never blocks the rest of the page.
+ * Attach bid-box detail (buyer premium + seller fee + watches + visitors) to each lot,
+ * best-effort. Bounded concurrency + an overall deadline; each fetch's timeout is clamped
+ * to the remaining budget so the whole call returns within ~deadlineMs even when Maestro
+ * hangs. Unresolved lots keep null ("—"). Callers should render this behind a Suspense
+ * boundary so it never blocks the rest of the page.
  */
 export async function enrichTopLots(
   lots: TopSoldLot[],
   { concurrency = 8, deadlineMs = 10_000 }: { concurrency?: number; deadlineMs?: number } = {},
 ): Promise<EnrichedLot[]> {
-  const out: EnrichedLot[] = lots.map((l) => ({ ...l, admin_fee_percent: null, watch_count: null }));
+  const out: EnrichedLot[] = lots.map((l) => ({
+    ...l,
+    admin_fee_percent: null,
+    buyer_premium_percent: null,
+    watch_count: null,
+    visitors: null,
+  }));
   const deadline = Date.now() + deadlineMs;
   let next = 0;
   async function worker() {
@@ -160,12 +141,13 @@ export async function enrichTopLots(
       const i = next++;
       const l = lots[i];
       const to = Math.min(6_000, remaining);
-      const [pct, watch] = await Promise.all([
-        fetchAdminFeePercent(l.site, l.asset_id, l.account_id, l.auction_id, l.close_date_et, to),
-        fetchWatchCount(l.asset_id, l.account_id, to),
-      ]);
-      out[i].admin_fee_percent = pct;
-      out[i].watch_count = watch;
+      const b = await fetchBidbox(l.site, l.asset_id, l.account_id, l.auction_id, to);
+      if (b) {
+        out[i].admin_fee_percent = b.adminFeePercent;
+        out[i].buyer_premium_percent = b.premiumPercent;
+        out[i].watch_count = b.watchCount;
+        out[i].visitors = b.visitors;
+      }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, lots.length) }, worker));

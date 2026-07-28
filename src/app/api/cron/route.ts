@@ -12,7 +12,7 @@ import {
   upsertSellerFees,
   type SellerFeeRow,
 } from "@/lib/azure-sql";
-import { fetchAdminFeePercent } from "@/lib/asset-fees";
+import { fetchBidbox } from "@/lib/asset-fees";
 import { etQuarterKey } from "@/lib/time";
 import { quarterDayKeys } from "@/lib/qtd-shared";
 import { sendReportEmail, type ReportEmailResult } from "@/lib/report-email";
@@ -257,8 +257,16 @@ export async function GET(request: Request) {
                   const s = batch[i++];
                   const to = Math.min(8000, deadline - Date.now());
                   if (to <= 250) break;
-                  const pct = await fetchAdminFeePercent(s.site, s.asset_id, s.account_id, s.auction_id, s.close_date_et, to, true);
-                  if (pct != null) rows.push({ site: s.site, account_id: s.account_id, admin_fee_percent: pct });
+                  const b = await fetchBidbox(s.site, s.asset_id, s.account_id, s.auction_id, to, true);
+                  // Persist when EITHER fee is known (a lot may expose the premium or the
+                  // admin fee, not both); still bumps fetched_at so the seller is fresh.
+                  if (b && (b.adminFeePercent != null || b.premiumPercent != null))
+                    rows.push({
+                      site: s.site,
+                      account_id: s.account_id,
+                      admin_fee_percent: b.adminFeePercent,
+                      buyer_premium_percent: b.premiumPercent,
+                    });
                 }
               };
               await Promise.all(Array.from({ length: 8 }, worker));

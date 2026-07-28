@@ -66,8 +66,10 @@ export function TopSoldItems({
         category: r.category,
         state: r.state,
         sale_amount_usd: r.sale_amount_usd,
+        buyer_premium_pct: r.buyer_premium_percent,
         admin_fee_pct: r.admin_fee_percent,
         watches: r.watch_count,
+        visitors: r.visitors,
         url: r.url ?? "",
       })),
     [view],
@@ -85,21 +87,28 @@ export function TopSoldItems({
   ];
 
   const coverage = blended && blended.total_gmv > 0 ? blended.covered_gmv / blended.total_gmv : 0;
+  const premCoverage = blended && blended.total_gmv > 0 ? blended.premium_covered_gmv / blended.total_gmv : 0;
+  // Assemble only the fees that are actually covered, so a missing one doesn't render a
+  // stray "— +" (premium and admin-fee coverage populate independently as the cron runs).
+  const blendedParts: string[] = [];
+  if (blended?.premium_pct != null) blendedParts.push(`${blended.premium_pct.toFixed(2)}% buyer premium`);
+  if (blended?.blended_pct != null) blendedParts.push(`${blended.blended_pct.toFixed(2)}% seller admin fee`);
+  const covPct = Math.max(coverage, premCoverage);
 
   return (
     <div className="space-y-3">
-      {blended && blended.blended_pct != null && coverage > 0 ? (
+      {blended && blendedParts.length > 0 && covPct > 0 ? (
         <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm">
-          <span className="font-semibold">QTD blended seller admin fee: {blended.blended_pct.toFixed(2)}%</span>
+          <span className="font-semibold">QTD blended take: {blendedParts.join(" + ")}</span>
           <span className="text-gray-500">
             {" "}
-            · GMV-weighted across sold lots with a known fee ({(coverage * 100).toFixed(0)}% of QTD GMV covered). Seller-side
-            only — excludes buyer&apos;s premium, so it understates full take rate.
+            · GMV-weighted across sold lots with known fees ({(covPct * 100).toFixed(0)}% of QTD GMV covered).{" "}
+            {blendedParts.length > 1 ? "Both read" : "Read"} live per lot from the marketplace bid box.
           </span>
         </div>
       ) : (
         <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-500">
-          Blended seller admin fee: building coverage — per-seller fees populate as the daily job runs.
+          Blended take: building coverage — per-seller fees populate as the daily job runs.
         </div>
       )}
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -133,8 +142,10 @@ export function TopSoldItems({
             { key: "category", label: "Category" },
             { key: "state", label: "State" },
             { key: "sale_amount_usd", label: "Sale USD" },
+            { key: "buyer_premium_pct", label: "Buyer Premium %" },
             { key: "admin_fee_pct", label: "Admin Fee %" },
             { key: "watches", label: "Watches" },
+            { key: "visitors", label: "Visitors" },
             { key: "url", label: "URL" },
           ]}
         />
@@ -149,8 +160,10 @@ export function TopSoldItems({
               <th className="py-1.5 pr-4 text-left">Seller</th>
               <th className="py-1.5 pr-4 text-left">Closed</th>
               <th className="py-1.5 pr-4 text-right">Sale (USD)</th>
+              <th className="py-1.5 pr-4 text-right">Buyer Prem %</th>
               <th className="py-1.5 pr-4 text-right">Admin Fee %</th>
-              <th className="py-1.5 text-right">Watches</th>
+              <th className="py-1.5 pr-4 text-right">Watches</th>
+              <th className="py-1.5 text-right">Visitors</th>
             </tr>
           </thead>
           <tbody>
@@ -174,10 +187,20 @@ export function TopSoldItems({
                   <td className="py-1 pr-4 text-gray-500 whitespace-nowrap tabular-nums">{r.close_date_et}</td>
                   <td className="py-1 pr-4 text-right tabular-nums">{fmtDollar(r.sale_amount_usd)}</td>
                   <td className="py-1 pr-4 text-right tabular-nums">
+                    {r.buyer_premium_percent == null ? (
+                      <span className="text-gray-300">—</span>
+                    ) : (
+                      `${r.buyer_premium_percent.toFixed(2)}%`
+                    )}
+                  </td>
+                  <td className="py-1 pr-4 text-right tabular-nums">
                     {r.admin_fee_percent == null ? <span className="text-gray-300">—</span> : `${r.admin_fee_percent.toFixed(2)}%`}
                   </td>
-                  <td className="py-1 text-right tabular-nums">
+                  <td className="py-1 pr-4 text-right tabular-nums">
                     {r.watch_count == null ? <span className="text-gray-300">—</span> : r.watch_count}
+                  </td>
+                  <td className="py-1 text-right tabular-nums">
+                    {r.visitors == null ? <span className="text-gray-300">—</span> : r.visitors}
                   </td>
                 </tr>
               );
@@ -187,11 +210,11 @@ export function TopSoldItems({
       </div>
 
       <p className="text-xs text-gray-400">
-        Quarter-to-date sold lots ≥ {fmtDollar(minUsd)}{total > rows.length ? ` (top ${rows.length} of ${total})` : ""}. Admin Fee % = LQDT&apos;s
-        seller-side admin fee on the lot — the only take-rate component the API exposes. It excludes buyer&apos;s premium (not
-        exposed), so it understates full marketplace take rate on every marketplace; GovDeals government lots in particular show
-        0% because they monetize via a buyer&apos;s premium instead. Watches = final watcher count. Both are fetched live per lot
-        and may show “—” if unavailable.
+        Quarter-to-date sold lots ≥ {fmtDollar(minUsd)}{total > rows.length ? ` (top ${rows.length} of ${total})` : ""}. Buyer Prem % = the
+        buyer&apos;s premium (buyer pays on top of the hammer) and Admin Fee % = LQDT&apos;s seller-side fee — together the take-rate
+        components, both read live per lot from the marketplace bid box. The two are often substitutes: GovDeals government lots
+        typically show a buyer&apos;s premium with a 0% admin fee, while some sellers instead charge an admin fee with 0% premium.
+        Watches/Visitors = final demand counts. All show “—” if unavailable.
       </p>
     </div>
   );

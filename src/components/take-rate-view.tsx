@@ -32,6 +32,7 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
   }
   const bySite = new Map((measured?.bySite ?? []).map((s) => [s.site, s]));
   const feePct = (site: string): number | null => bySite.get(site)?.blended_pct ?? null;
+  const premPct = (site: string): number | null => bySite.get(site)?.premium_pct ?? null;
 
   // Marketplace composition: reported commission take rate paired with the measured
   // seller admin fee. Only the clean commission segments (GovDeals, CAG) — RSCG is a
@@ -41,11 +42,12 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
     { label: "Industrial (CAG)", site: "GI", take: latest.cagTake },
   ];
 
-  // Independent cross-check: fee-implied band = measured seller fee + published buyer premium.
-  const bandRows: { label: string; reported: number; fee: number | null; bp: [number, number]; note?: string }[] = [
-    { label: "GovDeals", reported: latest.govdealsTake, fee: feePct("GD"), bp: BP_RANGE.GD },
-    { label: "Industrial (CAG)", reported: latest.cagTake, fee: feePct("GI"), bp: BP_RANGE.GI, note: "+ Machinio services" },
-    { label: "Blended marketplace", reported: latest.consignmentTake, fee: measured?.overall_pct ?? null, bp: BP_RANGE.BLENDED },
+  // Independent cross-check: fee-implied band = measured seller fee + published buyer
+  // premium. The measured buyer premium is shown alongside for a direct comparison.
+  const bandRows: { label: string; reported: number; fee: number | null; prem: number | null; bp: [number, number]; note?: string }[] = [
+    { label: "GovDeals", reported: latest.govdealsTake, fee: feePct("GD"), prem: premPct("GD"), bp: BP_RANGE.GD },
+    { label: "Industrial (CAG)", reported: latest.cagTake, fee: feePct("GI"), prem: premPct("GI"), bp: BP_RANGE.GI, note: "+ Machinio services" },
+    { label: "Blended marketplace", reported: latest.consignmentTake, fee: measured?.overall_pct ?? null, prem: measured?.premium_overall_pct ?? null, bp: BP_RANGE.BLENDED },
   ];
 
   // Recommended take rate per category: trailing-4-quarter GMV-weighted (smooths the
@@ -110,21 +112,22 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
         </div>
         <p className="mt-2 text-xs text-gray-400">
           Reported rates are LSI&apos;s filed actuals — verified to the decimal against SEC filings and consistent with published
-          fee mechanics. Within each marketplace rate the seller admin fee is <em>measured</em>{" "}
-          ({pp(measured?.overall_pct ?? null)} blended) and the buyer&apos;s premium is <em>inferred</em>. Use the marketplace
-          commissions (~10–17%) as the auction take rate; the total (~{pf(latest.blendedTake)}) mixes in the purchase/ownership
-          line and isn&apos;t a fee.
+          fee mechanics. Within each marketplace rate both fees are now <em>measured</em> live per lot from the marketplace bid
+          box — the buyer&apos;s premium ({pp(measured?.premium_overall_pct ?? null)} blended) and the seller admin fee
+          ({pp(measured?.overall_pct ?? null)} blended). Use the marketplace commissions (~10–17%) as the auction take rate; the
+          total (~{pf(latest.blendedTake)}) mixes in the purchase/ownership line and isn&apos;t a fee.
         </p>
       </section>
 
       {/* Thesis */}
       <p className="max-w-3xl text-gray-600">
-        LSI&apos;s take is overwhelmingly a <strong>buyer-premium and services</strong> story, not a seller-commission one. The
-        seller admin fee — the one component we can measure directly from the marketplace API — is only about{" "}
-        <strong>{pp(measured?.overall_pct ?? null)}</strong> of GMV, a small slice of the ~{pf(latest.consignmentTake)} blended
+        LSI&apos;s take is overwhelmingly a <strong>buyer-premium and services</strong> story, not a seller-commission one. We now
+        measure both auction fees directly from the marketplace bid box: the <strong>buyer&apos;s premium</strong> is the bulk at
+        ~<strong>{pp(measured?.premium_overall_pct ?? null)}</strong> of covered GMV, while the seller admin fee is only about{" "}
+        <strong>{pp(measured?.overall_pct ?? null)}</strong> — together roughly the ~{pf(latest.consignmentTake)} blended
         marketplace commission. (The reported ~{pf(latest.blendedTake)} total take is revenue ÷ all GMV, inflated by the
-        purchase/ownership line — see the build-up below.) Everything below shows how reported revenue is built and where that
-        seller fee sits within it.
+        purchase/ownership line — see the build-up below.) Everything below shows how reported revenue is built and where those
+        fees sit within it.
       </p>
 
       {/* 1. Revenue build-up for the latest reported quarter */}
@@ -196,16 +199,16 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
         </div>
       </section>
 
-      {/* 2. Take rate composition: seller fee vs implied buyer premium */}
+      {/* 2. Take rate composition: measured buyer premium + measured seller fee + residual */}
       <section>
-        <h3 className="mb-1 text-sm font-semibold">Take rate composition — seller fee vs. buyer premium</h3>
+        <h3 className="mb-1 text-sm font-semibold">Take rate composition — buyer premium + seller fee (both measured)</h3>
         <p className="mb-3 text-xs text-gray-500">
-          Each marketplace&apos;s reported commission take rate, split into the <strong>measured</strong> seller admin fee (from the
-          marketplace API) and the <strong>implied</strong> remainder (buyer&apos;s premium + fees + services), which the anonymous
-          API doesn&apos;t expose.
+          Each marketplace&apos;s reported commission take rate, split into the two fees we read <strong>live per lot from the
+          marketplace bid box</strong> — the <strong>buyer&apos;s premium</strong> and the <strong>seller admin fee</strong> —
+          leaving a small services / residual (e.g. Machinio on Industrial; measurement/coverage noise elsewhere).
           {measured
-            ? ` Measured fee is GMV-weighted over the trailing 90 days (${measured.from} → ${measured.to}).`
-            : " Measured seller fee unavailable (store not configured)."}
+            ? ` Measured fees are GMV-weighted over the trailing 90 days (${measured.from} → ${measured.to}).`
+            : " Measured fees unavailable (store not configured)."}
         </p>
         <div className="overflow-x-auto">
           <table className="w-full border-collapse">
@@ -213,45 +216,52 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
               <tr className="border-b-2 border-gray-300 text-left">
                 <th className="py-1.5 pr-4">Marketplace</th>
                 <th className="py-1.5 pr-4 text-right">Reported take rate</th>
+                <th className="py-1.5 pr-4 text-right">Measured buyer premium</th>
                 <th className="py-1.5 pr-4 text-right">Measured seller admin fee</th>
-                <th className="py-1.5 text-right">Implied buyer premium + services</th>
+                <th className="py-1.5 text-right">Services / residual</th>
               </tr>
             </thead>
             <tbody className="tabular-nums">
               {compRows.map((r) => {
                 const fee = feePct(r.site);
-                // Only show an implied buyer-premium when BOTH the take and the seller
-                // fee are known — an unmeasured fee must not be silently treated as 0%.
-                const implied = r.take > 0 && fee != null ? r.take * 100 - fee : null;
+                const prem = premPct(r.site);
+                // Residual only when the take AND both measured fees are known — an
+                // unmeasured fee must not be silently treated as 0%.
+                const residual = r.take > 0 && fee != null && prem != null ? r.take * 100 - fee - prem : null;
                 return (
                   <tr key={r.site} className="border-b border-gray-100">
                     <td className="py-1 pr-4">{r.label}</td>
                     <td className="py-1 pr-4 text-right">{r.take ? pf(r.take) : "—"}</td>
+                    <td className="py-1 pr-4 text-right">{pp(prem)}</td>
                     <td className="py-1 pr-4 text-right">{pp(fee)}</td>
-                    <td className="py-1 text-right">{implied == null ? "—" : implied.toFixed(2) + "%"}</td>
+                    <td className="py-1 text-right">{residual == null ? "—" : residual < 0 ? "n.m." : residual.toFixed(2) + "%"}</td>
                   </tr>
                 );
               })}
               <tr className="border-b border-gray-300 font-semibold">
                 <td className="py-1.5 pr-4">Blended (all consignment)</td>
                 <td className="py-1.5 pr-4 text-right">{latest.consignmentTake > 0 ? pf(latest.consignmentTake) : "—"}</td>
+                <td className="py-1.5 pr-4 text-right">{pp(measured?.premium_overall_pct ?? null)}</td>
                 <td className="py-1.5 pr-4 text-right">{pp(measured?.overall_pct ?? null)}</td>
                 <td className="py-1.5 text-right">
-                  {latest.consignmentTake > 0 && measured?.overall_pct != null
-                    ? (latest.consignmentTake * 100 - measured.overall_pct).toFixed(2) + "%"
-                    : "—"}
+                  {(() => {
+                    const v =
+                      latest.consignmentTake > 0 && measured?.overall_pct != null && measured?.premium_overall_pct != null
+                        ? latest.consignmentTake * 100 - measured.overall_pct - measured.premium_overall_pct
+                        : null;
+                    return v == null ? "—" : v < 0 ? "n.m." : v.toFixed(2) + "%";
+                  })()}
                 </td>
               </tr>
             </tbody>
           </table>
         </div>
         <p className="mt-2 text-xs text-gray-400">
-          The seller admin fee accounts for roughly{" "}
-          {measured?.overall_pct != null && latest.consignmentTake > 0
-            ? ((measured.overall_pct / (latest.consignmentTake * 100)) * 100).toFixed(0)
-            : "—"}
-          % of the blended marketplace commission; the rest is buyer-side + services. RSCG/purchase GMV is an ownership model (no
-          seller fee, no buyer premium) and is excluded from this marketplace split.
+          The buyer&apos;s premium is the bulk of the marketplace take; the seller admin fee is a small add-on, and the two are
+          often substitutes (many GovDeals sellers charge a premium with a 0% admin fee). Buyer-premium and admin-fee coverage
+          are priced on different lot subsets, so the residual is only meaningful once premium coverage is broad — it shows
+          &quot;n.m.&quot; when the two measured fees over-explain the reported take (a coverage-ramp artifact, not negative
+          services revenue). RSCG/purchase GMV is an ownership model (no seller fee, no buyer premium) and is excluded from this split.
         </p>
       </section>
 
@@ -269,8 +279,9 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
               (measured, not assumed).
             </li>
             <li>
-              <strong>Buyer&apos;s premium</strong> — the buyer pays on top of the winning bid. It&apos;s set by each seller, so we
-              use the marketplaces&apos; <em>published ranges</em> instead of a single number.
+              <strong>Buyer&apos;s premium</strong> — the buyer pays on top of the winning bid. It&apos;s set by each seller; we now
+              read it directly per lot (the <em>measured</em> column), and also show the marketplaces&apos; <em>published ranges</em>
+              as an independent cross-check.
             </li>
             <li>
               <strong>Fee-implied band = measured seller fee + published buyer-premium range.</strong> If the reported take rate
@@ -286,6 +297,7 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
                 <th className="py-1.5 pr-4">Marketplace</th>
                 <th className="py-1.5 pr-4 text-right">Reported take</th>
                 <th className="py-1.5 pr-4 text-right">Measured seller fee</th>
+                <th className="py-1.5 pr-4 text-right">Buyer premium (measured)</th>
                 <th className="py-1.5 pr-4 text-right">Buyer premium (published)</th>
                 <th className="py-1.5 pr-4 text-right">Fee-implied band</th>
                 <th className="py-1.5 text-right">Reported vs. band</th>
@@ -316,6 +328,7 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
                     <td className="py-1 pr-4">{r.label}</td>
                     <td className="py-1 pr-4 text-right">{rep == null ? "—" : rep.toFixed(2) + "%"}</td>
                     <td className="py-1 pr-4 text-right">{pp(r.fee)}</td>
+                    <td className="py-1 pr-4 text-right">{pp(r.prem)}</td>
                     <td className="py-1 pr-4 text-right text-gray-500">
                       {r.bp[0].toFixed(1)}–{r.bp[1].toFixed(1)}%
                     </td>
@@ -339,18 +352,19 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
         </p>
       </section>
 
-      {/* 3. Measured seller admin fee detail */}
+      {/* 3. Measured take-rate fees detail */}
       <section>
-        <h3 className="mb-1 text-sm font-semibold">Measured seller admin fee — detail &amp; coverage</h3>
+        <h3 className="mb-1 text-sm font-semibold">Measured take-rate fees — detail &amp; coverage</h3>
         <p className="mb-3 text-xs text-gray-500">
-          Per-lot admin fee (LQDT&apos;s seller-side fee) pulled from the marketplace asset-detail endpoint, GMV-weighted over sold
-          lots in the trailing 90 days. Coverage grows as the daily job prices more sellers.
+          Per-lot buyer&apos;s premium and seller admin fee, read from the marketplace bid box and GMV-weighted over sold lots in
+          the trailing 90 days. Coverage grows as the daily job prices more sellers.
         </p>
         <div className="overflow-x-auto">
           <table className="w-full border-collapse">
             <thead>
               <tr className="border-b-2 border-gray-300 text-left">
                 <th className="py-1.5 pr-4">Marketplace</th>
+                <th className="py-1.5 pr-4 text-right">GMV-weighted buyer premium</th>
                 <th className="py-1.5 pr-4 text-right">GMV-weighted admin fee</th>
                 <th className="py-1.5 pr-4 text-right">Priced GMV</th>
                 <th className="py-1.5 pr-4 text-right">Total GMV</th>
@@ -365,6 +379,7 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
                 return (
                   <tr key={site} className="border-b border-gray-100">
                     <td className="py-1 pr-4">{SITE_LABEL[site]}</td>
+                    <td className="py-1 pr-4 text-right">{pp(s?.premium_pct ?? null)}</td>
                     <td className="py-1 pr-4 text-right">{pp(s?.blended_pct ?? null)}</td>
                     <td className="py-1 pr-4 text-right">{m(s?.covered_gmv ?? 0)}</td>
                     <td className="py-1 pr-4 text-right">{m(s?.total_gmv ?? 0)}</td>
@@ -375,6 +390,7 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
               })}
               <tr className="border-b border-gray-300 font-semibold">
                 <td className="py-1.5 pr-4">Overall</td>
+                <td className="py-1.5 pr-4 text-right">{pp(measured?.premium_overall_pct ?? null)}</td>
                 <td className="py-1.5 pr-4 text-right">{pp(measured?.overall_pct ?? null)}</td>
                 <td className="py-1.5 pr-4 text-right">{m(measured?.covered_gmv ?? 0)}</td>
                 <td className="py-1.5 pr-4 text-right">{m(measured?.total_gmv ?? 0)}</td>
@@ -436,11 +452,11 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
 
       <p className="max-w-3xl text-xs text-gray-400">
         Method &amp; caveats: reported segment GMVs, take rates and revenue come from the model workbook (latest reported quarter{" "}
-        {fq(latest.quarter)}). The seller admin fee is measured live per lot from the marketplace API and GMV-weighted; the
-        &quot;implied&quot; columns are the reported take minus that measured fee — the buyer&apos;s premium half is inferred, not
-        directly measured, because the API only exposes it to an authenticated buyer. Measured fee and reported take rates cover
-        different periods (fees are per-seller and stable, so this is immaterial). RSCG/purchase is an ownership model, excluded
-        from the seller/buyer marketplace split.
+        {fq(latest.quarter)}). Both auction fees — the buyer&apos;s premium and the seller admin fee — are now measured live per
+        lot from the marketplace bid box and GMV-weighted; the &quot;services / residual&quot; column is the reported take minus
+        both measured fees. Premium is set per seller/event, so a single stored value per seller is a close approximation, and
+        premium vs admin-fee coverage can differ slightly. Measured fees and reported take rates cover different periods (fees are
+        stable, so this is immaterial). RSCG/purchase is an ownership model, excluded from the seller/buyer marketplace split.
       </p>
     </div>
   );

@@ -72,7 +72,13 @@ export function getMarketplaceData(): Promise<MarketplaceData> {
 // best-effort and cached with the rest so a page load makes them at most once per TTL.
 const TOP_SOLD_MIN_USD = Number(process.env.TOP_SOLD_MIN_USD) || 250_000;
 const TOP_SOLD_LIMIT = Number(process.env.TOP_SOLD_LIMIT) || 25;
-export type BlendedAdminFee = { blended_pct: number | null; covered_gmv: number; total_gmv: number };
+export type BlendedAdminFee = {
+  blended_pct: number | null;
+  covered_gmv: number;
+  premium_pct: number | null;
+  premium_covered_gmv: number;
+  total_gmv: number;
+};
 export type TopSoldData = { lots: EnrichedLot[]; total: number; blended: BlendedAdminFee | null; minUsd: number };
 
 const topSoldCache = ttlCache<TopSoldData>(TTL);
@@ -89,8 +95,13 @@ export function getTopSoldItems(): Promise<TopSoldData> {
     // blended reference reflects the top sellers immediately; the cron fills the rest.
     const seen = new Set<string>();
     const feeRows = enriched
-      .filter((l) => l.admin_fee_percent != null && l.account_id)
-      .map((l) => ({ site: l.site, account_id: l.account_id, admin_fee_percent: l.admin_fee_percent as number }))
+      .filter((l) => (l.admin_fee_percent != null || l.buyer_premium_percent != null) && l.account_id)
+      .map((l) => ({
+        site: l.site,
+        account_id: l.account_id,
+        admin_fee_percent: l.admin_fee_percent,
+        buyer_premium_percent: l.buyer_premium_percent,
+      }))
       .filter((r) => {
         const k = `${r.site}:${r.account_id}`;
         if (seen.has(k)) return false;
@@ -111,8 +122,9 @@ export function getTopSoldItems(): Promise<TopSoldData> {
 
 // --- Take Rate Composition page ---
 // Reconstructs reported revenue from the workbook's business-segment take rates and
-// overlays the independently-MEASURED seller admin fee, so the split between the
-// seller-side fee and the (inferred) buyer premium + services is explicit.
+// overlays the independently-MEASURED buyer's premium and seller admin fee (both read
+// per lot from the marketplace bid box), so the split between those measured fees and
+// the residual services take is explicit.
 export type TakeRateQuarter = {
   quarter: string;
   govdealsGmv: number; govdealsTake: number; govdealsRev: number;
@@ -126,11 +138,28 @@ export type TakeRateQuarter = {
   totalGmv: number;
   blendedTake: number; // reconstructed / (govdeals+rscg+cag GMV)
 };
-export type MeasuredFeeSite = { site: string; blended_pct: number | null; covered_gmv: number; total_gmv: number; covered_sellers: number };
+export type MeasuredFeeSite = {
+  site: string;
+  blended_pct: number | null;
+  covered_gmv: number;
+  premium_pct: number | null;
+  premium_covered_gmv: number;
+  total_gmv: number;
+  covered_sellers: number;
+};
 export type TakeRateComposition = {
   quarters: TakeRateQuarter[];
   latest: TakeRateQuarter | null;
-  measured: { overall_pct: number | null; covered_gmv: number; total_gmv: number; bySite: MeasuredFeeSite[]; from: string; to: string } | null;
+  measured: {
+    overall_pct: number | null;
+    covered_gmv: number;
+    premium_overall_pct: number | null;
+    premium_covered_gmv: number;
+    total_gmv: number;
+    bySite: MeasuredFeeSite[];
+    from: string;
+    to: string;
+  } | null;
 };
 
 const takeRateCache = ttlCache<TakeRateComposition>(TTL);
@@ -173,13 +202,17 @@ export function getTakeRateComposition(): Promise<TakeRateComposition> {
       const to = etTodayKey();
       const from = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
       const bySite = await getAdminFeeBySite(from, to).catch(() => [] as MeasuredFeeSite[]);
-      // Derive the overall blend FROM the per-site rows so they can never disagree.
+      // Derive the overall blends FROM the per-site rows so they can never disagree.
       const coveredGmv = bySite.reduce((a, s) => a + s.covered_gmv, 0);
       const totalGmv = bySite.reduce((a, s) => a + s.total_gmv, 0);
       const feeUsd = bySite.reduce((a, s) => a + ((s.blended_pct ?? 0) / 100) * s.covered_gmv, 0);
+      const premiumCoveredGmv = bySite.reduce((a, s) => a + s.premium_covered_gmv, 0);
+      const premiumUsd = bySite.reduce((a, s) => a + ((s.premium_pct ?? 0) / 100) * s.premium_covered_gmv, 0);
       measured = {
         overall_pct: coveredGmv > 0 ? (feeUsd / coveredGmv) * 100 : null,
         covered_gmv: coveredGmv,
+        premium_overall_pct: premiumCoveredGmv > 0 ? (premiumUsd / premiumCoveredGmv) * 100 : null,
+        premium_covered_gmv: premiumCoveredGmv,
         total_gmv: totalGmv,
         bySite,
         from,
