@@ -5,7 +5,17 @@ import type { ListingRow, MarketplaceSellerRow, SellerDeltaRow } from "./supabas
 import { ttlCache } from "./cache";
 import { useAzureData } from "./data-backend";
 import { azFetchListings, azFetchMarketplaceSellers, azFetchSellerDeltas } from "./azure-tables";
-import { getTopSoldLots, isAzureSqlConfigured, getBlendedAdminFee, getAdminFeeBySite, upsertSellerFees } from "./azure-sql";
+import {
+  getTopSoldLots,
+  isAzureSqlConfigured,
+  getBlendedAdminFee,
+  getAdminFeeBySite,
+  upsertSellerFees,
+  getFeePatterns,
+  getMeasuredTakeByQuarter,
+  type FeeBucket,
+  type MeasuredQuarterTake,
+} from "./azure-sql";
 import { enrichTopLots, type EnrichedLot } from "./asset-fees";
 import { loadModelMetrics } from "./reported-gmv";
 import { etTodayKey, etQuarterKey } from "./time";
@@ -127,6 +137,7 @@ export function getTopSoldItems(): Promise<TopSoldData> {
 // the residual services take is explicit.
 export type TakeRateQuarter = {
   quarter: string;
+  consignmentGmv: number; // total consignment (marketplace) GMV — the revenue-model base
   govdealsGmv: number; govdealsTake: number; govdealsRev: number;
   rscgGmv: number; rscgTake: number; rscgRev: number;
   cagGmv: number; cagTake: number; cagRev: number;
@@ -160,6 +171,10 @@ export type TakeRateComposition = {
     from: string;
     to: string;
   } | null;
+  // Model-free analytics: fee patterns across lot size / seller type / category, and the
+  // measured marketplace take per calendar quarter (drives the revenue back-test).
+  patterns: { bySize: FeeBucket[]; bySellerType: FeeBucket[]; byCategory: FeeBucket[] } | null;
+  measuredByQuarter: MeasuredQuarterTake[];
 };
 
 const takeRateCache = ttlCache<TakeRateComposition>(TTL);
@@ -184,6 +199,7 @@ export function getTakeRateComposition(): Promise<TakeRateComposition> {
       const totalGmv = gGmv + rGmv + cGmv;
       rows.push({
         quarter: q,
+        consignmentGmv: val(q, "consignment_gmv") ?? 0,
         govdealsGmv: gGmv, govdealsTake: gT, govdealsRev: gRev,
         rscgGmv: rGmv, rscgTake: rT, rscgRev: rRev,
         cagGmv: cGmv, cagTake: cT, cagRev: cRev,
@@ -196,7 +212,20 @@ export function getTakeRateComposition(): Promise<TakeRateComposition> {
     const latest = rows[rows.length - 1] ?? null;
 
     let measured: TakeRateComposition["measured"] = null;
+    let patterns: TakeRateComposition["patterns"] = null;
+    let measuredByQuarter: MeasuredQuarterTake[] = [];
     if (isAzureSqlConfigured()) {
+      // Analytics reads are best-effort AND bounded: these are wide aggregations over the
+      // sold-lot join, so each is capped by a date floor and raced against a timeout. On
+      // timeout we render without the section rather than holding the page (the .catch
+      // alone only covers rejection, not latency).
+      const analyticsFrom = new Date(Date.now() - 730 * 86_400_000).toISOString().slice(0, 10);
+      const bounded = <T,>(p: Promise<T>, fallback: T, ms = 6_000): Promise<T> =>
+        Promise.race([p.catch(() => fallback), new Promise<T>((res) => setTimeout(() => res(fallback), ms))]);
+      [patterns, measuredByQuarter] = await Promise.all([
+        bounded(getFeePatterns(analyticsFrom), null as TakeRateComposition["patterns"]),
+        bounded(getMeasuredTakeByQuarter(analyticsFrom), [] as MeasuredQuarterTake[]),
+      ]);
       // Seller fees are per-seller and stable, so a 90-day trailing window gives a
       // robust GMV-weighted read (and better seller_fees coverage) than QTD alone.
       const to = etTodayKey();
@@ -219,6 +248,6 @@ export function getTakeRateComposition(): Promise<TakeRateComposition> {
         to,
       };
     }
-    return { quarters: rows, latest, measured };
+    return { quarters: rows, latest, measured, patterns, measuredByQuarter };
   });
 }

@@ -1,4 +1,5 @@
 import type { TakeRateComposition, TakeRateQuarter, MeasuredFeeSite } from "@/lib/dashboard-data";
+import type { FeeBucket } from "@/lib/azure-sql";
 
 const SITE_LABEL: Record<string, string> = { AD: "AllSurplus", GD: "GovDeals", GI: "Industrial" };
 
@@ -33,8 +34,48 @@ const BP_RANGE: Record<string, [number, number]> = {
   BLENDED: [9, 13],
 };
 
+/** One fee-pattern table (lot size / seller type / category). All GMV-weighted. */
+function PatternTable({ title, rows, note }: { title: string; rows: FeeBucket[]; note?: string }) {
+  if (rows.length === 0) return null;
+  return (
+    <div>
+      <p className="mb-1 text-xs font-medium text-gray-600">{title}</p>
+      <div className="overflow-x-auto rounded-lg border">
+        <table className="w-full border-collapse text-xs">
+          <thead>
+            <tr className="border-b bg-gray-50/60 text-left">
+              <th className="px-2.5 py-1 font-semibold text-gray-600">{note ?? ""}</th>
+              <th className="px-2.5 py-1 text-right font-semibold text-gray-600">Premium</th>
+              <th className="px-2.5 py-1 text-right font-semibold text-gray-600">Admin</th>
+              <th className="px-2.5 py-1 text-right font-semibold text-gray-600" title="(premium + admin) ÷ premium-inclusive GMV — comparable to the reported take rate">
+                Total take
+              </th>
+              <th className="px-2.5 py-1 text-right font-semibold text-gray-600" title="Hammer-price GMV the fees were measured on (excludes the buyer premium)">
+                GMV (hammer)
+              </th>
+            </tr>
+          </thead>
+          <tbody className="tabular-nums">
+            {rows.map((r, i) => (
+              <tr key={`${r.dim}:${i}`} className="border-b border-gray-100">
+                <td className={`whitespace-nowrap py-1 pr-2.5 text-gray-700 ${r.sub ? "pl-7 text-gray-500" : "pl-2.5"}`}>{r.dim || "—"}</td>
+                <td className="px-2.5 py-1 text-right">{pp(r.premium_pct)}</td>
+                <td className="px-2.5 py-1 text-right text-gray-500">{pp(r.admin_pct)}</td>
+                <td className="px-2.5 py-1 text-right font-semibold">{pp(r.total_pct)}</td>
+                <td className="px-2.5 py-1 text-right text-gray-500">
+                  {r.sub ? <span title="already included in the row above">({m(r.gmv)})</span> : m(r.gmv)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 export function TakeRateView({ data }: { data: TakeRateComposition }) {
-  const { latest, quarters, measured } = data;
+  const { latest, quarters, measured, patterns, measuredByQuarter } = data;
   if (!latest) {
     return <p className="text-sm text-gray-500">Model metrics unavailable — the reported take-rate workbook isn&apos;t loaded.</p>;
   }
@@ -85,6 +126,44 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
   const blendedFee = measured?.overall_pct ?? null;
   const blendedAuction = blendedPrem != null && blendedFee != null ? inclusiveTake(blendedPrem, blendedFee) : null;
   const blendedServices = latest.consignmentTake > 0 && blendedAuction != null ? latest.consignmentTake * 100 - blendedAuction : null;
+
+  // Revenue back-test — segment build-up using OUR measured take rates.
+  //   GovDeals GMV × measured GD take  +  CAG GMV × measured AD/GI take
+  //   + RSCG segment revenue + Machinio (neither is a listing fee, so both come from the model)
+  // The segments must be govdeals + cag + rscg (the model's own decomposition): consignment_gmv
+  // ALREADY CONTAINS RSCG's consignment slice, so using consignment_gmv here alongside the RSCG
+  // line would double-count that slice. Verified in the metrics: consignment + purchase ==
+  // govdeals + rscg + cag to the dollar. Only the TAKE RATES are ours; segment GMV is the
+  // model's, because total GMV isn't observable from scraping.
+  const MIN_COVERED_GMV = 25_000_000; // don't present a thinly-measured quarter as authoritative
+  const takeByQ = new Map(measuredByQuarter.map((x) => [x.quarter, x]));
+  const backtest = quarters
+    .map((q) => {
+      const mq = takeByQ.get(q.quarter);
+      if (!mq || q.reported <= 0 || mq.covered_gmv < MIN_COVERED_GMV) return null;
+      if (mq.gd_take_pct == null || mq.cag_take_pct == null || q.govdealsGmv <= 0) return null;
+      const gd = q.govdealsGmv * (mq.gd_take_pct / 100);
+      const cag = q.cagGmv * (mq.cag_take_pct / 100);
+      const auction = gd + cag;
+      const rscg = q.rscgGmv * q.rscgTake;
+      const modeled = auction + rscg + q.machinio;
+      // Reported auction revenue for the same two segments, from the model's own take rates.
+      const reportedAuction = q.govdealsGmv * q.govdealsTake + q.cagGmv * q.cagTake;
+      return {
+        quarter: q.quarter,
+        gdTake: mq.gd_take_pct,
+        cagTake: mq.cag_take_pct,
+        auction,
+        reportedAuction: reportedAuction > 0 ? reportedAuction : null,
+        services: reportedAuction > 0 ? reportedAuction - auction : null,
+        modeled,
+        reported: q.reported,
+        deltaPct: (modeled / q.reported - 1) * 100,
+        coveredGmv: mq.covered_gmv,
+      };
+    })
+    .filter((x): x is NonNullable<typeof x> => x != null)
+    .reverse(); // newest first, matching the reconciliation table below
 
   return (
     <div className="space-y-10 text-sm">
@@ -419,6 +498,93 @@ export function TakeRateView({ data }: { data: TakeRateComposition }) {
           </table>
         </div>
       </section>
+
+      {/* 3b. Fee patterns — where the take rate is higher/lower */}
+      {patterns && (patterns.bySize.length > 0 || patterns.bySellerType.length > 0) && (
+        <section>
+          <h3 className="mb-1 text-sm font-semibold">Fee patterns — what drives the take rate</h3>
+          <p className="mb-3 text-xs text-gray-500">
+            Measured fees across every sold lot in our history, GMV-weighted. The strongest driver is{" "}
+            <strong>lot size</strong> (large lots negotiate rates down), then <strong>who the seller is</strong> — state
+            governments run a different structure (low premium, high seller fee). Category is largely a proxy for seller mix, so
+            it compresses once seller type is held constant. Fees are contracted per seller, so each row reflects the mix of
+            sellers active in that bucket.
+          </p>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <PatternTable title="By lot size — the take rate declines as lots get larger" rows={patterns.bySize} note="Lot size" />
+            <PatternTable title="By seller type (government split out by level)" rows={patterns.bySellerType} note="Seller" />
+          </div>
+          {patterns.byCategory.length > 0 && (
+            <div className="mt-4">
+              <PatternTable title="Largest categories by GMV (not exhaustive — top 12 only)" rows={patterns.byCategory} note="Category" />
+            </div>
+          )}
+          <p className="mt-2 text-xs text-gray-400">
+            Total take is on the premium-inclusive basis, so it&apos;s comparable to the reported take rate; the GMV column is the
+            hammer price the fees were measured on, so the two columns aren&apos;t a straight multiply. The size effect is a genuine
+            rate difference rather than a shift between premium and admin fee — it holds on the two combined. Practical read: GMV
+            growth concentrated in large lots dilutes the blended take rate even with no change in posted pricing. Government rows
+            are indented under their seller type and their GMV is shown in parentheses because it is already counted above.
+          </p>
+        </section>
+      )}
+
+      {/* 3c. Revenue back-test from measured fees */}
+      {backtest.length > 0 && (
+        <section>
+          <h3 className="mb-1 text-sm font-semibold">Revenue back-test — rebuilt from our measured fees</h3>
+          <p className="mb-3 text-xs text-gray-500">
+            Each quarter&apos;s revenue rebuilt segment by segment: <strong>GovDeals GMV × our measured GovDeals take</strong> +{" "}
+            <strong>Industrial GMV × our measured AllSurplus/Industrial take</strong> (both from the marketplace bid box, not the
+            model) + the RSCG segment and Machinio, which aren&apos;t listing fees and so come from the model. Segment GMV is the
+            model&apos;s — total GMV isn&apos;t observable from scraping — so this tests the <em>fee rates</em>, not the volumes.
+          </p>
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse">
+              <thead>
+                <tr className="border-b-2 border-gray-300 text-left">
+                  <th className="py-1.5 pr-4">Quarter</th>
+                  <th className="py-1.5 pr-4 text-right">GD take (ours)</th>
+                  <th className="py-1.5 pr-4 text-right">Ind. take (ours)</th>
+                  <th className="py-1.5 pr-4 text-right">Auction rev (ours)</th>
+                  <th className="py-1.5 pr-4 text-right">Auction rev (reported)</th>
+                  <th className="py-1.5 pr-4 text-right">Services gap</th>
+                  <th className="py-1.5 pr-4 text-right">Total modeled rev</th>
+                  <th className="py-1.5 pr-4 text-right">Reported rev</th>
+                  <th className="py-1.5 text-right">Δ</th>
+                </tr>
+              </thead>
+              <tbody className="tabular-nums">
+                {backtest.map((b) => (
+                  <tr key={b.quarter} className="border-b border-gray-100">
+                    <td className="py-1 pr-4">{fq(b.quarter)}</td>
+                    <td className="py-1 pr-4 text-right">{b.gdTake.toFixed(2)}%</td>
+                    <td className="py-1 pr-4 text-right">{b.cagTake.toFixed(2)}%</td>
+                    <td className="py-1 pr-4 text-right">{m(b.auction)}</td>
+                    <td className="py-1 pr-4 text-right text-gray-500">{b.reportedAuction == null ? "—" : m(b.reportedAuction)}</td>
+                    <td className="py-1 pr-4 text-right text-gray-500">{svc(b.services)}</td>
+                    <td className="py-1 pr-4 text-right font-semibold">{m(b.modeled)}</td>
+                    <td className="py-1 pr-4 text-right">{m(b.reported)}</td>
+                    <td className={`py-1 text-right ${Math.abs(b.deltaPct) <= 2 ? "text-green-700" : "text-amber-700"}`}>
+                      {(b.deltaPct >= 0 ? "+" : "") + b.deltaPct.toFixed(1)}%
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-xs text-gray-400">
+            Read the <strong>GovDeals</strong> column first: our measured GovDeals take reproduces the filed GovDeals take rate to
+            within a few hundredths of a point, so that segment&apos;s revenue rebuilds almost exactly — strong independent evidence
+            the measured fees are right. The <strong>services gap</strong> (reported auction revenue − ours) is concentrated in
+            Industrial, where the segment books Machinio-adjacent valuation/advisory revenue on top of auction fees; that isn&apos;t
+            a listing fee, so it can&apos;t appear in scraped data and the total therefore rebuilds a few percent light. Segments must
+            be GovDeals + Industrial + RSCG (the model&apos;s own decomposition) — consignment GMV already contains RSCG&apos;s
+            consignment slice, so mixing the two would double-count it. Quarters with under {m(MIN_COVERED_GMV)} of measured GMV are
+            omitted rather than shown as authoritative.
+          </p>
+        </section>
+      )}
 
       {/* 4. Revenue reconciliation across quarters */}
       <section>

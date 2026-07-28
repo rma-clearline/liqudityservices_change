@@ -1037,6 +1037,118 @@ export async function getBlendedAdminFee(
   };
 }
 
+// --- fee patterns + measured take by quarter (Take Rate page analytics) ------
+/** `sub` marks a child row whose GMV is already counted in the parent row above it. */
+export type FeeBucket = { dim: string; premium_pct: number | null; admin_pct: number | null; total_pct: number | null; gmv: number; lots: number; sub?: boolean };
+/** Measured take per calendar quarter, split by the segments the model reports:
+ *  `gd` = GovDeals (site GD), `cag` = the commercial/industrial marketplace (AD + GI).
+ *  Rates are premium-inclusive percents; *_gmv are the hammer GMV they were measured on. */
+export type MeasuredQuarterTake = {
+  quarter: string;
+  gd_take_pct: number | null;
+  gd_gmv: number;
+  cag_take_pct: number | null;
+  cag_gmv: number;
+  all_take_pct: number | null;
+  covered_gmv: number;
+};
+
+/** GMV-weighted premium/admin/total-take grouped by `dimSql`, over premium-covered lots.
+ *  `total_pct` is on the premium-INCLUSIVE basis (fees ÷ (hammer + premium)), matching how
+ *  the reported take rate is computed. Fees are per-seller, so a bucket's rate reflects the
+ *  mix of sellers active in it. */
+async function feeBuckets(dimSql: string, minGmv: number, limit: number, extraWhere = ""): Promise<FeeBucket[]> {
+  const pool = await getPool();
+  await ensureSellerFeesTable(pool);
+  const r = await pool.request().query(
+    `SELECT TOP ${limit} ${dimSql} AS dim, COUNT(*) AS lots, SUM(l.sale_amount_usd) AS gmv, ` +
+      "SUM(l.sale_amount_usd*f.buyer_premium_percent/100.0) AS prem_usd, " +
+      "SUM(l.sale_amount_usd*COALESCE(f.admin_fee_percent,0)/100.0) AS admin_usd, " +
+      "SUM(l.sale_amount_usd*(1+f.buyer_premium_percent/100.0)) AS incl_gmv " +
+      "FROM lqdt.sold_lots l JOIN lqdt.seller_fees f ON f.site=l.site AND f.account_id=l.account_id " +
+      `WHERE f.buyer_premium_percent IS NOT NULL ${extraWhere}` +
+      `GROUP BY ${dimSql} HAVING SUM(l.sale_amount_usd) > ${minGmv} ORDER BY SUM(l.sale_amount_usd) DESC`,
+  );
+  return r.recordset.map((x) => {
+    const gmv = Number(x.gmv ?? 0), incl = Number(x.incl_gmv ?? 0);
+    const prem = Number(x.prem_usd ?? 0), adm = Number(x.admin_usd ?? 0);
+    return {
+      dim: String(x.dim ?? ""),
+      premium_pct: gmv > 0 ? (prem / gmv) * 100 : null,
+      admin_pct: gmv > 0 ? (adm / gmv) * 100 : null,
+      total_pct: incl > 0 ? ((prem + adm) / incl) * 100 : null,
+      gmv,
+      lots: Number(x.lots ?? 0),
+    };
+  });
+}
+
+const SIZE_BUCKET_SQL =
+  "CASE WHEN l.sale_amount_usd < 1000 THEN '< $1k' WHEN l.sale_amount_usd < 10000 THEN '$1k–10k' " +
+  "WHEN l.sale_amount_usd < 50000 THEN '$10k–50k' WHEN l.sale_amount_usd < 250000 THEN '$50k–250k' " +
+  "WHEN l.sale_amount_usd < 1000000 THEN '$250k–1M' ELSE '> $1M' END";
+
+/** Fee patterns for the Take Rate page: by lot size, seller type / government level, and
+ *  the top categories. All GMV-weighted over lots with a measured premium, bounded to
+ *  lots closing on/after `fromEt`. Category uses `category` (the leaf categoryDescription)
+ *  — `category_routepath` is not populated on the sold rows, so there's no tree to roll up. */
+export async function getFeePatterns(fromEt: string): Promise<{ bySize: FeeBucket[]; bySellerType: FeeBucket[]; byCategory: FeeBucket[] }> {
+  const since = `AND l.close_date_et >= '${fromEt.replace(/[^0-9-]/g, "")}' `;
+  const [bySize, byType, byGov, byCategory] = await Promise.all([
+    feeBuckets(SIZE_BUCKET_SQL, 0, 10, since),
+    feeBuckets("l.seller_type", 1_000_000, 6, since + "AND l.seller_type IS NOT NULL "),
+    feeBuckets("l.gov_level", 1_000_000, 6, since + "AND l.gov_level IS NOT NULL AND l.gov_level <> 'commercial' "),
+    feeBuckets("l.category", 10_000_000, 12, since + "AND l.category IS NOT NULL AND l.category <> '' "),
+  ]);
+  const order = ["< $1k", "$1k–10k", "$10k–50k", "$50k–250k", "$250k–1M", "> $1M"];
+  bySize.sort((a, b) => order.indexOf(a.dim) - order.indexOf(b.dim));
+  // gov_level rows are a DECOMPOSITION of the "government" seller_type row, not extra
+  // slices — splice them directly beneath their parent and flag them so the UI can indent
+  // and parenthesise the GMV (otherwise the GMV column reads as double-counted).
+  const kids = byGov.map((r) => ({ ...r, sub: true }));
+  const gi = byType.findIndex((r) => r.dim === "government");
+  const bySellerType = gi >= 0 ? [...byType.slice(0, gi + 1), ...kids, ...byType.slice(gi + 1)] : [...byType, ...kids];
+  return { bySize, bySellerType, byCategory };
+}
+
+/** Measured (model-free) marketplace take per calendar quarter, premium-inclusive basis,
+ *  split GovDeals vs the commercial/industrial marketplace so each can be applied to the
+ *  matching reported segment GMV. Bounded to lots closing on/after `fromEt`. */
+export async function getMeasuredTakeByQuarter(fromEt: string): Promise<MeasuredQuarterTake[]> {
+  const pool = await getPool();
+  await ensureSellerFeesTable(pool);
+  const r = await pool
+    .request()
+    .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+    .query(
+      "SELECT CONCAT(YEAR(l.close_date_et),'Q',DATEPART(QUARTER,l.close_date_et)) AS quarter, " +
+        "CASE WHEN l.site='GD' THEN 'gd' ELSE 'cag' END AS grp, " +
+        "SUM(l.sale_amount_usd) AS gmv, SUM(l.sale_amount_usd*(1+f.buyer_premium_percent/100.0)) AS incl_gmv, " +
+        "SUM(l.sale_amount_usd*(f.buyer_premium_percent+COALESCE(f.admin_fee_percent,0))/100.0) AS fee_usd " +
+        "FROM lqdt.sold_lots l JOIN lqdt.seller_fees f ON f.site=l.site AND f.account_id=l.account_id " +
+        "WHERE f.buyer_premium_percent IS NOT NULL AND l.close_date_et >= @from " +
+        "GROUP BY CONCAT(YEAR(l.close_date_et),'Q',DATEPART(QUARTER,l.close_date_et)), CASE WHEN l.site='GD' THEN 'gd' ELSE 'cag' END",
+    );
+  const byQ = new Map<string, MeasuredQuarterTake>();
+  for (const x of r.recordset) {
+    const q = String(x.quarter ?? "");
+    const row = byQ.get(q) ?? { quarter: q, gd_take_pct: null, gd_gmv: 0, cag_take_pct: null, cag_gmv: 0, all_take_pct: null, covered_gmv: 0 };
+    const gmv = Number(x.gmv ?? 0), incl = Number(x.incl_gmv ?? 0), fee = Number(x.fee_usd ?? 0);
+    const take = incl > 0 ? (fee / incl) * 100 : null;
+    if (String(x.grp) === "gd") { row.gd_take_pct = take; row.gd_gmv = gmv; }
+    else { row.cag_take_pct = take; row.cag_gmv = gmv; }
+    byQ.set(q, row);
+  }
+  // Blended across both groups, weighted by each group's premium-inclusive GMV.
+  for (const row of byQ.values()) {
+    row.covered_gmv = row.gd_gmv + row.cag_gmv;
+    const gdIncl = row.gd_gmv, cagIncl = row.cag_gmv;
+    const num = (row.gd_take_pct ?? 0) * gdIncl + (row.cag_take_pct ?? 0) * cagIncl;
+    row.all_take_pct = gdIncl + cagIncl > 0 ? num / (gdIncl + cagIncl) : null;
+  }
+  return [...byQ.values()].filter((x) => x.covered_gmv > 0).sort((a, b) => a.quarter.localeCompare(b.quarter));
+}
+
 /** GMV-weighted seller admin fee + buyer's premium per marketplace (site) in [from,to],
  *  each with its own coverage (premium may be priced on a different subset than the fee). */
 export async function getAdminFeeBySite(
