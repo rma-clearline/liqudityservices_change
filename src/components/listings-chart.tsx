@@ -13,6 +13,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import type { ListingRow } from "@/lib/supabase";
+import { lqdtFiscalQuarter } from "@/lib/time";
 
 type ChartRow = {
   label: string;
@@ -92,15 +93,18 @@ function fmtTickDate(v: string): string {
   return `${Number(m)}/${Number(d)}/${y.slice(2)}`;
 }
 
-/** Second-row x-axis tick: the quarter label (e.g. "Q1 '25") centered under each
- *  quarter. Recharts injects x/y/payload; `labels` maps a data label → its text. */
-function QuarterTick(props: { x?: number; y?: number; payload?: { value?: string }; labels?: Map<string, string> }) {
+/** Second-row x-axis tick: the quarter label centered under each quarter, showing
+ *  BOTH the calendar quarter (top) and LQDT's fiscal quarter (below, muted), since
+ *  the FY ends 9/30 so they differ. Recharts injects x/y/payload; `labels` maps a
+ *  data label → its { cq, fq } text. */
+function QuarterTick(props: { x?: number; y?: number; payload?: { value?: string }; labels?: Map<string, { cq: string; fq: string }> }) {
   const { x = 0, y = 0, payload, labels } = props;
-  const text = labels?.get(payload?.value ?? "") ?? "";
-  if (!text) return null;
+  const t = labels?.get(payload?.value ?? "");
+  if (!t) return null;
   return (
-    <text x={x} y={y + 12} textAnchor="middle" fontSize={11} fontWeight={600} fill="#374151">
-      {text}
+    <text x={x} y={y + 11} textAnchor="middle">
+      <tspan x={x} fontSize={11} fontWeight={600} fill="#374151">{t.cq}</tspan>
+      <tspan x={x} dy={12} fontSize={9} fill="#9ca3af">{t.fq}</tspan>
     </text>
   );
 }
@@ -119,7 +123,7 @@ export function ListingsChart({ data, allData }: { data: ListingRow[]; allData: 
         primaryTicks: [] as string[],
         quarterEndTicks: [] as string[],
         quarterMidLabels: [] as string[],
-        quarterLabelMap: new Map<string, string>(),
+        quarterLabelMap: new Map<string, { cq: string; fq: string }>(),
       };
     }
     const first = labels[0];
@@ -139,7 +143,7 @@ export function ListingsChart({ data, allData }: { data: ListingRow[]; allData: 
     };
     const qEnds: string[] = [];
     const midLabels: string[] = [];
-    const labelMap = new Map<string, string>();
+    const labelMap = new Map<string, { cq: string; fq: string }>();
     let y = Number(first.slice(0, 4));
     let q = Math.floor((Number(first.slice(5, 7)) - 1) / 3) + 1;
     for (let guard = 0; guard < 80; guard++) {
@@ -157,7 +161,8 @@ export function ListingsChart({ data, allData }: { data: ListingRow[]; allData: 
       if (mid > last) mid = last;
       const ml = nearest(mid);
       if (!labelMap.has(ml)) {
-        labelMap.set(ml, `Q${q} '${String(y).slice(2)}`);
+        const { fy, fq } = lqdtFiscalQuarter(y, q);
+        labelMap.set(ml, { cq: `CQ${q} '${String(y).slice(2)}`, fq: `FQ${fq} '${String(fy).slice(2)}` });
         midLabels.push(ml);
       }
       q++;
@@ -180,9 +185,9 @@ export function ListingsChart({ data, allData }: { data: ListingRow[]; allData: 
     <ResponsiveContainer width="100%" height={600}>
       <LineChart data={chartData} margin={{ top: 5, right: hasYoY ? 60 : 20, bottom: 5, left: 20 }}>
         <CartesianGrid strokeDasharray="3 3" vertical={false} />
-        {/* Quarter-end cutoff markers. */}
+        {/* Quarter-end gridlines — light grey dotted verticals at each quarter cutoff. */}
         {quarterEndTicks.map((t) => (
-          <ReferenceLine key={t} x={t} stroke="#cbd5e1" strokeDasharray="4 3" />
+          <ReferenceLine key={t} x={t} stroke="#cbd5e1" strokeDasharray="2 4" strokeWidth={1} />
         ))}
         {/* Primary axis: dates at quarter ends (+ range endpoints). */}
         <XAxis dataKey="label" ticks={primaryTicks} interval={0} tickFormatter={fmtTickDate} tick={{ fontSize: 11 }} height={22} />
@@ -194,7 +199,7 @@ export function ListingsChart({ data, allData }: { data: ListingRow[]; allData: 
           interval={0}
           tickLine={false}
           axisLine={false}
-          height={20}
+          height={34}
           tick={<QuarterTick labels={quarterLabelMap} />}
         />
         <YAxis
