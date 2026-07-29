@@ -31,7 +31,10 @@ export async function GET(request: Request) {
   const started = Date.now();
   try {
     const fetched = await fetchSoldRange(from, to, { maxPages });
-    const { written, skipped } = await writeSoldLots(fetched.rows);
+    // A truncated fetch (page cap hit / failed pages) still persists its rows but must
+    // not claim full day coverage — storeCoversRange would serve the undercount as
+    // complete. `truncated: true` in the response tells the operator to re-run.
+    const { written, skipped } = await writeSoldLots(fetched.rows, { markCoverage: !fetched.truncated });
     // Re-mark relist supersession before reporting coverage: a backfill can introduce a
     // second sold record for an asset that already had one, and until this runs both
     // count toward GMV. Without it the numbers below (and every read) would stay

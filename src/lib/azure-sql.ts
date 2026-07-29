@@ -281,13 +281,31 @@ async function mergeBatch(pool: sql.ConnectionPool, batchId: string): Promise<vo
       throw e;
     }
   }
+  // Clear this batch's staging rows. Best-effort; a rare failed DELETE leaves rows
+  // scoped to a dead batch_id (never re-selected) — acceptable vs. failing the write.
+  await pool
+    .request()
+    .input("bid", sql.UniqueIdentifier, batchId)
+    .query("DELETE FROM lqdt.sold_lots_staging WHERE batch_id = @bid")
+    .catch(() => {});
+}
+
+/**
+ * Claim day coverage for [dates]. Deliberately NOT done per merged chunk: a day's rows
+ * span several chunks (rows arrive value-ranked, not grouped by day), so marking inside
+ * mergeBatch would claim a complete day from a write that then died half-way — and
+ * sold_coverage is exactly what storeCoversRange trusts to serve a range as complete.
+ * Called once, only after every chunk of a COMPLETE (non-truncated) fetch has merged.
+ */
+async function markSoldCoverage(pool: sql.ConnectionPool, dates: string[]): Promise<void> {
+  if (dates.length === 0) return;
   try {
     await pool
       .request()
-      .input("bid", sql.UniqueIdentifier, batchId)
+      .input("dates", sql.NVarChar(sql.MAX), JSON.stringify(dates))
       .query(
         "MERGE lqdt.sold_coverage AS T " +
-          "USING (SELECT DISTINCT close_date_et FROM lqdt.sold_lots_staging WHERE batch_id = @bid) AS S " +
+          "USING (SELECT DISTINCT CAST(value AS date) AS close_date_et FROM OPENJSON(@dates)) AS S " +
           "ON T.close_date_et = S.close_date_et " +
           "WHEN MATCHED THEN UPDATE SET refreshed_at = SYSUTCDATETIME() " +
           "WHEN NOT MATCHED THEN INSERT (close_date_et) VALUES (S.close_date_et);",
@@ -296,13 +314,6 @@ async function mergeBatch(pool: sql.ConnectionPool, batchId: string): Promise<vo
     // Allow a rolling app deploy before migration 002 is applied.
     if (sqlErrorNumber(error) !== 208) throw error;
   }
-  // Clear this batch's staging rows. Best-effort; a rare failed DELETE leaves rows
-  // scoped to a dead batch_id (never re-selected) — acceptable vs. failing the write.
-  await pool
-    .request()
-    .input("bid", sql.UniqueIdentifier, batchId)
-    .query("DELETE FROM lqdt.sold_lots_staging WHERE batch_id = @bid")
-    .catch(() => {});
 }
 
 // Returns the number of rows it could NOT persist (skipped as individually
@@ -342,8 +353,12 @@ async function writeChunk(pool: sql.ConnectionPool, rows: SoldExportRow[]): Prom
  * to indicate a systemic failure (so a dead connection is never reported as a
  * successful capture of zero rows).
  */
-export async function writeSoldLots(rows: SoldExportRow[]): Promise<{ written: number; skipped: number }> {
+export async function writeSoldLots(
+  rows: SoldExportRow[],
+  opts: { markCoverage?: boolean } = {},
+): Promise<{ written: number; skipped: number }> {
   if (!rows.length) return { written: 0, skipped: 0 };
+  const markCoverage = opts.markCoverage !== false;
   const seen = new Set<string>();
   const unique: SoldExportRow[] = [];
   for (const r of rows) {
@@ -363,6 +378,12 @@ export async function writeSoldLots(rows: SoldExportRow[]): Promise<{ written: n
   const tolerance = Math.max(50, Math.floor(unique.length * 0.02));
   if (skipped > tolerance) {
     throw new Error(`sold_lots: ${skipped}/${unique.length} rows failed to load — aborting as systemic failure`);
+  }
+  // Coverage is claimed only now: every chunk merged and the write is complete. A
+  // truncated fetch passes markCoverage:false, so its days stay unclaimed and readers
+  // fall back instead of serving the undercount as a complete day.
+  if (markCoverage) {
+    await markSoldCoverage(pool, [...new Set(unique.map((r) => r.close_date_et))]);
   }
   return { written: unique.length - skipped, skipped };
 }
@@ -423,21 +444,34 @@ export async function refreshSoldSupersession(): Promise<{ changed: number; ms: 
   // record can't win and the result doesn't depend on ingest order. auction_id only
   // breaks exact close-time ties, and is cast so '10' outranks '9' rather than sorting
   // lexicographically (no such ties exist today; this keeps it correct if they appear).
-  const r = await pool.request().query(
+  const REFRESH_SQL =
     "WITH d AS (SELECT site, account_id, asset_id FROM lqdt.sold_lots " +
-      "GROUP BY site, account_id, asset_id " +
-      "HAVING COUNT(*) > 1 OR MAX(CASE WHEN superseded_by_auction IS NOT NULL THEN 1 ELSE 0 END) = 1), " +
-      "r AS (SELECT s.row_key, s.superseded_by_auction AS cur, " +
-      "ROW_NUMBER() OVER (PARTITION BY s.site, s.account_id, s.asset_id " +
-      "ORDER BY s.close_time_utc DESC, TRY_CAST(s.auction_id AS bigint) DESC, s.auction_id DESC) AS rn, " +
-      "FIRST_VALUE(s.auction_id) OVER (PARTITION BY s.site, s.account_id, s.asset_id " +
-      "ORDER BY s.close_time_utc DESC, TRY_CAST(s.auction_id AS bigint) DESC, s.auction_id DESC) AS win " +
-      "FROM lqdt.sold_lots s JOIN d ON d.site = s.site AND d.account_id = s.account_id AND d.asset_id = s.asset_id) " +
-      "UPDATE t SET superseded_by_auction = CASE WHEN r.rn = 1 THEN NULL ELSE r.win END " +
-      "FROM lqdt.sold_lots t JOIN r ON r.row_key = t.row_key " +
-      "WHERE ISNULL(r.cur, '~') <> ISNULL(CASE WHEN r.rn = 1 THEN NULL ELSE r.win END, '~')",
-  );
-  return { changed: r.rowsAffected[0] ?? 0, ms: Date.now() - t0 };
+    "GROUP BY site, account_id, asset_id " +
+    "HAVING COUNT(*) > 1 OR MAX(CASE WHEN superseded_by_auction IS NOT NULL THEN 1 ELSE 0 END) = 1), " +
+    "r AS (SELECT s.row_key, s.superseded_by_auction AS cur, " +
+    "ROW_NUMBER() OVER (PARTITION BY s.site, s.account_id, s.asset_id " +
+    "ORDER BY s.close_time_utc DESC, TRY_CAST(s.auction_id AS bigint) DESC, s.auction_id DESC) AS rn, " +
+    "FIRST_VALUE(s.auction_id) OVER (PARTITION BY s.site, s.account_id, s.asset_id " +
+    "ORDER BY s.close_time_utc DESC, TRY_CAST(s.auction_id AS bigint) DESC, s.auction_id DESC) AS win " +
+    "FROM lqdt.sold_lots s JOIN d ON d.site = s.site AND d.account_id = s.account_id AND d.asset_id = s.asset_id) " +
+    "UPDATE t SET superseded_by_auction = CASE WHEN r.rn = 1 THEN NULL ELSE r.win END " +
+    "FROM lqdt.sold_lots t JOIN r ON r.row_key = t.row_key " +
+    "WHERE ISNULL(r.cur, '~') <> ISNULL(CASE WHEN r.rn = 1 THEN NULL ELSE r.win END, '~')";
+  // A concurrent backfill/cron MERGE can deadlock this UPDATE the same way MERGEs
+  // deadlock each other (see mergeBatch); a lost refresh leaves relists double-counted
+  // in SOLD_CURRENT until the next capture run, so retry the victim (error 1205).
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const r = await pool.request().query(REFRESH_SQL);
+      return { changed: r.rowsAffected[0] ?? 0, ms: Date.now() - t0 };
+    } catch (e) {
+      if (sqlErrorNumber(e) === 1205 && attempt < 3) {
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 /** Latest ET close-date present in the store (YYYY-MM-DD), or null if empty.
@@ -529,6 +563,32 @@ export async function getSoldDaily(fromEt: string, toEt: string): Promise<SoldDa
     gmv: Number(x.gmv ?? 0),
     lots: Number(x.lots ?? 0),
   }));
+}
+
+/**
+ * The ET days in [from,to] the store claims as COMPLETE (a full, non-truncated capture
+ * wrote them — see markSoldCoverage). Row presence alone does not mean a complete day:
+ * a truncated capture persists real-but-partial rows, and serving those as the day's
+ * total is a silent undercount. Readers that blend the store with another source use
+ * this to decide which days the store may speak for. Empty set when the coverage table
+ * predates migration 002 (callers then keep their previous behavior).
+ */
+export async function soldCoveredDays(fromEt: string, toEt: string): Promise<Set<string>> {
+  const pool = await getPool();
+  try {
+    const r = await pool
+      .request()
+      .input("from", sql.Date, new Date(`${fromEt}T00:00:00Z`))
+      .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
+      .query(
+        "SELECT CONVERT(char(10), close_date_et, 23) AS d FROM lqdt.sold_coverage " +
+          "WHERE close_date_et BETWEEN @from AND @to",
+      );
+    return new Set(r.recordset.map((x) => String(x.d)));
+  } catch (error) {
+    if (sqlErrorNumber(error) !== 208) throw error;
+    return new Set();
+  }
 }
 
 export type CategoryDailyRow = { date: string; category: string; gmv: number };

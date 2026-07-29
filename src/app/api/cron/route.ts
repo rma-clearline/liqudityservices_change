@@ -200,21 +200,35 @@ export async function GET(request: Request) {
       // killed — which would drop cron_runs logging and the noon email for every
       // task. On timeout this task is marked failed; the rest of the cron proceeds.
       const timeoutMs = Number(process.env.SOLD_CAPTURE_TIMEOUT_MS) || 45000;
+      const work = (async () => {
+        const fetched = await fetchSoldRange(from, to, { maxPages: 400 });
+        // A truncated fetch still writes its (real) rows but must not claim day
+        // coverage — storeCoversRange would serve the undercount as complete.
+        const { written } = await writeSoldLots(fetched.rows, { markCoverage: !fetched.truncated });
+        return { written, from, to, truncated: fetched.truncated, skipped: false, error: null as string | null };
+      })();
       try {
         return await Promise.race([
-          (async () => {
-            const fetched = await fetchSoldRange(from, to, { maxPages: 400 });
-            const { written } = await writeSoldLots(fetched.rows);
-            return { written, from, to, truncated: fetched.truncated, skipped: false, error: null as string | null };
-          })(),
+          work,
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error("sold_lots capture timeout")), timeoutMs)),
         ]);
       } catch (e) {
+        // The race rejects on timeout but does NOT cancel the fetch+write, which keeps
+        // running on this long-lived container and can MERGE fresh relist rows AFTER
+        // the supersession refresh below — leaving both attempts counted in
+        // SOLD_CURRENT until the next capture run. Chain a follow-up refresh onto the
+        // abandoned write so a late landing re-marks immediately.
+        void work
+          .then(async () => {
+            const s = await refreshSoldSupersession();
+            console.log(`[cron] sold supersession (late capture write): ${s.changed} row(s) re-marked in ${s.ms}ms`);
+          })
+          .catch(() => {});
         return { written: 0, from, to, truncated: false, skipped: false, error: e instanceof Error ? e.message : String(e) };
       }
     },
     (r): SourceSummary => ({
-      status: r.skipped ? "skipped" : r.error ? "failed" : "success",
+      status: r.skipped ? "skipped" : r.error ? "failed" : r.truncated ? "partial" : "success",
       rows: r.written,
       detail: { from: r.from, to: r.to, truncated: r.truncated },
       error: r.error,
@@ -290,7 +304,7 @@ export async function GET(request: Request) {
     }),
   );
 
-  const [listingResult] = await Promise.all([
+  const [listingResult, , , soldCaptureResult] = await Promise.all([
     listingsTask,
     metricsTask,
     auctionsTask,
@@ -304,11 +318,13 @@ export async function GET(request: Request) {
   // after the sold capture and before the forecast snapshot below, because it is what
   // keeps SOLD_CURRENT (the deduped read surface in azure-sql.ts that every aggregation
   // goes through) in step with what was just ingested.
+  let supersessionOk = true;
   if (runSoldCapture && isAzureSqlConfigured()) {
     try {
       const s = await refreshSoldSupersession();
       console.log(`[cron] sold supersession: ${s.changed} row(s) re-marked in ${s.ms}ms`);
     } catch (e) {
+      supersessionOk = false;
       console.error("[cron] sold supersession failed:", e instanceof Error ? e.message : String(e));
     }
   }
@@ -319,6 +335,20 @@ export async function GET(request: Request) {
     "forecast_snapshot",
     async () => {
       if (!runSoldCapture) return { skipped: true, stored: 0, error: null as string | null };
+      if (!supersessionOk) {
+        // A failed refresh means SOLD_CURRENT may still hold both attempts of a relist
+        // just ingested; persisting now would freeze that double count into the snapshot
+        // the dashboard serves. Keep the previous snapshot until a refresh succeeds.
+        return { skipped: false, stored: 0, error: "skipped: supersession refresh failed — snapshot would carry relist double-counts" };
+      }
+      // Same reasoning for a timed-out capture: the race rejected but the write is still
+      // in flight (see the capture task above), so rows can land — unmarked, or as a
+      // half-merged day — while this computes. The chained refresh repairs SOLD_CURRENT
+      // for live readers, but a snapshot written mid-flight would freeze the bad number
+      // for hours, since /api/forecast prefers the stored snapshot. Skip this run.
+      if (soldCaptureResult?.error) {
+        return { skipped: false, stored: 0, error: `skipped: sold capture did not complete (${soldCaptureResult.error}) — snapshot could freeze an in-flight write` };
+      }
       try {
         const payload = await computeRevenueForecast(1);
         if (useAzureData()) {

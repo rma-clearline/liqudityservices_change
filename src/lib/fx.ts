@@ -13,7 +13,7 @@
 import { supabaseAdmin } from "./supabase";
 import { etTodayKey } from "./time";
 import { useAzureData } from "./data-backend";
-import { azUpsertFxRates } from "./azure-tables";
+import { azReadFxRates, azUpsertFxRates } from "./azure-tables";
 
 // Maestro currency codes → ISO codes. Superset of the per-file maps.
 export const CURRENCY_MAP: Record<string, string> = {
@@ -65,6 +65,28 @@ export async function loadFxRates(): Promise<FxRates> {
 
 function emptyRates(): FxRates {
   return { rates: {}, fetchedAt: 0, source: "unavailable", date: etTodayKey() };
+}
+
+/**
+ * Historical rates for [from,to] from the persisted fx_rates audit trail, keyed by ET
+ * date. Lets a backfill convert each lot at the rates in force on its close day rather
+ * than today's snapshot. Best-effort: an empty map when the backend is not Azure, the
+ * table is empty/missing, or the read fails — callers fall back to current rates.
+ */
+export async function loadFxRatesByDate(fromDate: string, toDate: string): Promise<Map<string, FxRates>> {
+  const out = new Map<string, FxRates>();
+  if (!useAzureData()) return out;
+  try {
+    for (const r of await azReadFxRates(fromDate, toDate)) {
+      if (!(r.rate > 0)) continue;
+      let fx = out.get(r.date);
+      if (!fx) out.set(r.date, (fx = { rates: {}, fetchedAt: 0, source: `fx_rates:${r.date}`, date: r.date }));
+      fx.rates[r.currency] = r.rate;
+    }
+  } catch {
+    // The audit trail is best-effort; conversion falls back to current rates.
+  }
+  return out;
 }
 
 /**

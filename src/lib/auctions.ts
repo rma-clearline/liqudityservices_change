@@ -14,7 +14,7 @@ import {
   type Platform,
 } from "./maestro";
 import { dateKeyToUtcDate, enumerateDays, enumerateQuarterLabelsBetween, etDateKey, parseQuarterLabel, quarterBounds } from "./time";
-import { getSoldDaily, isAzureSqlConfigured, type SoldDailyRow } from "./azure-sql";
+import { getSoldDaily, isAzureSqlConfigured, soldCoveredDays, type SoldDailyRow } from "./azure-sql";
 import { useAzureData } from "./data-backend";
 import {
   azUpsertAuctionsOpen,
@@ -459,8 +459,20 @@ function parseSoldListing(platform: Platform, raw: Record<string, unknown>, fx: 
 
   const currency = typeof raw.currencyCode === "string" && raw.currencyCode ? raw.currencyCode : "USD";
   const rawBid = safeNumber(raw.currentBid);
+  // Same corrupt-price guard as parseSale (src/lib/historical-sales.ts): the feed
+  // sometimes leaks `highBidder` (a bidder ID) into the money fields. This path fills
+  // TODAY's GMV until the durable store captures the day, so an unguarded leak here
+  // put the bad number straight into the live headline. A bidder ID is not a price —
+  // drop the USD figures; the native amount stays for audit.
+  const highBidder = raw.highBidder == null ? null : safeNumber(raw.highBidder);
+  const priceIsBidderId = highBidder != null && highBidder > 0 && rawBid === highBidder;
+  if (priceIsBidderId) {
+    console.warn(
+      `[parseSoldListing] dropping bidder-ID price: ${platform}:${assetId} currentBid=${rawBid} == highBidder — row kept, USD amounts nulled`,
+    );
+  }
   const conv = convertToUsd(rawBid, currency, fx);
-  const priceUsd = roundUsd(conv.usd);
+  const priceUsd = priceIsBidderId ? null : roundUsd(conv.usd);
   const endDate = typeof raw.assetAuctionEndDateUtc === "string" ? raw.assetAuctionEndDateUtc : null;
 
   return {
@@ -1039,6 +1051,12 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   }
   const startIso = start.toISOString();
   const endIso = end.toISOString();
+  // The tracked-feed queries are UTC-bounded, but days bucket by ET key: a lot closing
+  // 00:00–04:00 UTC just after `end` still belongs to the range's last ET day (e.g. a
+  // 9:30pm ET sale on the quarter's final day). Fetch one extra UTC day and let the
+  // etDateKey/chartDaySet filters drop anything genuinely outside the range — otherwise
+  // those closes (and their open-auction projections) are counted in neither quarter.
+  const fetchEndIso = new Date(end.getTime() + 86_400_000).toISOString();
   const quarterDays = enumerateDays(start, end);
   const quarterDaySet = new Set(quarterDays);
   const chartDays = quarterDays;
@@ -1050,8 +1068,8 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
       const historical = sumHistoricalPlatform(historicalDailyGmv, platform, quarterDaySet);
       const [closedRaw, openRaw] = useAzureData()
         ? await Promise.all([
-            azFetchAuctionsClosed(platform, startIso, endIso),
-            azFetchAuctionsOpen(platform, nowIso, endIso),
+            azFetchAuctionsClosed(platform, startIso, fetchEndIso),
+            azFetchAuctionsOpen(platform, nowIso, fetchEndIso),
           ])
         : await Promise.all([
             fetchAllAuctionRows((from, to) =>
@@ -1060,7 +1078,7 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
                 .select("asset_id, status, final_price_usd, current_bid_usd, close_time_utc, category, bid_count")
                 .eq("platform", platform)
                 .gte("close_time_utc", startIso)
-                .lt("close_time_utc", endIso)
+                .lt("close_time_utc", fetchEndIso)
                 .in("status", ["closed_sold", "closed_nosale"])
                 .order("close_time_utc", { ascending: false })
                 .range(from, to),
@@ -1072,14 +1090,19 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
                 .eq("platform", platform)
                 .eq("status", "open")
                 .gte("close_time_utc", nowIso)
-                .lt("close_time_utc", endIso)
+                .lt("close_time_utc", fetchEndIso)
                 .order("close_time_utc", { ascending: false })
                 .range(from, to),
             ),
           ]);
 
-      const closed = closedRaw as ClosedAuctionForProjection[];
-      const open = openRaw as OpenAuctionForProjection[];
+      // Trim the +1-UTC-day overfetch (and the pre-range ET-evening rows the UTC
+      // window always included) to the range's actual ET days, so counts, the
+      // projection model, and the per-platform blocks all agree with the
+      // ET-bucketed daily series.
+      const inRangeEt = (iso: string | null) => Boolean(iso && quarterDaySet.has(etDateKey(iso)));
+      const closed = (closedRaw as ClosedAuctionForProjection[]).filter((r) => inRangeEt(r.close_time_utc));
+      const open = (openRaw as OpenAuctionForProjection[]).filter((r) => inRangeEt(r.close_time_utc));
       const sold = closed.filter((r) => r.status === "closed_sold");
       const trackedRealizedGmv = sold.reduce((s, r) => s + (r.final_price_usd ?? 0), 0);
       const realizedSource: "historical_export" | "tracked_auctions" =
@@ -1208,16 +1231,25 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     // retry — pool now warming — usually succeeds. The retry uses a shorter
     // timeout so the worst case stays bounded on a genuinely stalled DB.
     let soldRows: SoldDailyRow[] | null = null;
+    // Days the store claims as COMPLETE. A truncated capture persists real-but-partial
+    // rows, so row presence alone would let the blend serve, say, 60% of a day's lots as
+    // that day's total — an invisible undercount. Read alongside the rows and gate on it.
+    let coveredDays = new Set<string>();
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const attemptMs = attempt === 1 ? timeoutMs : Math.min(timeoutMs, 8000);
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        soldRows = await Promise.race([
-          getSoldDaily(liveDays[0], liveDays[liveDays.length - 1]).finally(() => clearTimeout(timer)),
-          new Promise<SoldDailyRow[]>((_, reject) => {
+        const [rows, covered] = await Promise.race([
+          Promise.all([
+            getSoldDaily(liveDays[0], liveDays[liveDays.length - 1]),
+            soldCoveredDays(liveDays[0], liveDays[liveDays.length - 1]),
+          ]).finally(() => clearTimeout(timer)),
+          new Promise<[SoldDailyRow[], Set<string>]>((_, reject) => {
             timer = setTimeout(() => reject(new Error("sold_lots timeout")), attemptMs);
           }),
         ]);
+        soldRows = rows;
+        coveredDays = covered;
         break; // success
       } catch {
         clearTimeout(timer);
@@ -1244,6 +1276,11 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
         if (bucket.hasHistoricalRealized) continue; // historical days stay on the CSV
         const s = perDay.get(key);
         if (!s) continue; // uncovered live day (e.g. today) → keep the tracked-auctions fill
+        // Rows exist but the day isn't claimed complete (a truncated capture wrote a
+        // partial day) → keep the tracked fill rather than publish the undercount as
+        // that day's realized total. An empty coverage set means the coverage table
+        // predates migration 002; fall back to the previous row-presence behavior.
+        if (coveredDays.size > 0 && !coveredDays.has(key)) continue;
         bucket.realized.all = s.all;
         bucket.realized.domestic = s.domestic;
         bucket.realized.international = s.intl;
@@ -1319,16 +1356,20 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
     // tracked auctions, deduped here so the two platform blocks sum to the
     // headline total instead of ~2x it (cross-listed lots were double-counted).
     const isHistorical = p.realizedSource === "historical_export";
-    // Live quarter realized = durable store's per-site realized on the days it
-    // covers + tracked auctions on the days it doesn't (per-day blend), so the
-    // AllSurplus/GovDeals blocks reconcile with the blended daily headline (GI,
-    // having no block, stays in the total only — as with historical quarters).
-    // When the store isn't in play, storeDays is empty → this is exactly the
-    // deduped tracked-auctions total. Counts/open/projection stay on the tracked
+    // Realized = CSV days (historical quarters) + the store's per-site realized on the
+    // days it covers + tracked auctions on days neither covers — three disjoint sets by
+    // construction (a store/tracked day is one the CSV lacks). For a quarter fully
+    // served by the CSV the last two terms are 0; for the live quarter the first is 0
+    // (when the store isn't in play, storeDays is empty → exactly the deduped
+    // tracked-auctions total). For a BLENDED quarter — e.g. 2026Q2, whose Jun 30
+    // postdates the CSV — this keeps the AllSurplus/GovDeals blocks summing to the
+    // blended daily headline instead of dropping the store-covered day (GI, having no
+    // block, stays in the total only). Counts/open/projection stay on the tracked
     // model (the store carries realized GMV only).
-    const realizedGmv = isHistorical
-      ? p.realizedGmv
-      : soldBySite[p.platform] + dedupAgg(p.platform, trackedUncoveredDay).realizedGmv;
+    const realizedGmv =
+      (isHistorical ? p.realizedGmv : 0) +
+      soldBySite[p.platform] +
+      dedupAgg(p.platform, trackedUncoveredDay).realizedGmv;
     const auctionsSold = isHistorical ? p.auctionsSold : agg.soldCount;
     const auctionsClosed = isHistorical ? p.closed.length : agg.closedCount;
     const openCount = isHistorical ? p.open.length : agg.openCount;

@@ -16,7 +16,7 @@ import "server-only";
 // complete slice.
 
 import { randomUUID } from "node:crypto";
-import { loadFxRates } from "./fx";
+import { loadFxRates, loadFxRatesByDate, type FxRates } from "./fx";
 import { buildSoldPayload, extractListings, MAESTRO_KEY, MAESTRO_URL, SOLD_SEARCH_PATH } from "./maestro";
 import { dateKeyToUtcDate, dateRangeForEtDay, etDateKey, etMonthKey, etQuarterKey, etWeekKey } from "./time";
 import { classifySellerLevel, type GovLevel } from "./gov-seller";
@@ -84,6 +84,26 @@ const CONCURRENCY = Number(process.env.GMV_EXPORT_CONCURRENCY) || 5;
 type PageResult = { rows: Record<string, unknown>[]; total: number; ok: boolean };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const addDaysKey = (dateKey: string, days: number): string => {
+  const d = new Date(`${dateKey}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+};
+
+/** Audited rates for the lot's close day, or the nearest earlier audited day within a
+ *  week (rates are persisted daily, so a gap means the cron missed days). Null → the
+ *  caller falls back to the current snapshot. */
+function fxForCloseDate(byDate: Map<string, FxRates>, dateKey: string): FxRates | null {
+  if (byDate.size === 0) return null;
+  let d = dateKey;
+  for (let i = 0; i < 7; i += 1) {
+    const fx = byDate.get(d);
+    if (fx) return fx;
+    d = addDaysKey(d, -1);
+  }
+  return null;
+}
 
 async function fetchPageOnce(fromIso: string, toIso: string, page: number): Promise<PageResult> {
   try {
@@ -207,6 +227,23 @@ export async function fetchSoldRange(
   if (!MAESTRO_KEY) throw new Error("MAESTRO_API_KEY is not configured");
 
   const fx = await loadFxRates();
+  // FX guard: with no rates at all (cold process + rate API down), every non-USD lot
+  // would parse to sale_amount_usd=null — and the idempotent MERGE would then overwrite
+  // previously-CORRECT stored USD amounts with null, a silent GMV undercount that
+  // persists until the window is re-captured. Refuse the whole fetch instead; callers
+  // surface a clean, retryable error and no write happens.
+  if (Object.keys(fx.rates).length === 0) {
+    throw new Error("FX rates unavailable — cannot convert non-USD lots; retry once the rate feed recovers.");
+  }
+  // Close-date FX: convert each lot at the rates in force on its ET close day (from the
+  // persisted fx_rates audit trail), not today's snapshot, so re-capturing an old window
+  // doesn't drift every non-USD lot by the FX move since it closed. Per-lot fallback:
+  // nearest earlier audited day within a week, else the current snapshot.
+  const fxByDate = await loadFxRatesByDate(addDaysKey(from, -6), to);
+  // The audit trail persists only the tracked currencies; overlay each day's rates on
+  // the full current snapshot so a currency missing from that day's audit rows still
+  // converts (at the snapshot rate) instead of nulling out.
+  for (const [d, dayFx] of fxByDate) fxByDate.set(d, { ...dayFx, rates: { ...fx.rates, ...dayFx.rates } });
   const chunks = chunkRange(from, to);
   if (chunks.length === 0) {
     return { rows: [], total_in_range: 0, fetched: 0, truncated: false };
@@ -265,7 +302,7 @@ export async function fetchSoldRange(
     const closeIso = typeof raw.assetAuctionEndDateUtc === "string" ? raw.assetAuctionEndDateUtc : "";
     const closeDateEt = etDateKey(closeIso);
     if (!closeDateEt || closeDateEt < from || closeDateEt > to) continue; // guard to the ET range
-    const base = parseSale(raw, fx);
+    const base = parseSale(raw, fxForCloseDate(fxByDate, closeDateEt) ?? fx);
     const gov_level = classifySellerLevel(base.seller);
     rows.push({
       ...base,

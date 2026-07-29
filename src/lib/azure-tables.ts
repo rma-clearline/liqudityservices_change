@@ -428,6 +428,19 @@ export async function azUpsertFxRates(rows: readonly object[]): Promise<number> 
   return runJsonWrite(upsertMergeSql("lqdt.fx_rates", FX_COLS, ["date", "currency"]), dedupBy(rows, key));
 }
 
+/** Historical daily rates for [from,to] (ET date keys, inclusive). `rate` is the same
+ *  units-per-USD divisor persistFxRates stores (the column name usd_per_unit predates
+ *  the convention; the VALUE has always been units per USD). */
+export async function azReadFxRates(fromDate: string, toDate: string): Promise<{ date: string; currency: string; rate: number }[]> {
+  const pool = await getPool();
+  const res = await pool
+    .request()
+    .input("from", sql.NVarChar(10), fromDate)
+    .input("to", sql.NVarChar(10), toDate)
+    .query("SELECT [date], currency, usd_per_unit FROM lqdt.fx_rates WHERE [date] BETWEEN @from AND @to ORDER BY [date]");
+  return res.recordset.map((r) => ({ date: String(r.date), currency: String(r.currency), rate: Number(r.usd_per_unit) }));
+}
+
 // --- cron_runs insert (best-effort; detail is JSON) ---
 export async function azInsertCronRuns(rows: readonly object[]): Promise<number> {
   if (rows.length === 0) return 0;

@@ -68,10 +68,28 @@ function withTimeout<T>(p: Promise<T>, label: string): Promise<T> {
   ]);
 }
 
+// Maestro's sold archive is a rolling ~12 months; days older than this many days ago
+// exist ONLY in the durable store (and the CSV). A Maestro fallback for such a range
+// would silently return nothing for those days — dropped GMV served as a complete
+// result — so a failed store read on such a range must surface as retryable instead.
+const MAESTRO_ARCHIVE_SAFE_DAYS = Number(process.env.MAESTRO_ARCHIVE_SAFE_DAYS) || 330;
+
+class StoreUnavailableError extends Error {
+  code = "store_unavailable" as const;
+  constructor(from: string, to: string, cause: string) {
+    super(
+      `The sold-lot store is temporarily unreachable (${cause}) and ${from}..${to} reaches ` +
+        `beyond the live archive, so a live fallback would silently drop the oldest days. Retry in a moment.`,
+    );
+    this.name = "StoreUnavailableError";
+  }
+}
+
 // Prefer the durable Azure store, but ONLY for a range it FULLY covers (every ET
 // day present) — otherwise a leading/interior gap would be served as a complete $0
 // result. Fall back to the live Maestro feed when the store is unconfigured, doesn't
-// fully cover the range, or is unreachable/slow within the timeout.
+// fully cover the range, or is unreachable/slow within the timeout — EXCEPT when the
+// range needs days only the store still holds (see StoreUnavailableError).
 async function loadSoldRows(from: string, to: string, filters: ExportFilters): Promise<SoldSource> {
   if (isAzureSqlConfigured()) {
     const readFilters = {
@@ -109,7 +127,15 @@ async function loadSoldRows(from: string, to: string, filters: ExportFilters): P
       // Too-large means "split the window" — Maestro can't serve it either (the
       // live path would just refuse it again after wasted probes), so surface it.
       if (e instanceof RangeTooLargeError) throw e;
-      // store unreachable / slow / partial → fall through to Maestro
+      // A store FAILURE (timeout/unreachable — distinct from "range not covered",
+      // which returns null above) on a range reaching past the live archive would
+      // fall back to a silently-incomplete result: Maestro no longer holds the
+      // oldest days. Fail retryable instead of quietly dropping their GMV.
+      const horizon = new Date(Date.now() - MAESTRO_ARCHIVE_SAFE_DAYS * 86_400_000).toISOString().slice(0, 10);
+      if (from < horizon) {
+        throw new StoreUnavailableError(from, to, e instanceof Error ? e.message : String(e));
+      }
+      // store unreachable / slow on a recent range → fall through to Maestro
     }
   }
   const f = await fetchSoldRange(from, to, { maxRows: LIVE_FALLBACK_MAX_LOTS });
@@ -287,8 +313,10 @@ export async function GET(request: Request) {
       live = await loadSoldRows(liveFrom, to, filters);
     } catch (e) {
       // A range too large to fetch live in one request → clean, retryable 503 so the
-      // client re-requests it as smaller complete slices. Anything else → 502.
-      if (e instanceof RangeTooLargeError) {
+      // client re-requests it as smaller complete slices. A store outage on a range
+      // only the store can serve → also a retryable 503 (never a silently-incomplete
+      // CSV). Anything else → 502.
+      if (e instanceof RangeTooLargeError || e instanceof StoreUnavailableError) {
         return NextResponse.json({ error: e.message, code: e.code }, { status: 503 });
       }
       return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 502 });

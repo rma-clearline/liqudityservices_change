@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { categoryByPeriod, fetchSoldRange, type ExportPeriod } from "@/lib/sold-export";
-import { getCategoryDaily, isAzureSqlConfigured } from "@/lib/azure-sql";
+import { getCategoryDaily, isAzureSqlConfigured, soldCoveredDays } from "@/lib/azure-sql";
 import { ttlCache } from "@/lib/cache";
 import { etTodayKey, quarterBounds } from "@/lib/time";
 
@@ -72,8 +72,12 @@ export async function GET(request: Request) {
       if (daily.length > 0) {
         const rows = daily.map((d) => ({ category: d.category, close_date_et: d.date, sale_amount_usd: d.gmv }));
         const { categories, data } = categoryByPeriod(rows, period, SERVER_TOPN);
-        // Store data is complete (not a value-ranked sample), so truncated=false.
-        return NextResponse.json({ from, to, period, categories, data, truncated: false, source: "store" });
+        // Store data is not a value-ranked sample, but a day whose capture was truncated
+        // holds real-but-partial rows — so report completeness from sold_coverage rather
+        // than asserting it. (Empty set = coverage table predates migration 002.)
+        const covered = await soldCoveredDays(from, to).catch(() => new Set<string>());
+        const partial = covered.size > 0 && daily.some((d) => !covered.has(d.date));
+        return NextResponse.json({ from, to, period, categories, data, truncated: partial, source: "store" });
       }
       // Store has no rows for this range (e.g. entirely pre-store) — fall through.
     }
