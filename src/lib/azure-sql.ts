@@ -46,7 +46,12 @@ function sqlConfig(): sql.config {
       requestTimeout: 120_000,
       useUTC: true,
     },
-    pool: { max: 4, min: 0, idleTimeoutMillis: 30_000 },
+    // max must exceed the number of connections any single background job can hold
+    // at once, or that job starves the request path: a long analytics refresh once
+    // held 3 of 4 slots for its full 120s requestTimeout, so the forecast's
+    // getSoldDaily could not get a connection inside its 25s budget and the live
+    // quarter silently reverted to the sparse tracked feed (8x too small).
+    pool: { max: 12, min: 0, idleTimeoutMillis: 30_000 },
   };
 }
 
@@ -1161,11 +1166,13 @@ export async function readFeeAnalytics(): Promise<FeeAnalytics | null> {
 /** Recompute the heavy fee aggregations and store them. Cron-only — takes minutes. */
 export async function refreshFeeAnalytics(fromEt: string): Promise<{ ok: boolean; ms: number }> {
   const t0 = Date.now();
-  const [quarterlyFees, measuredByQuarter, patterns] = await Promise.all([
-    getQuarterlyFeesBySite(fromEt),
-    getMeasuredTakeByQuarter(fromEt),
-    getFeePatterns(fromEt),
-  ]);
+  // SEQUENTIAL, not Promise.all: each of these is a minutes-long aggregation, and
+  // running them concurrently held three pool connections for the whole refresh,
+  // starving the request path (see the pool.max note in sqlConfig). One at a time
+  // costs the same total DTU and leaves the rest of the pool free.
+  const quarterlyFees = await getQuarterlyFeesBySite(fromEt);
+  const measuredByQuarter = await getMeasuredTakeByQuarter(fromEt);
+  const patterns = await getFeePatterns(fromEt);
   const pool = await getPool();
   await ensureAnalyticsTable(pool);
   await pool

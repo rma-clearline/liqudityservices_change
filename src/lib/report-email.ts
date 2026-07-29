@@ -93,6 +93,9 @@ type ReportData = {
   snapshot: HeadlineSnapshot | null;
   /** Highest-value QTD sold lots (≥ threshold), newest-priced first, + total ≥ threshold. */
   topLots: { lots: TopSoldLot[]; total: number } | null;
+  /** True when the forecast's sold-store read failed, so the live quarter fell back to
+   *  the sparse tracked feed. Every QTD figure is then far too small — do NOT send. */
+  storeDegraded: boolean;
 };
 
 async function loadReportData(todayKey: string): Promise<ReportData> {
@@ -100,7 +103,18 @@ async function loadReportData(todayKey: string): Promise<ReportData> {
   // Full-history forecast (quarter="ALL") — the QTD math needs prior-year daily
   // and the last reported quarters (for the auto capture rate), so the current-
   // quarter forecast snapshot is NOT enough. Matches what the /qtd page fetches.
-  const base = await computeRevenueForecast(1, "ALL");
+  //
+  // A degraded run (sold-store read failed) collapses the live quarter to the sparse
+  // tracked auctions feed, which understates QTD GMV ~8x and turns a +42% Y/Y into
+  // -84%. That is worse than no report, so retry once before giving up and let the
+  // caller refuse to send. Root cause was pool starvation by a concurrent analytics
+  // refresh (fixed), but the guard has to hold for any future store stall.
+  let base = await computeRevenueForecast(1, "ALL");
+  if (base.store_degraded) {
+    console.warn("[report-email] forecast store read degraded — retrying once before refusing to send");
+    await new Promise((r) => setTimeout(r, 5_000));
+    base = await computeRevenueForecast(1, "ALL");
+  }
 
   const [reportedGmv, estimates, metrics, listingRows] = await Promise.all([
     import("@/lib/reported-gmv").then((m) => m.loadReportedQuarterlyGmv()),
@@ -206,6 +220,7 @@ async function loadReportData(todayKey: string): Promise<ReportData> {
     daysBehind,
     snapshot,
     topLots,
+    storeDegraded: Boolean(base.store_degraded),
   };
 }
 
@@ -501,6 +516,12 @@ export async function sendReportEmail({
   if (recipients.length === 0) return { success: false, error: "no recipients" };
 
   const data = await loadReportData(date);
+
+  // Refuse to mail QTD figures computed off the fallback feed — a wrong number sent to
+  // an analyst is worse than a missed report. The cron logs this as a failed email step.
+  if (data.storeDegraded) {
+    return { success: false, error: "sold-store read degraded (QTD would understate ~8x) — send skipped" };
+  }
 
   // Charts — each independent; failure degrades to text.
   const attachments: { filename: string; content: string; content_type: string; contentId: string }[] = [];

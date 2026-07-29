@@ -297,17 +297,6 @@ export async function GET(request: Request) {
     sellerFeeTask,
   ]);
 
-  // Precompute the Take Rate page's fee analytics into lqdt.analytics_cache. The
-  // underlying sold_lots ⋈ seller_fees aggregation takes ~2.5 min on this tier, so it can
-  // neither run on a request path nor block the cron response — it is fired and forgotten
-  // on the long-running container, and a failure just leaves the previous snapshot in place.
-  if (runSoldCapture && isAzureSqlConfigured()) {
-    const analyticsFrom = new Date(Date.now() - 730 * 86_400_000).toISOString().slice(0, 10);
-    void refreshFeeAnalytics(analyticsFrom)
-      .then((r) => console.log(`[cron] fee_analytics refreshed in ${r.ms}ms`))
-      .catch((e) => console.error("[cron] fee_analytics failed:", e instanceof Error ? e.message : String(e)));
-  }
-
   // Materialize the current forecast while Azure SQL is already awake. Normal
   // dashboard views then read one small Supabase row instead of waking SQL.
   await logger.track(
@@ -386,6 +375,21 @@ export async function GET(request: Request) {
     logger.push("email", emailResult.success ? "success" : "failed", null, { charts: emailResult.charts, headline: emailResult.headline ?? null }, emailResult.error ?? null);
   } else {
     logger.push("email", "skipped", null, null, emailResult.error ?? null);
+  }
+
+  // Precompute the Take Rate page's fee analytics into lqdt.analytics_cache. The
+  // underlying sold_lots ⋈ seller_fees aggregation takes ~2.5 min on this tier, so it can
+  // neither run on a request path nor block the cron response — it is fired and forgotten
+  // on the long-running container, and a failure just leaves the previous snapshot in place.
+  //
+  // Fired LAST, after the report email: it used to run before the forecast snapshot and
+  // the email, and its (then concurrent) queries starved the pool so the email's
+  // getSoldDaily timed out and mailed a live quarter collapsed to the sparse tracked feed.
+  if (runSoldCapture && isAzureSqlConfigured()) {
+    const analyticsFrom = new Date(Date.now() - 730 * 86_400_000).toISOString().slice(0, 10);
+    void refreshFeeAnalytics(analyticsFrom)
+      .then((r) => console.log(`[cron] fee_analytics refreshed in ${r.ms}ms`))
+      .catch((e) => console.error("[cron] fee_analytics failed:", e instanceof Error ? e.message : String(e)));
   }
 
   const runs = await logger.flush();
