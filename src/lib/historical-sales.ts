@@ -137,6 +137,25 @@ export function parseSale(raw: Record<string, unknown>, fx: Awaited<ReturnType<t
   const openingNative = raw.assetBidPrice == null ? null : safeNumber(raw.assetBidPrice);
   const openingUsd = openingNative == null ? null : convertToUsd(openingNative, currencyCode, fx).usd;
 
+  // Corrupt-price guard. The feed sometimes leaks `highBidder` (a bidder ID) into the
+  // money fields: GD asset 1093/5701 auction 2 came back with currentBid == assetBidPrice
+  // == highBidder == 3218754 on a scrap truck that actually sold for $946, and that one
+  // row added $3.2M (3.8%) to July GMV and topped the report's biggest-lots table.
+  // A bidder ID is not a price, so the USD figures — the only fields any GMV/take-rate
+  // aggregation reads — are dropped. Nothing else is: the row is still ingested and the
+  // raw feed numbers stay in the _native columns, so the lot is never lost and the bad
+  // value stays auditable. Falling back to assetBidPrice is useless here (it was corrupt
+  // too). Exact equality against a positive bidder ID keeps false positives negligible;
+  // the warning makes any we do hit visible in the cron logs.
+  const highBidder = raw.highBidder == null ? null : safeNumber(raw.highBidder);
+  const priceIsBidderId = highBidder != null && highBidder > 0 && nativeAmount === highBidder;
+  if (priceIsBidderId) {
+    console.warn(
+      `[parseSale] dropping bidder-ID price: ${rowKey(raw)} currentBid=${nativeAmount} == highBidder — ` +
+        `row kept, USD amounts nulled (${safeString(raw, ["assetShortDescription"])})`,
+    );
+  }
+
   return {
     // platform is the row's true marketplace (AD/GD/GI), not the AD-site query.
     platform: typeof raw.businessId === "string" ? raw.businessId : "",
@@ -152,11 +171,11 @@ export function parseSale(raw: Record<string, unknown>, fx: Awaited<ReturnType<t
     close_time_display: typeof raw.assetAuctionEndDateDisplay === "string" ? raw.assetAuctionEndDateDisplay : "",
     currency_code: currencyCode,
     sale_amount_native: nativeAmount,
-    sale_amount_usd: usd === null ? null : Math.round(usd * 100) / 100,
+    sale_amount_usd: priceIsBidderId || usd === null ? null : Math.round(usd * 100) / 100,
     bid_count: safeNumber(raw.bidCount),
     url: saleUrl(raw),
     opening_bid_native: openingNative,
-    opening_bid_usd: openingUsd == null ? null : Math.round(openingUsd * 100) / 100,
+    opening_bid_usd: priceIsBidderId || openingUsd == null ? null : Math.round(openingUsd * 100) / 100,
     is_sold_auction: typeof raw.isSoldAuction === "boolean" ? raw.isSoldAuction : null,
     asset_status_cd: safeString(raw, ["assetStatusCd"]) || null,
     start_time_et:
