@@ -62,6 +62,17 @@ export function getPool(): Promise<sql.ConnectionPool> {
   if (!poolPromise) {
     poolPromise = new sql.ConnectionPool(sqlConfig())
       .connect()
+      .then(async (pool) => {
+        // Every read goes through SOLD_CURRENT, which references superseded_by_auction,
+        // so the column has to exist before any query runs — including on a fresh
+        // database where the cron hasn't run yet. Non-fatal on purpose: a DDL failure
+        // must not take the pool (and every write with it) down, and the resulting
+        // "invalid column name" is self-describing.
+        await ensureSupersession(pool).catch((e) =>
+          console.error("[azure-sql] ensureSupersession failed:", e instanceof Error ? e.message : String(e)),
+        );
+        return pool;
+      })
       .catch((e) => {
         poolPromise = null; // let the next call retry a fresh connection
         throw e;
@@ -356,7 +367,83 @@ export async function writeSoldLots(rows: SoldExportRow[]): Promise<{ written: n
   return { written: unique.length - skipped, skipped };
 }
 
-/** Latest ET close-date present in the store (YYYY-MM-DD), or null if empty. */
+// --- relist supersession ----------------------------------------------------
+//
+// An asset that sells but doesn't complete (bidder defaults, sale voided) is relisted
+// and sold again under a NEW auctionId. row_key is site:account:asset:auction, so every
+// attempt persists as its own row and all of them counted toward GMV — the same 2015
+// F-150 appeared three times (auction 1 $1,946, auction 2 $3,218,754, auction 3 $946).
+// LSI counts "transactions for which we earned compensation upon their completion", so
+// only the final sale is real GMV.
+//
+// This never showed up before 2026Q2 because the Maestro sold search returns only the
+// LATEST auction record per asset: the one-pass historical backfill was deduped by the
+// source, while daily captures accumulate each relist. Deduping to the latest sale both
+// fixes GMV and restores comparability with the backfilled quarters.
+//
+// Implementation: a persisted `superseded_by_auction` marker, plus SOLD_CURRENT below as
+// the single read surface. Rows are only ever MARKED — never deleted or nulled — so every
+// relist attempt stays fully intact in the base table for audit.
+//
+// SOLD_CURRENT is a derived table rather than a real view because lqdt_app has ALTER on
+// the schema but not database-level CREATE VIEW ("CREATE VIEW permission denied"). The
+// optimizer folds the predicate into the scan either way, and keeping the rule in one
+// constant means a query cannot accidentally read the undeduped table.
+const SOLD_CURRENT = "(SELECT * FROM lqdt.sold_lots WHERE superseded_by_auction IS NULL)";
+
+let supersessionEnsured = false;
+async function ensureSupersession(pool: sql.ConnectionPool): Promise<void> {
+  if (supersessionEnsured) return;
+  await pool
+    .request()
+    .batch(
+      "IF COL_LENGTH('lqdt.sold_lots', 'superseded_by_auction') IS NULL " +
+        "ALTER TABLE lqdt.sold_lots ADD superseded_by_auction nvarchar(64) NULL;",
+    );
+  supersessionEnsured = true;
+}
+
+/**
+ * Recompute which sold rows are superseded by a later sale of the same asset. Scoped to
+ * assets that actually have more than one row, and idempotent + arrival-order independent
+ * (it ranks by close_time_utc, so a late-arriving older record can't win). Cheap enough
+ * to run after every sold capture: one aggregate to find multi-row assets, then a keyed
+ * update of only the rows whose marker actually changes.
+ */
+export async function refreshSoldSupersession(): Promise<{ changed: number; ms: number }> {
+  const t0 = Date.now();
+  const pool = await getPool();
+  await ensureSupersession(pool);
+  // Candidate assets: any with more than one sold row, PLUS any single-row asset that
+  // still carries a marker. Without that second arm a marker could never be cleared once
+  // its duplicate went away (retention prune, or a corrected row_key), and the surviving
+  // sale would stay excluded from GMV forever.
+  //
+  // Ranking is close_time_utc first — the actual sale time, so a late-arriving OLDER
+  // record can't win and the result doesn't depend on ingest order. auction_id only
+  // breaks exact close-time ties, and is cast so '10' outranks '9' rather than sorting
+  // lexicographically (no such ties exist today; this keeps it correct if they appear).
+  const r = await pool.request().query(
+    "WITH d AS (SELECT site, account_id, asset_id FROM lqdt.sold_lots " +
+      "GROUP BY site, account_id, asset_id " +
+      "HAVING COUNT(*) > 1 OR MAX(CASE WHEN superseded_by_auction IS NOT NULL THEN 1 ELSE 0 END) = 1), " +
+      "r AS (SELECT s.row_key, s.superseded_by_auction AS cur, " +
+      "ROW_NUMBER() OVER (PARTITION BY s.site, s.account_id, s.asset_id " +
+      "ORDER BY s.close_time_utc DESC, TRY_CAST(s.auction_id AS bigint) DESC, s.auction_id DESC) AS rn, " +
+      "FIRST_VALUE(s.auction_id) OVER (PARTITION BY s.site, s.account_id, s.asset_id " +
+      "ORDER BY s.close_time_utc DESC, TRY_CAST(s.auction_id AS bigint) DESC, s.auction_id DESC) AS win " +
+      "FROM lqdt.sold_lots s JOIN d ON d.site = s.site AND d.account_id = s.account_id AND d.asset_id = s.asset_id) " +
+      "UPDATE t SET superseded_by_auction = CASE WHEN r.rn = 1 THEN NULL ELSE r.win END " +
+      "FROM lqdt.sold_lots t JOIN r ON r.row_key = t.row_key " +
+      "WHERE ISNULL(r.cur, '~') <> ISNULL(CASE WHEN r.rn = 1 THEN NULL ELSE r.win END, '~')",
+  );
+  return { changed: r.rowsAffected[0] ?? 0, ms: Date.now() - t0 };
+}
+
+/** Latest ET close-date present in the store (YYYY-MM-DD), or null if empty.
+ *  Deliberately reads the base table, and the answer is provably the same either way: a
+ *  superseded row always has a successor with a LATER close_time_utc, hence a close_date
+ *  that is equal or later, so it can never be the store's maximum on its own. */
 export async function latestSoldDate(): Promise<string | null> {
   const pool = await getPool();
   const r = await pool
@@ -374,7 +461,7 @@ export async function soldCoverage(fromEt: string, toEt: string): Promise<{ lots
     .input("to", sql.Date, new Date(`${toEt}T00:00:00Z`))
     .query(
       "SELECT COUNT(*) AS lots, COALESCE(SUM(sale_amount_usd),0) AS gmv, COUNT(DISTINCT close_date_et) AS days " +
-        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to",
+        `FROM ${SOLD_CURRENT} AS sl WHERE close_date_et BETWEEN @from AND @to`,
     );
   const row = r.recordset[0] ?? {};
   return { lots: Number(row.lots ?? 0), gmv: Number(row.gmv ?? 0), days: Number(row.days ?? 0) };
@@ -432,7 +519,7 @@ export async function getSoldDaily(fromEt: string, toEt: string): Promise<SoldDa
         "COALESCE(market,'domestic') AS market, " +
         "COALESCE(SUM(sale_amount_usd),0) AS gmv, " +
         "SUM(CASE WHEN sale_amount_usd > 0 THEN 1 ELSE 0 END) AS lots " +
-        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to " +
+        `FROM ${SOLD_CURRENT} AS sl WHERE close_date_et BETWEEN @from AND @to ` +
         "GROUP BY close_date_et, site, COALESCE(market,'domestic')",
     );
   return r.recordset.map((x) => ({
@@ -463,7 +550,7 @@ export async function getCategoryDaily(fromEt: string, toEt: string): Promise<Ca
       "SELECT CONVERT(char(10), close_date_et, 23) AS d, " +
         "COALESCE(NULLIF(LTRIM(RTRIM(category)), ''), 'Uncategorized') AS category, " +
         "COALESCE(SUM(sale_amount_usd), 0) AS gmv " +
-        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to AND sale_amount_usd > 0 " +
+        `FROM ${SOLD_CURRENT} AS sl WHERE close_date_et BETWEEN @from AND @to AND sale_amount_usd > 0 ` +
         "GROUP BY close_date_et, COALESCE(NULLIF(LTRIM(RTRIM(category)), ''), 'Uncategorized')",
     );
   return r.recordset.map((x) => ({
@@ -595,7 +682,7 @@ export async function getSoldDailyByBucket(fromEt: string, toEt: string): Promis
         "COALESCE(SUM(sale_amount_usd),0) AS gmv, " +
         "SUM(CASE WHEN sale_amount_usd > 0 THEN 1 ELSE 0 END) AS lots, " +
         "COALESCE(SUM(CAST(bid_count AS bigint)),0) AS bids " +
-        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to " +
+        `FROM ${SOLD_CURRENT} AS sl WHERE close_date_et BETWEEN @from AND @to ` +
         "GROUP BY CONVERT(char(10), close_date_et, 23), site, seller_type, category_code, category",
     );
   // Accumulate the grouped rows into (date, bucket) totals.
@@ -782,7 +869,7 @@ export async function countSoldLots(
 ): Promise<number> {
   const pool = await getPool();
   const { request, where } = buildSoldLotRequest(pool, fromEt, toEt, filters);
-  const r = await request.query(`SELECT COUNT(*) AS n FROM lqdt.sold_lots WHERE ${where}`);
+  const r = await request.query(`SELECT COUNT(*) AS n FROM ${SOLD_CURRENT} AS sl WHERE ${where}`);
   return Number(r.recordset[0]?.n ?? 0);
 }
 
@@ -799,7 +886,7 @@ export async function readSoldLots(
         "bid_count, url, close_time_utc, CONVERT(char(10), close_date_et, 23) AS close_date_et, " +
         "opening_bid_native, opening_bid_usd, is_sold_auction, asset_status_cd, start_time_et, " +
         "category_code, category_routepath " +
-        `FROM lqdt.sold_lots WHERE ${where}`,
+        `FROM ${SOLD_CURRENT} AS sl WHERE ${where}`,
     );
   return r.recordset.map((x): SoldExportRow => {
     const closeIso = x.close_time_utc instanceof Date ? x.close_time_utc.toISOString() : (x.close_time_utc ?? "");
@@ -878,7 +965,7 @@ export async function getTopSoldLots(
         "CONVERT(char(10), close_date_et, 23) AS close_date_et, sale_amount_usd, " +
         "asset_id, account_id, auction_id, " +
         "COUNT(*) OVER () AS total_matching " +
-        "FROM lqdt.sold_lots WHERE close_date_et BETWEEN @from AND @to AND sale_amount_usd >= @min " +
+        `FROM ${SOLD_CURRENT} AS sl WHERE close_date_et BETWEEN @from AND @to AND sale_amount_usd >= @min ` +
         "ORDER BY sale_amount_usd DESC",
     );
   const lots: TopSoldLot[] = r.recordset.map((x) => ({
@@ -953,7 +1040,7 @@ export async function getDistinctSellersForFees(
         "CONVERT(char(10), close_date_et, 23) AS close_date_et, " +
         "ROW_NUMBER() OVER (PARTITION BY site, account_id ORDER BY sale_amount_usd DESC, asset_id) AS rn, " +
         "SUM(sale_amount_usd) OVER (PARTITION BY site, account_id) AS seller_gmv " +
-        "FROM lqdt.sold_lots " +
+        `FROM ${SOLD_CURRENT} AS sl ` +
         "WHERE close_date_et >= @from AND account_id IS NOT NULL AND account_id <> '' AND asset_id IS NOT NULL" +
         ") t WHERE rn = 1 " +
         // Biggest sellers first: coverage is GMV-weighted, so the top-GMV sellers matter
@@ -1025,7 +1112,7 @@ export async function getBlendedAdminFee(
         "SUM(CASE WHEN f.buyer_premium_percent IS NOT NULL THEN l.sale_amount_usd * f.buyer_premium_percent / 100.0 ELSE 0 END) AS premium_usd, " +
         "SUM(CASE WHEN f.buyer_premium_percent IS NOT NULL THEN l.sale_amount_usd ELSE 0 END) AS premium_covered_gmv, " +
         "SUM(l.sale_amount_usd) AS total_gmv " +
-        "FROM lqdt.sold_lots l LEFT JOIN lqdt.seller_fees f ON f.site = l.site AND f.account_id = l.account_id " +
+        `FROM ${SOLD_CURRENT} AS l LEFT JOIN lqdt.seller_fees f ON f.site = l.site AND f.account_id = l.account_id ` +
         "WHERE l.close_date_et BETWEEN @from AND @to",
     );
   const x = r.recordset[0] ?? {};
@@ -1070,7 +1157,7 @@ async function feeBuckets(dimSql: string, minGmv: number, limit: number, extraWh
       "SUM(l.sale_amount_usd*f.buyer_premium_percent/100.0) AS prem_usd, " +
       "SUM(l.sale_amount_usd*COALESCE(f.admin_fee_percent,0)/100.0) AS admin_usd, " +
       "SUM(l.sale_amount_usd*(1+f.buyer_premium_percent/100.0)) AS incl_gmv " +
-      "FROM lqdt.sold_lots l JOIN lqdt.seller_fees f ON f.site=l.site AND f.account_id=l.account_id " +
+      `FROM ${SOLD_CURRENT} AS l JOIN lqdt.seller_fees f ON f.site=l.site AND f.account_id=l.account_id ` +
       `WHERE f.buyer_premium_percent IS NOT NULL ${extraWhere}` +
       `GROUP BY ${dimSql} HAVING SUM(l.sale_amount_usd) > ${minGmv} ORDER BY SUM(l.sale_amount_usd) DESC`,
   );
@@ -1218,7 +1305,7 @@ export async function getQuarterlyFeesBySite(fromEt: string): Promise<QuarterlyF
         "SUM(CASE WHEN f.buyer_premium_percent IS NOT NULL THEN l.sale_amount_usd*COALESCE(f.admin_fee_percent,0)/100.0 ELSE 0 END) AS adm, " +
         "SUM(CASE WHEN f.buyer_premium_percent IS NOT NULL THEN l.sale_amount_usd*(1+f.buyer_premium_percent/100.0) ELSE 0 END) AS incl, " +
         "COUNT(*) AS lots " +
-        "FROM lqdt.sold_lots l LEFT JOIN lqdt.seller_fees f ON f.site=l.site AND f.account_id=l.account_id " +
+        `FROM ${SOLD_CURRENT} AS l LEFT JOIN lqdt.seller_fees f ON f.site=l.site AND f.account_id=l.account_id ` +
         "WHERE l.close_date_et >= @from " +
         "GROUP BY CONCAT(YEAR(l.close_date_et),'Q',DATEPART(QUARTER,l.close_date_et)), l.site " +
         "ORDER BY quarter, l.site",
@@ -1253,7 +1340,7 @@ export async function getMeasuredTakeByQuarter(fromEt: string): Promise<Measured
         "CASE WHEN l.site='GD' THEN 'gd' ELSE 'cag' END AS grp, " +
         "SUM(l.sale_amount_usd) AS gmv, SUM(l.sale_amount_usd*(1+f.buyer_premium_percent/100.0)) AS incl_gmv, " +
         "SUM(l.sale_amount_usd*(f.buyer_premium_percent+COALESCE(f.admin_fee_percent,0))/100.0) AS fee_usd " +
-        "FROM lqdt.sold_lots l JOIN lqdt.seller_fees f ON f.site=l.site AND f.account_id=l.account_id " +
+        `FROM ${SOLD_CURRENT} AS l JOIN lqdt.seller_fees f ON f.site=l.site AND f.account_id=l.account_id ` +
         "WHERE f.buyer_premium_percent IS NOT NULL AND l.close_date_et >= @from " +
         "GROUP BY CONCAT(YEAR(l.close_date_et),'Q',DATEPART(QUARTER,l.close_date_et)), CASE WHEN l.site='GD' THEN 'gd' ELSE 'cag' END",
     );
@@ -1307,7 +1394,7 @@ export async function getAdminFeeBySite(
         "SUM(CASE WHEN f.buyer_premium_percent IS NOT NULL THEN l.sale_amount_usd ELSE 0 END) AS premium_covered_gmv, " +
         "SUM(l.sale_amount_usd) AS total_gmv, " +
         "COUNT(DISTINCT CASE WHEN f.admin_fee_percent IS NOT NULL THEN l.account_id END) AS covered_sellers " +
-        "FROM lqdt.sold_lots l LEFT JOIN lqdt.seller_fees f ON f.site = l.site AND f.account_id = l.account_id " +
+        `FROM ${SOLD_CURRENT} AS l LEFT JOIN lqdt.seller_fees f ON f.site = l.site AND f.account_id = l.account_id ` +
         "WHERE l.close_date_et BETWEEN @from AND @to " +
         "GROUP BY l.site",
     );

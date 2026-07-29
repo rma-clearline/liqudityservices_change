@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { fetchSoldRange } from "@/lib/sold-export";
-import { writeSoldLots, soldCoverage, isAzureSqlConfigured } from "@/lib/azure-sql";
+import { writeSoldLots, soldCoverage, refreshSoldSupersession, isAzureSqlConfigured } from "@/lib/azure-sql";
 
 // One-window backfill of the durable sold-lot store. Drive it window-by-window
 // (e.g. month by month) so each request stays bounded. Guarded by CRON_SECRET.
@@ -32,6 +32,11 @@ export async function GET(request: Request) {
   try {
     const fetched = await fetchSoldRange(from, to, { maxPages });
     const { written, skipped } = await writeSoldLots(fetched.rows);
+    // Re-mark relist supersession before reporting coverage: a backfill can introduce a
+    // second sold record for an asset that already had one, and until this runs both
+    // count toward GMV. Without it the numbers below (and every read) would stay
+    // double-counted until the next cron sold capture happened to fix them.
+    const superseded = await refreshSoldSupersession();
     const coverage = await soldCoverage(from, to);
     return NextResponse.json({
       from,
@@ -42,6 +47,7 @@ export async function GET(request: Request) {
       truncated: fetched.truncated, // true → hit the page cap; raise maxPages and re-run
       written, // unique lots upserted to sold_lots
       skipped, // rows that could not be loaded (individually unloadable)
+      superseded, // relist markers re-computed after the write ({changed, ms})
       coverage, // what the store now holds for [from,to]
       ms: Date.now() - started,
     });

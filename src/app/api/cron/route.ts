@@ -11,6 +11,7 @@ import {
   getSellerFeesFresh,
   upsertSellerFees,
   refreshFeeAnalytics,
+  refreshSoldSupersession,
   type SellerFeeRow,
 } from "@/lib/azure-sql";
 import { fetchBidbox } from "@/lib/asset-fees";
@@ -296,6 +297,21 @@ export async function GET(request: Request) {
     soldCaptureTask,
     sellerFeeTask,
   ]);
+
+  // A relisted asset resells under a new auctionId, and row_key is keyed by auction, so
+  // the failed attempt would keep counting as GMV alongside the completed sale. Re-mark
+  // superseded rows now that this run's lots are in: ~10s and idempotent, but it MUST run
+  // after the sold capture and before the forecast snapshot below, because it is what
+  // keeps SOLD_CURRENT (the deduped read surface in azure-sql.ts that every aggregation
+  // goes through) in step with what was just ingested.
+  if (runSoldCapture && isAzureSqlConfigured()) {
+    try {
+      const s = await refreshSoldSupersession();
+      console.log(`[cron] sold supersession: ${s.changed} row(s) re-marked in ${s.ms}ms`);
+    } catch (e) {
+      console.error("[cron] sold supersession failed:", e instanceof Error ? e.message : String(e));
+    }
+  }
 
   // Materialize the current forecast while Azure SQL is already awake. Normal
   // dashboard views then read one small Supabase row instead of waking SQL.
