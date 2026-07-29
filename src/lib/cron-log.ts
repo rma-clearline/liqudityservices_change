@@ -99,10 +99,23 @@ export class CronLogger {
       if (useAzureData()) {
         await azInsertCronRuns(all);
       } else {
-        await supabaseAdmin.from("cron_runs").insert(all);
+        // supabase-js RESOLVES with an { error } object instead of throwing, so a
+        // failure here would never reach the catch below. Re-throw it. This is the
+        // exact shape that hid the outage: DATA_BACKEND defaults to supabase, prod
+        // Supabase has no cron_runs table, and every insert came back PGRST205
+        // "Could not find the table" — discarded, silently, for months.
+        const { error } = await supabaseAdmin.from("cron_runs").insert(all);
+        if (error) throw new Error(`supabase insert failed: ${error.message}`);
       }
-    } catch {
-      // cron logging is best-effort — never fail the run because logging failed.
+    } catch (e) {
+      // Still best-effort — a logging failure must never fail the run — but no longer
+      // silent. When this write is dropped the ops log, the freshness badges and the
+      // alert banner all go blank with nothing indicating they are blind.
+      console.warn(
+        `[cron-log] could not persist ${all.length} cron_runs record(s) to ` +
+          `${useAzureData() ? "azure" : "supabase"}:`,
+        e instanceof Error ? e.message : String(e),
+      );
     }
     return all;
   }

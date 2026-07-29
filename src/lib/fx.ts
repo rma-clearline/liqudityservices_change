@@ -134,9 +134,18 @@ export async function persistFxRates(fx: FxRates): Promise<void> {
     if (useAzureData()) {
       await azUpsertFxRates(rows);
     } else {
-      await supabaseAdmin.from("fx_rates").upsert(rows, { onConflict: "date,currency" });
+      // Same trap as the cron logger: supabase-js resolves with { error }, it does not
+      // throw, so this failure has to be checked to be seen. fx_rates was the second
+      // table silently dropped for months on the default supabase backend.
+      const { error } = await supabaseAdmin.from("fx_rates").upsert(rows, { onConflict: "date,currency" });
+      if (error) throw new Error(`supabase upsert failed: ${error.message}`);
     }
-  } catch {
-    // fx_rates audit is best-effort; ingestion must not fail on it.
+  } catch (e) {
+    // Best-effort: ingestion must not fail on the audit trail — but a dropped write
+    // means stored USD amounts stop being reproducible, so say it out loud.
+    console.warn(
+      `[fx] could not persist ${rows.length} fx_rates row(s) to ${useAzureData() ? "azure" : "supabase"}:`,
+      e instanceof Error ? e.message : String(e),
+    );
   }
 }
