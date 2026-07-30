@@ -9,7 +9,6 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.103.3",
     "html2canvas-pro": "^2.0.2",
     "mssql": "^12.7.0",
     "next": "16.2.4",

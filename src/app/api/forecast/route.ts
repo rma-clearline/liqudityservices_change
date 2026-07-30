@@ -8,8 +8,6 @@ import {
   loadModelMetrics,
   loadReportedQuarterlyGmv,
 } from "@/lib/reported-gmv";
-import { supabase } from "@/lib/supabase";
-import { useAzureData } from "@/lib/data-backend";
 import { azFetchLatestForecastSnapshot } from "@/lib/azure-tables";
 import { etTodayKey } from "@/lib/time";
 
@@ -22,22 +20,8 @@ const forecastCache = ttlCache<RevenueForecast>(Number(process.env.FORECAST_CACH
 const bucketDailyCache = ttlCache<SoldBucketDailyRow[]>(Number(process.env.FORECAST_CACHE_MS) || 15 * 60_000);
 
 async function loadBaseForecast(quarter?: string): Promise<RevenueForecast> {
-  if (useAzureData()) {
-    const snap = await azFetchLatestForecastSnapshot<RevenueForecast>().catch(() => null);
-    if (snap?.payload && (!quarter || snap.payload.quarter === quarter)) return snap.payload;
-    return computeRevenueForecast(1, quarter);
-  }
-  const snapshot = await supabase
-    .from("forecast_snapshots")
-    .select("payload")
-    .order("generated_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (!snapshot.error && snapshot.data?.payload) {
-    const payload = snapshot.data.payload as unknown as RevenueForecast;
-    if (!quarter || payload.quarter === quarter) return payload;
-  }
-  // Migration-safe fallback and historical-quarter path.
+  const snap = await azFetchLatestForecastSnapshot<RevenueForecast>().catch(() => null);
+  if (snap?.payload && (!quarter || snap.payload.quarter === quarter)) return snap.payload;
   return computeRevenueForecast(1, quarter);
 }
 

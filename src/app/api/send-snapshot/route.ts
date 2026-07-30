@@ -1,7 +1,5 @@
 import { NextResponse } from "next/server";
 import { Resend } from "resend";
-import { supabase } from "@/lib/supabase";
-import { useAzureData } from "@/lib/data-backend";
 import { azFetchListings } from "@/lib/azure-tables";
 
 export const dynamic = "force-dynamic";
@@ -78,16 +76,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Email not configured on server" }, { status: 500 });
   }
 
-  const rows = useAzureData()
-    ? await azFetchListings({ limit: 30 }).catch(() => [])
-    : (
-        await supabase
-          .from("listings")
-          .select("*")
-          .order("date", { ascending: false })
-          .order("timestamp", { ascending: false })
-          .limit(30)
-      ).data ?? [];
+  const rows = await azFetchListings({ limit: 30 }).catch(() => []);
 
   const latest = rows?.[0];
   const fmtNum = (n: number | null) => (n != null ? n.toLocaleString("en-US") : "N/A");

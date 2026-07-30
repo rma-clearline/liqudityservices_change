@@ -1,4 +1,6 @@
-import { createClient } from "@supabase/supabase-js";
+// Shared database row-shape types. Formerly the Supabase client module; the app
+// now runs entirely on Azure SQL (see src/lib/azure-tables.ts), so only these
+// types remain. (Filename kept to avoid churning the many type imports.)
 
 export type ListingRow = {
   id: number;
@@ -95,32 +97,3 @@ export type AuctionDailyStatsRow = {
   total_bids_closed: number;
 };
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY!;
-// Optional least-privilege anon/publishable key for reads. When set, browser
-// and server reads go through RLS ("public read") instead of the secret key.
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-const clientOptions = { auth: { persistSession: false } } as const;
-
-/**
- * Read client. Prefers the least-privilege anon key; falls back to the secret
- * key so existing deployments keep working until `NEXT_PUBLIC_SUPABASE_ANON_KEY`
- * is configured. Use this for all SELECTs (server components, read API routes).
- */
-export const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_ANON_KEY || SUPABASE_SECRET_KEY,
-  clientOptions,
-);
-
-/**
- * Server-only writer (service role, bypasses RLS). Use for all inserts/updates
- * (cron ingestion, fx-rate audit, cron-run logging). Never import into a client
- * component — it carries the secret key.
- */
-export const supabaseAdmin = createClient(
-  SUPABASE_URL,
-  SUPABASE_SECRET_KEY,
-  clientOptions,
-);

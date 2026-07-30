@@ -1,34 +1,8 @@
 import { NextResponse } from "next/server";
-import { supabase } from "@/lib/supabase";
 import { ttlCache } from "@/lib/cache";
-import { useAzureData } from "@/lib/data-backend";
 import { azFetchDataFreshness, azFetchCronRunsRecent } from "@/lib/azure-tables";
 
 export const dynamic = "force-dynamic";
-
-// Which column best represents "freshness" for each data table. `fallback` is
-// used when the primary column doesn't exist yet (e.g. a not-yet-applied
-// migration) so the endpoint degrades gracefully instead of reporting "no data".
-const TABLE_FRESHNESS: { table: string; column: string; fallback?: string }[] = [
-  { table: "listings", column: "date" },
-  { table: "marketplace_sellers", column: "date" },
-  { table: "auctions", column: "last_seen_at" },
-];
-
-async function latestValue(table: string, column: string, fallback?: string): Promise<string | null> {
-  const { data, error } = await supabase
-    .from(table)
-    .select(column)
-    .order(column, { ascending: false })
-    .limit(1);
-  if (error) {
-    return fallback ? latestValue(table, fallback) : null;
-  }
-  if (!data || data.length === 0) return null;
-  const row = data[0] as unknown as Record<string, unknown>;
-  const value = row[column];
-  return typeof value === "string" ? value : null;
-}
 
 type CronRunRow = {
   run_id: string;
@@ -54,14 +28,7 @@ export async function GET() {
 async function buildDataStatus() {
   const [tables, cronRows] = await Promise.all([
     loadTableFreshness(),
-    useAzureData()
-      ? (azFetchCronRunsRecent(60).catch(() => []) as Promise<CronRunRow[]>)
-      : supabase
-          .from("cron_runs")
-          .select("run_id, source, status, rows_ingested, error, started_at, ended_at, duration_ms")
-          .order("started_at", { ascending: false })
-          .limit(60)
-          .then((res) => (res.data ?? []) as CronRunRow[]),
+    azFetchCronRunsRecent(60).catch(() => []) as Promise<CronRunRow[]>,
   ]);
 
   // Reduce recent cron_runs to the latest entry per source.
@@ -110,15 +77,5 @@ async function buildDataStatus() {
 }
 
 async function loadTableFreshness(): Promise<Record<string, string | null>> {
-  if (useAzureData()) return azFetchDataFreshness().catch(() => ({}));
-  const { data, error } = await supabase.rpc("latest_data_freshness");
-  if (!error && data && typeof data === "object" && !Array.isArray(data)) {
-    return data as Record<string, string | null>;
-  }
-  // Rolling-deploy fallback until migration 025 is present.
-  const entries = await Promise.all(
-    TABLE_FRESHNESS.map(async ({ table, column, fallback }) =>
-      [table, await latestValue(table, column, fallback)] as const),
-  );
-  return Object.fromEntries(entries);
+  return azFetchDataFreshness().catch(() => ({}));
 }

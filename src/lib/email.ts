@@ -1,8 +1,6 @@
 import { Resend } from "resend";
-import { supabase } from "./supabase";
 import type { ListingRow } from "./supabase";
 import { downsample, MAX_CHART_LABELS, renderChartPng } from "./chart-utils";
-import { useAzureData } from "./data-backend";
 import { azFetchListings } from "./azure-tables";
 
 function getResend() {
@@ -162,16 +160,7 @@ export async function sendDailySummary({ date, timestamp, allsurplus, govdeals }
   twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
   const chartCutoff = twoYearsAgo.toISOString().slice(0, 10);
 
-  const allRows = useAzureData()
-    ? await azFetchListings({ sinceDate: chartCutoff }).catch(() => [])
-    : (
-        await supabase
-          .from("listings")
-          .select("*")
-          .gte("date", chartCutoff)
-          .order("date", { ascending: false })
-          .order("timestamp", { ascending: false })
-      ).data ?? [];
+  const allRows = await azFetchListings({ sinceDate: chartCutoff }).catch(() => []);
 
   const chartResult = await generateChartImage(allRows);
 

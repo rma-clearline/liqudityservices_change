@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { supabase, supabaseAdmin } from "./supabase";
 import { convertToUsd, loadFxRates, persistFxRates, roundUsd, type FxRates } from "./fx";
 import {
   buildSearchPayload,
@@ -15,7 +14,6 @@ import {
 } from "./maestro";
 import { dateKeyToUtcDate, enumerateDays, enumerateQuarterLabelsBetween, etDateKey, parseQuarterLabel, quarterBounds } from "./time";
 import { getSoldDaily, isAzureSqlConfigured, soldCoveredDays, type SoldDailyRow } from "./azure-sql";
-import { useAzureData } from "./data-backend";
 import {
   azUpsertAuctionsOpen,
   azUpsertAuctionsSold,
@@ -350,17 +348,11 @@ async function ingestPlatform(platform: Platform, fx: FxRates, nowIso: string): 
     result.rowsSkippedFx += rows.filter((r) => r.current_bid_usd === null).length;
 
     if (rows.length > 0) {
-      if (useAzureData()) {
-        try {
-          await azUpsertAuctionsOpen(rows);
-          result.upserted += rows.length;
-        } catch (e) {
-          if (!result.upsertError) result.upsertError = e instanceof Error ? e.message : String(e);
-        }
-      } else {
-        const { error } = await supabaseAdmin.from("auctions").upsert(rows, { onConflict: "platform,asset_id" });
-        if (!error) result.upserted += rows.length;
-        else if (!result.upsertError) result.upsertError = error.message;
+      try {
+        await azUpsertAuctionsOpen(rows);
+        result.upserted += rows.length;
+      } catch (e) {
+        if (!result.upsertError) result.upsertError = e instanceof Error ? e.message : String(e);
       }
     }
 
@@ -374,56 +366,11 @@ async function ingestPlatform(platform: Platform, fx: FxRates, nowIso: string): 
 type ClosureResult = { sold: number; nosale: number; unknown: number };
 
 async function sweepClosures(nowIso: string): Promise<ClosureResult> {
-  if (useAzureData()) {
-    try {
-      return await azSweepClosures(nowIso);
-    } catch {
-      return { sold: 0, nosale: 0, unknown: 0 };
-    }
+  try {
+    return await azSweepClosures(nowIso);
+  } catch {
+    return { sold: 0, nosale: 0, unknown: 0 };
   }
-  const { data, error } = await supabaseAdmin
-    .from("auctions")
-    .select("id, bid_count")
-    .eq("status", "open")
-    .lt("close_time_utc", nowIso);
-  if (error || !data) return { sold: 0, nosale: 0, unknown: 0 };
-
-  const nosaleIds: number[] = [];
-  const unknownIds: number[] = [];
-  for (const row of data) {
-    const bids = row.bid_count ?? 0;
-    if (bids > 0) {
-      // A bid does not prove the reserve was met or that the auction closed
-      // as sold. Keep it out of realized GMV unless a sold feed verifies it.
-      unknownIds.push(row.id);
-    } else {
-      nosaleIds.push(row.id);
-    }
-  }
-
-  if (nosaleIds.length > 0) {
-    const CHUNK = 500;
-    for (let i = 0; i < nosaleIds.length; i += CHUNK) {
-      const chunk = nosaleIds.slice(i, i + CHUNK);
-      await supabaseAdmin
-        .from("auctions")
-        .update({ status: "closed_nosale", final_price_usd: 0, closed_at: nowIso })
-        .in("id", chunk);
-    }
-  }
-
-  if (unknownIds.length > 0) {
-    const CHUNK = 500;
-    for (let i = 0; i < unknownIds.length; i += CHUNK) {
-      const chunk = unknownIds.slice(i, i + CHUNK);
-      await supabaseAdmin
-        .from("auctions")
-        .update({ status: "unknown", closed_at: nowIso })
-        .in("id", chunk);
-    }
-  }
-
-  return { sold: 0, nosale: nosaleIds.length, unknown: unknownIds.length };
 }
 
 export type AuctionsIngestResult = {
@@ -531,17 +478,11 @@ async function ingestSoldPlatform(
     result.rowsSkippedFx += rows.filter((r) => r.final_price_usd === null).length;
 
     if (rows.length > 0) {
-      if (useAzureData()) {
-        try {
-          await azUpsertAuctionsSold(rows);
-          result.upserted += rows.length;
-        } catch (e) {
-          if (!result.upsertError) result.upsertError = e instanceof Error ? e.message : String(e);
-        }
-      } else {
-        const { error } = await supabaseAdmin.from("auctions").upsert(rows, { onConflict: "platform,asset_id" });
-        if (!error) result.upserted += rows.length;
-        else if (!result.upsertError) result.upsertError = error.message;
+      try {
+        await azUpsertAuctionsSold(rows);
+        result.upserted += rows.length;
+      } catch (e) {
+        if (!result.upsertError) result.upsertError = e instanceof Error ? e.message : String(e);
       }
     }
 
@@ -907,20 +848,9 @@ function sumHistoricalPlatform(
 }
 
 async function collectDebug(nowIso: string, startIso: string, endIso: string) {
-  let rows: unknown[];
-  let sampleRow: Record<string, unknown> | null;
-  if (useAzureData()) {
-    const d = await azFetchAuctionsDebug();
-    rows = d.rows;
-    sampleRow = d.sample;
-  } else {
-    const [allRes, sampleRes] = await Promise.all([
-      supabase.from("auctions").select("platform, status, close_time_utc"),
-      supabase.from("auctions").select("*").limit(1),
-    ]);
-    rows = allRes.data ?? [];
-    sampleRow = (sampleRes.data?.[0] as Record<string, unknown> | undefined) ?? null;
-  }
+  const d = await azFetchAuctionsDebug();
+  const rows: unknown[] = d.rows;
+  const sampleRow: Record<string, unknown> | null = d.sample;
   const by_platform: Record<string, number> = {};
   const by_status: Record<string, number> = {};
   let with_close_time = 0;
@@ -960,28 +890,6 @@ async function collectDebug(nowIso: string, startIso: string, endIso: string) {
   };
 }
 
-// Supabase/PostgREST caps every response at ~1000 rows. The current quarter can
-// have many thousands of sold rows, so the forecast's per-platform reads must
-// paginate — otherwise realized/projected silently truncate to the first 1000
-// and undercount (the live-quarter bug). A safety cap keeps an ALL-view read
-// bounded even after the table grows large (ordered close_time desc, so the cap
-// keeps the most recent rows — which is exactly what the current quarter needs).
-const AUCTIONS_READ_PAGE = 1000;
-const AUCTIONS_READ_MAX_PAGES = Number(process.env.AUCTIONS_READ_MAX_PAGES) || 60;
-
-async function fetchAllAuctionRows(
-  build: (from: number, to: number) => PromiseLike<{ data: unknown[] | null; error: unknown }>,
-): Promise<unknown[]> {
-  const rows: unknown[] = [];
-  for (let page = 0; page < AUCTIONS_READ_MAX_PAGES; page += 1) {
-    const from = page * AUCTIONS_READ_PAGE;
-    const { data, error } = await build(from, from + AUCTIONS_READ_PAGE - 1);
-    if (error || !data || data.length === 0) break;
-    rows.push(...data);
-    if (data.length < AUCTIONS_READ_PAGE) break;
-  }
-  return rows;
-}
 
 // Cross-listing dedup (Phase-0 stopgap for the live-quarter forecast).
 // The per-site ingester stores a cross-listed asset under BOTH platform=AD and
@@ -1066,35 +974,10 @@ export async function computeRevenueForecast(takeRate = 0.2, quarterLabel?: stri
   const perPlatform = await Promise.all(
     platforms.map(async (platform) => {
       const historical = sumHistoricalPlatform(historicalDailyGmv, platform, quarterDaySet);
-      const [closedRaw, openRaw] = useAzureData()
-        ? await Promise.all([
-            azFetchAuctionsClosed(platform, startIso, fetchEndIso),
-            azFetchAuctionsOpen(platform, nowIso, fetchEndIso),
-          ])
-        : await Promise.all([
-            fetchAllAuctionRows((from, to) =>
-              supabase
-                .from("auctions")
-                .select("asset_id, status, final_price_usd, current_bid_usd, close_time_utc, category, bid_count")
-                .eq("platform", platform)
-                .gte("close_time_utc", startIso)
-                .lt("close_time_utc", fetchEndIso)
-                .in("status", ["closed_sold", "closed_nosale"])
-                .order("close_time_utc", { ascending: false })
-                .range(from, to),
-            ),
-            fetchAllAuctionRows((from, to) =>
-              supabase
-                .from("auctions")
-                .select("asset_id, current_bid_usd, close_time_utc, category, bid_count")
-                .eq("platform", platform)
-                .eq("status", "open")
-                .gte("close_time_utc", nowIso)
-                .lt("close_time_utc", fetchEndIso)
-                .order("close_time_utc", { ascending: false })
-                .range(from, to),
-            ),
-          ]);
+      const [closedRaw, openRaw] = await Promise.all([
+        azFetchAuctionsClosed(platform, startIso, fetchEndIso),
+        azFetchAuctionsOpen(platform, nowIso, fetchEndIso),
+      ]);
 
       // Trim the +1-UTC-day overfetch (and the pre-range ET-evening rows the UTC
       // window always included) to the range's actual ET days, so counts, the

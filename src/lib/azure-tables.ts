@@ -1,8 +1,8 @@
 // Azure SQL access layer for the app's relational tables (the Supabase→Azure
 // migration — docs/azure-migration-spec.md). SERVER-ONLY. Reuses the lqdt_app
 // pool + conventions from azure-sql.ts. Every function here mirrors the shape a
-// Supabase read/write returned, so the callers (behind the DATA_BACKEND flag)
-// are drop-in. jsonb columns are NVARCHAR(MAX) here, so JSON is parsed/stringified
+// Supabase read/write once returned, so the callers were drop-in during the
+// migration. jsonb columns are NVARCHAR(MAX) here, so JSON is parsed/stringified
 // explicitly at this boundary; DATETIME2 columns come back as JS Dates and are
 // converted to the ISO strings the app's row types expect.
 import "server-only";
@@ -469,4 +469,23 @@ export async function azUpsertForecastSnapshot(quarter: string, payload: unknown
         "WHEN MATCHED THEN UPDATE SET payload=@payload, generated_at=SYSUTCDATETIME() " +
         "WHEN NOT MATCHED THEN INSERT (quarter, payload) VALUES (@quarter, @payload);",
     );
+}
+
+// --- retention (replaces the Supabase run_cost_retention RPC / migration 024) ---
+/** Bound the operational + duplicate-closed-auction history: cron_runs >90d,
+ *  marketplace_sellers >548d, closed auctions >120d. Returns per-table delete counts. */
+export async function azRunRetention(): Promise<{ cron_runs: number; marketplace_sellers: number; auctions: number }> {
+  const pool = await getPool();
+  const cron = await pool.request().query("DELETE FROM lqdt.cron_runs WHERE started_at < DATEADD(day, -90, SYSUTCDATETIME())");
+  const sellers = await pool
+    .request()
+    .query("DELETE FROM lqdt.marketplace_sellers WHERE date < CONVERT(NVARCHAR(10), DATEADD(day, -548, CAST(SYSUTCDATETIME() AS date)), 23)");
+  const auctions = await pool
+    .request()
+    .query("DELETE FROM lqdt.auctions WHERE status <> 'open' AND close_time_utc < DATEADD(day, -120, SYSUTCDATETIME())");
+  return {
+    cron_runs: cron.rowsAffected[0] ?? 0,
+    marketplace_sellers: sellers.rowsAffected[0] ?? 0,
+    auctions: auctions.rowsAffected[0] ?? 0,
+  };
 }

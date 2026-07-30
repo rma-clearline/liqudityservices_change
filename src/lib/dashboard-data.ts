@@ -1,9 +1,7 @@
 import "server-only";
 
-import { supabase } from "./supabase";
 import type { ListingRow, MarketplaceSellerRow, SellerDeltaRow } from "./supabase";
 import { ttlCache } from "./cache";
-import { useAzureData } from "./data-backend";
 import { azFetchListings, azFetchMarketplaceSellers, azFetchSellerDeltas } from "./azure-tables";
 import {
   getTopSoldLots,
@@ -32,15 +30,7 @@ const TTL = Number(process.env.DASHBOARD_CACHE_MS) || 15 * 60_000;
 const listingsCache = ttlCache<ListingRow[]>(TTL);
 
 export function getListings(): Promise<ListingRow[]> {
-  return listingsCache.get("all", async () => {
-    if (useAzureData()) return azFetchListings();
-    const { data } = await supabase
-      .from("listings")
-      .select("*")
-      .order("date", { ascending: false })
-      .order("timestamp", { ascending: false });
-    return (data ?? []) as ListingRow[];
-  });
+  return listingsCache.get("all", () => azFetchListings());
 }
 
 /** Newest listing snapshot (overview cards). Reuses the shared listings cache. */
@@ -57,23 +47,8 @@ const marketplaceCache = ttlCache<MarketplaceData>(TTL);
 
 export function getMarketplaceData(): Promise<MarketplaceData> {
   return marketplaceCache.get("all", async () => {
-    if (useAzureData()) {
-      const [sellers, deltas] = await Promise.all([azFetchMarketplaceSellers(200), azFetchSellerDeltas()]);
-      return { sellers, deltas };
-    }
-    const [sellersRes, deltasRes] = await Promise.all([
-      supabase
-        .from("marketplace_sellers")
-        .select("*")
-        .order("date", { ascending: false })
-        .order("total_current_bid", { ascending: false })
-        .limit(200),
-      supabase.from("marketplace_seller_deltas").select("*").limit(500),
-    ]);
-    return {
-      sellers: (sellersRes.data ?? []) as MarketplaceSellerRow[],
-      deltas: (deltasRes.data ?? []) as SellerDeltaRow[],
-    };
+    const [sellers, deltas] = await Promise.all([azFetchMarketplaceSellers(200), azFetchSellerDeltas()]);
+    return { sellers, deltas };
   });
 }
 

@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabase";
 import { scrapeListings } from "@/lib/scraper";
 import { scrapeMarketplaceMetrics, type SellerInfo } from "@/lib/marketplace-metrics";
 import { computeRevenueForecast, ingestAuctions } from "@/lib/auctions";
@@ -19,8 +18,7 @@ import { etQuarterKey } from "@/lib/time";
 import { quarterDayKeys } from "@/lib/qtd-shared";
 import { sendReportEmail, type ReportEmailResult } from "@/lib/report-email";
 import { CronLogger, type SourceSummary } from "@/lib/cron-log";
-import { useAzureData } from "@/lib/data-backend";
-import { azUpsertListing, azUpsertMarketplaceSellers, azUpsertForecastSnapshot } from "@/lib/azure-tables";
+import { azUpsertListing, azUpsertMarketplaceSellers, azUpsertForecastSnapshot, azRunRetention } from "@/lib/azure-tables";
 
 // Daily reconciliation also materializes the forecast after ingestion.
 export const maxDuration = 120;
@@ -75,17 +73,10 @@ export async function GET(request: Request) {
     async () => {
       const { allsurplus, govdeals } = await scrapeListings();
       let error: string | null = null;
-      if (useAzureData()) {
-        try {
-          await azUpsertListing({ date, timestamp, allsurplus, govdeals });
-        } catch (e) {
-          error = e instanceof Error ? e.message : String(e);
-        }
-      } else {
-        const res = await supabaseAdmin
-          .from("listings")
-          .upsert({ date, timestamp, allsurplus, govdeals }, { onConflict: "date" });
-        error = res.error?.message ?? null;
+      try {
+        await azUpsertListing({ date, timestamp, allsurplus, govdeals });
+      } catch (e) {
+        error = e instanceof Error ? e.message : String(e);
       }
       return { allsurplus, govdeals, error };
     },
@@ -124,19 +115,11 @@ export async function GET(request: Request) {
       let sellersStored = 0;
       let sellersError: string | null = null;
       if (sellerRows.length > 0) {
-        if (useAzureData()) {
-          try {
-            await azUpsertMarketplaceSellers(sellerRows);
-            sellersStored = sellerRows.length;
-          } catch (e) {
-            sellersError = e instanceof Error ? e.message : String(e);
-          }
-        } else {
-          const { error } = await supabaseAdmin
-            .from("marketplace_sellers")
-            .upsert(sellerRows, { onConflict: "date,platform,account_id" });
-          sellersError = error?.message ?? null;
-          sellersStored = error ? 0 : sellerRows.length;
+        try {
+          await azUpsertMarketplaceSellers(sellerRows);
+          sellersStored = sellerRows.length;
+        } catch (e) {
+          sellersError = e instanceof Error ? e.message : String(e);
         }
       }
       // scrapeMarketplaceMetrics never throws; a total fetch failure returns
@@ -351,15 +334,8 @@ export async function GET(request: Request) {
       }
       try {
         const payload = await computeRevenueForecast(1);
-        if (useAzureData()) {
-          await azUpsertForecastSnapshot(payload.quarter, payload);
-          return { skipped: false, stored: 1, error: null };
-        }
-        const { error } = await supabaseAdmin.from("forecast_snapshots").upsert(
-          { quarter: payload.quarter, payload, generated_at: new Date().toISOString() },
-          { onConflict: "quarter" },
-        );
-        return { skipped: false, stored: error ? 0 : 1, error: error?.message ?? null };
+        await azUpsertForecastSnapshot(payload.quarter, payload);
+        return { skipped: false, stored: 1, error: null };
       } catch (error) {
         return { skipped: false, stored: 0, error: error instanceof Error ? error.message : String(error) };
       }
@@ -372,20 +348,20 @@ export async function GET(request: Request) {
   );
 
   // Keep operational/history tables bounded. This runs after ingestion so it
-  // cannot contend with the writers above. Migration 024 installs the RPC.
+  // cannot contend with the writers above (azRunRetention: cron_runs >90d,
+  // marketplace_sellers >548d, closed auctions >120d).
   await logger.track(
     "retention",
     async () => {
       if (!isDailyRun && !forceDaily && searchParams.get("retention") !== "1") {
         return { skipped: true, deleted: 0, error: null as string | null };
       }
-      const { data, error } = await supabaseAdmin.rpc("run_cost_retention");
-      const counts = (data ?? {}) as Record<string, unknown>;
-      const deleted = Object.values(counts).reduce<number>(
-        (sum, value) => sum + (typeof value === "number" ? value : 0),
-        0,
-      );
-      return { skipped: false, deleted, error: error?.message ?? null };
+      try {
+        const c = await azRunRetention();
+        return { skipped: false, deleted: c.cron_runs + c.marketplace_sellers + c.auctions, error: null as string | null };
+      } catch (e) {
+        return { skipped: false, deleted: 0, error: e instanceof Error ? e.message : String(e) };
+      }
     },
     (r): SourceSummary => ({
       status: r.skipped ? "skipped" : r.error ? "failed" : "success",

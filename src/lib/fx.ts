@@ -10,9 +10,7 @@
 // open.er-api.com returns USD-based rates where rates[XYZ] = units of XYZ per
 // 1 USD, so USD = amount / rates[XYZ].
 
-import { supabaseAdmin } from "./supabase";
 import { etTodayKey } from "./time";
-import { useAzureData } from "./data-backend";
 import { azReadFxRates, azUpsertFxRates } from "./azure-tables";
 
 // Maestro currency codes → ISO codes. Superset of the per-file maps.
@@ -75,7 +73,6 @@ function emptyRates(): FxRates {
  */
 export async function loadFxRatesByDate(fromDate: string, toDate: string): Promise<Map<string, FxRates>> {
   const out = new Map<string, FxRates>();
-  if (!useAzureData()) return out;
   try {
     for (const r of await azReadFxRates(fromDate, toDate)) {
       if (!(r.rate > 0)) continue;
@@ -131,20 +128,12 @@ export async function persistFxRates(fx: FxRates): Promise<void> {
     }));
   if (rows.length === 0) return;
   try {
-    if (useAzureData()) {
-      await azUpsertFxRates(rows);
-    } else {
-      // Same trap as the cron logger: supabase-js resolves with { error }, it does not
-      // throw, so this failure has to be checked to be seen. fx_rates was the second
-      // table silently dropped for months on the default supabase backend.
-      const { error } = await supabaseAdmin.from("fx_rates").upsert(rows, { onConflict: "date,currency" });
-      if (error) throw new Error(`supabase upsert failed: ${error.message}`);
-    }
+    await azUpsertFxRates(rows);
   } catch (e) {
     // Best-effort: ingestion must not fail on the audit trail — but a dropped write
     // means stored USD amounts stop being reproducible, so say it out loud.
     console.warn(
-      `[fx] could not persist ${rows.length} fx_rates row(s) to ${useAzureData() ? "azure" : "supabase"}:`,
+      `[fx] could not persist ${rows.length} fx_rates row(s) to azure:`,
       e instanceof Error ? e.message : String(e),
     );
   }
