@@ -154,6 +154,42 @@ export async function loadModelMetrics(): Promise<ModelMetricRow[]> {
   return out;
 }
 
+/** Last-resort take rate when the workbook carries no consignment rate at all. This is
+ *  the placeholder the Forecast tab used to hardcode — roughly 2x what the marketplace
+ *  actually earns — so it is a degrade path, never a number to present as calculated. */
+export const FALLBACK_TAKE_RATE = 0.2;
+
+export type ForecastTakeRate = {
+  rate: number;
+  source: "model_consignment" | "fallback";
+  /** Workbook quarter the rate came from; null when falling back. */
+  quarter: string | null;
+  kind: "reported" | "forecast" | null;
+};
+
+/**
+ * The marketplace take rate to price auction GMV at: the model's own
+ * `consignment_take_rate` (reported revenue ÷ consignment, i.e. non-purchase, GMV).
+ *
+ * Why this metric and not the workbook's blended take: the blend divides by
+ * GovDeals + RSCG + CAG GMV, a base ~1.9x this page's, and is dominated by RSCG's ~74%
+ * purchase/resale take — a segment absent from lqdt.sold_lots entirely. Consignment take
+ * is the auction-only rate, and it independently corroborates our own per-lot fee
+ * measurement (11.18% model vs 11.20% measured, hammer basis).
+ *
+ * Prefers `preferQuarter`'s own rate so a historical quarter is priced at the rate that
+ * actually applied; otherwise the most recent quarter carrying one (only reported
+ * quarters do, so the live quarter resolves to the last reported).
+ */
+export function consignmentTakeRate(metrics: ModelMetricRow[], preferQuarter?: string): ForecastTakeRate {
+  const rows = metrics
+    .filter((m) => m.metric === "consignment_take_rate" && m.value > 0 && m.value < 1)
+    .sort((a, b) => a.quarter.localeCompare(b.quarter));
+  if (rows.length === 0) return { rate: FALLBACK_TAKE_RATE, source: "fallback", quarter: null, kind: null };
+  const chosen = (preferQuarter ? rows.find((r) => r.quarter === preferQuarter) : undefined) ?? rows[rows.length - 1];
+  return { rate: chosen.value, source: "model_consignment", quarter: chosen.quarter, kind: chosen.kind };
+}
+
 /**
  * Model-file estimates merged with analyst overrides from `lqdt.model_estimates`
  * (Azure SQL — the app owns the schema and bootstraps the table itself). A DB row

@@ -60,6 +60,14 @@ type Forecast = {
   quarter_start: string;
   quarter_end: string;
   take_rate: number;
+  /** Where the take rate comes from when the request doesn't pin one (see
+   *  consignmentTakeRate) — drives the caption under the input. */
+  default_take_rate?: {
+    rate: number;
+    source: "model_consignment" | "fallback";
+    quarter: string | null;
+    kind: "reported" | "forecast" | null;
+  };
   is_current: boolean;
   available_quarters: string[];
   platforms: PlatformForecast[];
@@ -1073,7 +1081,7 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
           </BarChart>
         </ResponsiveContainer>
         <p className="mt-1 text-xs text-gray-400">
-          Revenue = category GMV × {(takeRate * 100).toFixed(0)}% take rate. Top {topN} categories by GMV; the rest grouped as
+          Revenue = category GMV × {(takeRate * 100).toFixed(2)}% take rate. Top {topN} categories by GMV; the rest grouped as
           Other (hover any segment for its exact category and value). X-axis: CQ (calendar quarter) / FQ (LQDT fiscal, FY ends Sep 30).
           {state.truncated ? " Value-ranked sample (top lots by value) — captures most GMV, not every tail lot." : ""}
         </p>
@@ -1090,8 +1098,12 @@ function CategoryRevenueChart({ from, to, takeRate }: { from: string; to: string
 }
 
 export function RevenueForecast() {
-  const [takeRate, setTakeRate] = useState(0.2);
-  const [requestedTakeRate, setRequestedTakeRate] = useState(0.2);
+  // null = "use the calculated default": the rate comes from the model and only the
+  // server knows it, so the request omits the param and the input renders whatever the
+  // server applied. It becomes a number only once the analyst overrides it, which is
+  // also what makes the override sticky across quarter switches.
+  const [takeRate, setTakeRate] = useState<number | null>(null);
+  const [requestedTakeRate, setRequestedTakeRate] = useState<number | null>(null);
   const [quarter, setQuarter] = useState<string | null>(null);
   const [chartMetric, setChartMetric] = useState<ChartMetric>("gmv");
   const [chartMarket, setChartMarket] = useState<SalesMarketFilter>(DEFAULT_CHART_MARKET);
@@ -1107,13 +1119,16 @@ export function RevenueForecast() {
   const [switching, setSwitching] = useState(false);
 
   useEffect(() => {
+    if (takeRate === null) return; // still on the server-supplied default
     const timer = window.setTimeout(() => setRequestedTakeRate(takeRate), 300);
     return () => window.clearTimeout(timer);
   }, [takeRate]);
 
   useEffect(() => {
     let cancelled = false;
-    const params = new URLSearchParams({ takeRate: String(requestedTakeRate) });
+    const params = new URLSearchParams();
+    // Omitted on the first load so the server applies its calculated default.
+    if (requestedTakeRate !== null) params.set("takeRate", String(requestedTakeRate));
     if (quarter) params.set("quarter", quarter);
     fetch(`/api/forecast?${params.toString()}`)
       .then((r) => r.json())
@@ -1149,6 +1164,17 @@ export function RevenueForecast() {
   const totalRevLabel = isAll
     ? "Total Revenue (all data)"
     : `${forecast.is_current ? "Projected" : "Realized"} ${quarterLabel} Revenue`;
+  // What the server actually applied — the calculated default until an analyst overrides it.
+  const effectiveTakeRate = takeRate ?? forecast.take_rate;
+  const takeRateDefault = forecast.default_take_rate;
+  const takeRateNote =
+    takeRate !== null
+      ? `Custom rate — “reset” returns to the calculated ${((takeRateDefault?.rate ?? forecast.take_rate) * 100).toFixed(2)}%.`
+      : takeRateDefault?.source === "model_consignment"
+        ? `Calculated: Clearline model consignment (auction) take rate${
+            takeRateDefault.quarter ? ` — ${formatQuarterLabel(takeRateDefault.quarter)} ${takeRateDefault.kind ?? ""}`.trimEnd() : ""
+          }. Independently corroborated by our per-lot measured fees (11.2% on the same basis).`
+        : "Placeholder rate — the model's consignment take rate is unavailable.";
   const dailyStart = forecast.daily[0]?.date;
   const dailyEnd = forecast.daily[forecast.daily.length - 1]?.date;
   const dailyRange = dailyStart && dailyEnd ? `${dailyStart} to ${dailyEnd}` : quarterLabel;
@@ -1216,15 +1242,28 @@ export function RevenueForecast() {
           Take rate
           <input
             type="number"
-            step="0.01"
+            step="0.001"
             min="0"
             max="1"
-            value={takeRate}
+            value={effectiveTakeRate}
             onChange={(e) => setTakeRate(Math.max(0, Math.min(1, Number(e.target.value) || 0)))}
-            className="w-20 border rounded px-2 py-0.5 text-sm"
+            className="w-24 border rounded px-2 py-0.5 text-sm"
           />
-          <span className="text-xs text-gray-400">{(takeRate * 100).toFixed(0)}%</span>
+          <span className="text-xs text-gray-400">{(effectiveTakeRate * 100).toFixed(2)}%</span>
+          {takeRate !== null && (
+            <button
+              type="button"
+              onClick={() => {
+                setTakeRate(null);
+                setRequestedTakeRate(null);
+              }}
+              className="text-xs text-blue-600 underline underline-offset-2 hover:text-blue-700"
+            >
+              reset
+            </button>
+          )}
         </label>
+        <span className="text-xs text-gray-400 basis-full">{takeRateNote}</span>
         <button
           onClick={() => setShowExport(true)}
           className="ml-auto rounded border border-gray-300 bg-white px-3 py-1 text-sm font-medium text-gray-700 hover:bg-gray-50"
@@ -1337,7 +1376,7 @@ export function RevenueForecast() {
             {showCategory ? "Hide" : "Show category breakdown"}
           </button>
         </div>
-        {showCategory && <CategoryRevenueChart from={exportFrom} to={exportTo} takeRate={takeRate} />}
+        {showCategory && <CategoryRevenueChart from={exportFrom} to={exportTo} takeRate={effectiveTakeRate} />}
       </div>
 
       {!isAll && ad && <PlatformBlock label="AllSurplus" color="text-blue-600" p={ad} />}

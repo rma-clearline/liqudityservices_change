@@ -2,7 +2,12 @@ import { NextResponse } from "next/server";
 import { applyForecastTakeRate, computeRevenueForecast, type RevenueForecast } from "@/lib/auctions";
 import { getSoldDailyByBucket, isAzureSqlConfigured, type SoldBucketDailyRow } from "@/lib/azure-sql";
 import { ttlCache } from "@/lib/cache";
-import { loadModelEstimatesMerged, loadModelMetrics, loadReportedQuarterlyGmv } from "@/lib/reported-gmv";
+import {
+  consignmentTakeRate,
+  loadModelEstimatesMerged,
+  loadModelMetrics,
+  loadReportedQuarterlyGmv,
+} from "@/lib/reported-gmv";
 import { supabase } from "@/lib/supabase";
 import { useAzureData } from "@/lib/data-backend";
 import { azFetchLatestForecastSnapshot } from "@/lib/azure-tables";
@@ -39,8 +44,6 @@ async function loadBaseForecast(quarter?: string): Promise<RevenueForecast> {
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const takeRateParam = searchParams.get("takeRate");
-  const parsed = takeRateParam ? Number(takeRateParam) : 0.2;
-  const takeRate = Math.max(0, Math.min(1, Number.isFinite(parsed) ? parsed : 0.2));
   const quarter = searchParams.get("quarter")?.trim() || undefined;
 
   const key = quarter ?? "current";
@@ -56,6 +59,17 @@ export async function GET(request: Request) {
     loadModelEstimatesMerged(),
     loadModelMetrics(),
   ]);
+
+  // Default take rate = the model's consignment (auction) take rate, matched to the
+  // quarter actually being served. An explicit ?takeRate still wins — this only decides
+  // what an unparameterized request gets, which is what the tab now loads with instead
+  // of the old hardcoded 0.2 (roughly 2x what this GMV earns). Resolved here rather than
+  // at the top of the handler because it needs the metrics loaded above; no extra I/O.
+  const default_take_rate = consignmentTakeRate(model_metrics, base.quarter);
+  const parsedTakeRate = takeRateParam ? Number(takeRateParam) : NaN;
+  const takeRate = Number.isFinite(parsedTakeRate)
+    ? Math.max(0, Math.min(1, parsedTakeRate))
+    : default_take_rate.rate;
 
   // Daily take-rate-bucket split — QTD-page (quarter=ALL) only, so the forecast
   // tab's per-quarter requests stay light. Store failures just omit the series;
@@ -78,6 +92,7 @@ export async function GET(request: Request) {
 
   return NextResponse.json({
     ...applyForecastTakeRate(base, takeRate),
+    default_take_rate,
     reported_gmv_by_quarter,
     model_estimates_by_quarter,
     model_metrics,
