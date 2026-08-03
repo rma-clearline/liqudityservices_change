@@ -166,6 +166,11 @@ export async function GET(request: Request) {
     },
   );
 
+  // Set when the capture times out: resolves true once the ABANDONED write (and its
+  // supersession re-mark) actually lands. Everything downstream reads sold_lots, so it
+  // must wait for this rather than compute on pre-capture data — see the wait below.
+  let lateCaptureWrite: Promise<boolean> | null = null;
+
   // Durable per-lot capture into Azure SQL (lqdt.sold_lots). Writes the last few
   // ET days' COMPLETE, deduped feed (via fetchSoldRange — true marketplace, incl.
   // GI) so the data is preserved before Maestro's ~12-month archive rolls it off.
@@ -208,12 +213,14 @@ export async function GET(request: Request) {
         // the supersession refresh below — leaving both attempts counted in
         // SOLD_CURRENT until the next capture run. Chain a follow-up refresh onto the
         // abandoned write so a late landing re-marks immediately.
-        void work
+        lateCaptureWrite = work
           .then(async () => {
             const s = await refreshSoldSupersession();
             console.log(`[cron] sold supersession (late capture write): ${s.changed} row(s) re-marked in ${s.ms}ms`);
+            return true;
           })
-          .catch(() => {});
+          .catch(() => false);
+        void lateCaptureWrite;
         return { written: 0, from, to, truncated: false, skipped: false, error: e instanceof Error ? e.message : String(e) };
       }
     },
@@ -302,6 +309,26 @@ export async function GET(request: Request) {
     sellerFeeTask,
   ]);
 
+  // The capture's timeout rejects the TASK but does not cancel its write, which keeps
+  // running on this long-lived container and lands minutes later. Everything below reads
+  // sold_lots — the supersession re-mark, the forecast snapshot, and the report email —
+  // so proceeding immediately computes on PRE-capture data. That is exactly how the
+  // 2026-08-03 noon and 5pm reports came out identical ($170.55M both): the 21:00 capture
+  // timed out at 45s, its write landed at 21:05, and the email had already computed.
+  // Wait (bounded) for the abandoned write so the report reflects this run's own capture.
+  let lateCaptureLanded = false;
+  if (soldCaptureResult?.error && lateCaptureWrite) {
+    const waitMs = Number(process.env.SOLD_CAPTURE_LATE_WAIT_MS) || 300_000;
+    const t0 = Date.now();
+    lateCaptureLanded = await Promise.race([
+      lateCaptureWrite,
+      new Promise<boolean>((r) => setTimeout(() => r(false), waitMs)),
+    ]);
+    console.log(
+      `[cron] late sold-capture write ${lateCaptureLanded ? "landed" : "did NOT land"} after ${Math.round((Date.now() - t0) / 1000)}s`,
+    );
+  }
+
   // A relisted asset resells under a new auctionId, and row_key is keyed by auction, so
   // the failed attempt would keep counting as GMV alongside the completed sale. Re-mark
   // superseded rows now that this run's lots are in: ~10s and idempotent, but it MUST run
@@ -335,8 +362,12 @@ export async function GET(request: Request) {
       // in flight (see the capture task above), so rows can land — unmarked, or as a
       // half-merged day — while this computes. The chained refresh repairs SOLD_CURRENT
       // for live readers, but a snapshot written mid-flight would freeze the bad number
-      // for hours, since /api/forecast prefers the stored snapshot. Skip this run.
-      if (soldCaptureResult?.error) {
+      // for hours, since /api/forecast prefers the stored snapshot. Skip this run —
+      // UNLESS the wait above confirmed the abandoned write (and its supersession
+      // re-mark) already landed, in which case nothing is in flight and the read is
+      // complete. Without that exemption a timed-out capture skipped the snapshot on
+      // every noon run, leaving /api/forecast on the previous day's snapshot.
+      if (soldCaptureResult?.error && !lateCaptureLanded) {
         return { skipped: false, stored: 0, error: `skipped: sold capture did not complete (${soldCaptureResult.error}) — snapshot could freeze an in-flight write` };
       }
       try {
