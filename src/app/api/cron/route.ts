@@ -387,7 +387,9 @@ export async function GET(request: Request) {
       emailResult = { success: false, error: `skipped: ${slot} report already sent today` };
       logger.push("email", "skipped", null, null, emailResult.error ?? null);
     } else {
-      emailResult = await sendReportEmail({ date, timestamp });
+      // Pass THIS run's task outcomes so the report's pipeline-health banner reflects
+      // the run that produced these numbers (cron_runs is not written until flush()).
+      emailResult = await sendReportEmail({ date, timestamp, tasks: logger.entries });
       // A failed send must not burn the slot — release it so a later run retries.
       if (!emailResult.success && !forceEmail) await azReleaseReportSend(date, slot);
       // Persist the headline in the email row so the NEXT report can diff against it.

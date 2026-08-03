@@ -18,7 +18,7 @@ import { generateChartImage } from "@/lib/email";
 import { buildModel, buildQuarterView, computeQtdHeadline, type QtdData, type QtdHeadline } from "@/lib/qtd-compute";
 import { computeQtdModelData, type ListingsDay } from "@/lib/qtd-model-compute";
 import { fmtM, fmtPct } from "@/lib/qtd-shared";
-import { azFetchRecentEmailRuns } from "@/lib/azure-tables";
+import { azFetchRecentEmailRuns, azFetchCronRunsRecent } from "@/lib/azure-tables";
 import { addDaysKey, quarterDayKeys } from "@/lib/qtd-shared";
 import { siteLabel } from "@/lib/sites";
 import { etQuarterKey, formatQuarterLabel } from "@/lib/time";
@@ -326,7 +326,46 @@ function tilesGrid(cells: string[]): string {
   return `<table style="width:100%;border-collapse:collapse;table-layout:fixed;">${rows.join("")}</table>`;
 }
 
-function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCids: { qtdYoy?: string; qtd?: string; listings?: string }): string {
+/** One cron task's outcome, as the CronLogger records it. */
+export type CronTaskState = { source: string; status: string; rows_ingested: number | null; error: string | null };
+
+/**
+ * Pipeline-health banner. The report is the one thing that gets read twice a day,
+ * so a broken ingestion task belongs HERE and not only in the ops log — that is
+ * exactly how marketplace_metrics failed for five weeks and sold_lots timed out
+ * every noon run without anyone noticing (the numbers still looked plausible).
+ *
+ * Only `failed`/`partial` count. `skipped` is normal (sam and retention are
+ * off-cycle on most runs) and a 0-row success is normal for retention and
+ * seller_fees, so both would be pure noise here. /api/data-status deliberately
+ * keeps a broader alert set — a dashboard badge can afford a weaker signal than
+ * a twice-daily email can.
+ *
+ * Renders a muted "all N tasks ok" when clean, rather than nothing, so the check
+ * is visibly alive — a silent health check is indistinguishable from a broken one.
+ */
+function buildHealthLine(tasks: CronTaskState[] | undefined): string {
+  if (!tasks || tasks.length === 0) return "";
+  const bad = tasks.filter((t) => t.status === "failed" || t.status === "partial");
+  if (bad.length === 0) {
+    const ok = tasks.filter((t) => t.status === "success").length;
+    return `<p style="font-size:12px;color:#9ca3af;margin:10px 0 0;">Pipeline: all ${ok} task${ok === 1 ? "" : "s"} ok</p>`;
+  }
+  const items = bad
+    .map((t) => {
+      const why = t.error ? String(t.error).replace(/\s+/g, " ").slice(0, 120) : t.status;
+      return `<li style="margin:2px 0;"><strong>${t.source}</strong> ${t.status} — ${why}</li>`;
+    })
+    .join("");
+  return `<div style="margin:12px 0 0;border:1px solid #fecaca;background:#fef2f2;border-radius:6px;padding:10px 12px;">
+    <div style="font-size:12px;font-weight:700;color:#b91c1c;margin-bottom:4px;">
+      &#9888; ${bad.length} pipeline task${bad.length === 1 ? "" : "s"} did not complete — the figures below may be stale or incomplete
+    </div>
+    <ul style="margin:0;padding-left:18px;font-size:12px;color:#7f1d1d;">${items}</ul>
+  </div>`;
+}
+
+function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCids: { qtdYoy?: string; qtd?: string; listings?: string }, tasks?: CronTaskState[]): string {
   const h = d.headline;
   const tiles: string[] = [];
   if (h) {
@@ -452,6 +491,7 @@ function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCid
       </td>
       <td style="vertical-align:top;text-align:right;white-space:nowrap;">${button}</td>
     </tr></table>
+    ${buildHealthLine(tasks)}
     ${qtdYoyImg}
     ${tiles.length ? `<div style="margin:12px 0 0;">${tilesGrid(tiles)}</div>` : ""}
     ${sinceLine}
@@ -491,10 +531,16 @@ export async function sendReportEmail({
   date,
   timestamp,
   toOverride,
+  tasks,
 }: {
   date: string;
   timestamp: string;
   toOverride?: string;
+  /** THIS run's task outcomes, for the pipeline-health banner. The cron passes its
+   *  logger entries, which is what makes the banner reflect the run that produced
+   *  these very numbers — cron_runs is not written until after the email. Omitted
+   *  by the preview path, which falls back to the last completed run below. */
+  tasks?: CronTaskState[];
 }): Promise<ReportEmailResult> {
   if (!process.env.RESEND_API_KEY) return { success: false, error: "RESEND_API_KEY not set" };
   const recipients = (toOverride ?? process.env.NOTIFICATION_EMAIL ?? "")
@@ -542,7 +588,25 @@ export async function sendReportEmail({
     debug.listings = `error: ${e instanceof Error ? e.message : String(e)}`;
   }
 
-  const html = buildHtml(data, date, timestamp, chartCids);
+  // Preview sends carry no live run, so fall back to the newest cron_runs row per
+  // source (the last completed run) — a lagged banner still beats no banner.
+  let healthTasks = tasks;
+  if (!healthTasks) {
+    healthTasks = await azFetchCronRunsRecent(60)
+      .then((rows) => {
+        const perSource = new Map<string, CronTaskState>();
+        for (const r of rows) {
+          // rows are newest-first; keep the first (latest) per source, skip the run summary
+          if (r.source !== "__run__" && !perSource.has(r.source)) {
+            perSource.set(r.source, { source: r.source, status: r.status, rows_ingested: r.rows_ingested, error: r.error });
+          }
+        }
+        return [...perSource.values()];
+      })
+      .catch(() => undefined);
+  }
+
+  const html = buildHtml(data, date, timestamp, chartCids, healthTasks);
   const { error } = await getResend().emails.send({
     from: process.env.RESEND_FROM_EMAIL || "LQDT Tracker <notifications@resend.dev>",
     to: recipients,
