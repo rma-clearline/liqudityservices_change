@@ -1,8 +1,8 @@
 import "server-only";
 
-import type { ListingRow, MarketplaceSellerRow, SellerDeltaRow } from "./supabase";
+import type { ListingRow } from "./supabase";
 import { ttlCache } from "./cache";
-import { azFetchListings, azFetchMarketplaceSellers, azFetchSellerDeltas } from "./azure-tables";
+import { azFetchListings } from "./azure-tables";
 import {
   getTopSoldLots,
   isAzureSqlConfigured,
@@ -37,19 +37,6 @@ export function getListings(): Promise<ListingRow[]> {
 export async function getLatestListing(): Promise<ListingRow | null> {
   const rows = await getListings();
   return rows[0] ?? null;
-}
-
-
-// --- Marketplace page (2 reads) ---
-export type MarketplaceData = { sellers: MarketplaceSellerRow[]; deltas: SellerDeltaRow[] };
-
-const marketplaceCache = ttlCache<MarketplaceData>(TTL);
-
-export function getMarketplaceData(): Promise<MarketplaceData> {
-  return marketplaceCache.get("all", async () => {
-    const [sellers, deltas] = await Promise.all([azFetchMarketplaceSellers(200), azFetchSellerDeltas()]);
-    return { sellers, deltas };
-  });
 }
 
 // --- Top Sold Items (current quarter) — enriched with take rate + watches ---

@@ -57,10 +57,10 @@ each fetching only the data it needs:
 
 ```
 /             — Listings: active-listing trend chart + history table + email snapshot
-/overview     — Executive summary (realized/projected GMV reconciliation) + listing counts
 /forecast     — Quarterly revenue/GMV forecast
-/marketplace  — Top sellers + seller movers
-/contracts    — Federal contracts, SAM.gov opportunities, and state/local contracts
+/qtd          — Quarter-to-date progress vs guidance/Clearline + model sections
+/marketplace  — Top sold items (QTD) with measured admin fee / buyer premium
+/take-rate    — Take-rate composition + measured fee analytics
 ```
 
 API routes:

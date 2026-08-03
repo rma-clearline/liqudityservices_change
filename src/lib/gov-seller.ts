@@ -13,15 +13,6 @@
 
 export type GovLevel = "federal" | "state" | "local" | "commercial";
 
-export const GOV_LEVELS: GovLevel[] = ["federal", "state", "local", "commercial"];
-
-export const GOV_LEVEL_LABELS: Record<GovLevel, string> = {
-  federal: "Federal",
-  state: "State",
-  local: "Local",
-  commercial: "Commercial",
-};
-
 // Federal agencies / departments / military (checked first — most specific).
 const FEDERAL = [
   /\bfederal\b/i,
@@ -75,40 +66,3 @@ export function classifySellerLevel(companyName: string | null | undefined): Gov
   return "commercial";
 }
 
-export type SellerLike = {
-  company_name: string | null;
-  listing_count: number | null;
-  total_current_bid: number | null;
-};
-
-export type LevelStat = {
-  level: GovLevel;
-  seller_count: number;
-  listing_count: number;
-  gmv_proxy: number;
-  gmv_share: number; // 0..1 of total GMV proxy across all levels
-};
-
-/** Aggregate a seller list into per-level stats (seller/listing counts, GMV proxy + share). */
-export function aggregateByLevel(sellers: SellerLike[]): LevelStat[] {
-  const acc: Record<GovLevel, { seller_count: number; listing_count: number; gmv_proxy: number }> = {
-    federal: { seller_count: 0, listing_count: 0, gmv_proxy: 0 },
-    state: { seller_count: 0, listing_count: 0, gmv_proxy: 0 },
-    local: { seller_count: 0, listing_count: 0, gmv_proxy: 0 },
-    commercial: { seller_count: 0, listing_count: 0, gmv_proxy: 0 },
-  };
-  for (const s of sellers) {
-    const level = classifySellerLevel(s.company_name);
-    acc[level].seller_count += 1;
-    acc[level].listing_count += s.listing_count ?? 0;
-    acc[level].gmv_proxy += s.total_current_bid ?? 0;
-  }
-  const totalGmv = GOV_LEVELS.reduce((sum, l) => sum + acc[l].gmv_proxy, 0);
-  return GOV_LEVELS.map((level) => ({
-    level,
-    seller_count: acc[level].seller_count,
-    listing_count: acc[level].listing_count,
-    gmv_proxy: acc[level].gmv_proxy,
-    gmv_share: totalGmv > 0 ? acc[level].gmv_proxy / totalGmv : 0,
-  }));
-}

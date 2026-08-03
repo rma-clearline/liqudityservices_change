@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { scrapeListings } from "@/lib/scraper";
-import { scrapeMarketplaceMetrics, type SellerInfo } from "@/lib/marketplace-metrics";
 import { computeRevenueForecast, ingestAuctions } from "@/lib/auctions";
 import { fetchSoldRange } from "@/lib/sold-export";
 import {
@@ -20,7 +19,6 @@ import { sendReportEmail, type ReportEmailResult } from "@/lib/report-email";
 import { CronLogger, type SourceSummary } from "@/lib/cron-log";
 import {
   azUpsertListing,
-  azUpsertMarketplaceSellers,
   azUpsertForecastSnapshot,
   azRunRetention,
   azClaimReportSend,
@@ -92,62 +90,6 @@ export async function GET(request: Request) {
       rows: r.error ? 0 : 1,
       detail: { allsurplus: r.allsurplus, govdeals: r.govdeals },
       error: r.error,
-    }),
-  );
-
-  // The marketplace_metrics cards were removed from the UI; we no longer persist
-  // that table. This task still scrapes the marketplace to populate
-  // marketplace_sellers, which powers the Top Sellers table on the Marketplace page.
-  const metricsTask = logger.track(
-    "marketplace_metrics",
-    async () => {
-      const metrics = await scrapeMarketplaceMetrics();
-      const sellerRow = (s: SellerInfo, platform: "AD" | "GD") => ({
-        date,
-        platform,
-        account_id: s.account_id,
-        company_name: s.company_name,
-        country: s.country,
-        state: s.state,
-        listing_count: s.listing_count,
-        total_current_bid: s.total_current_bid,
-        total_bids: s.total_bids,
-        top_bid_asset_id: s.top_bid_asset_id,
-        sub_business_id: s.sub_business_id,
-      });
-      const sellerRows = [
-        ...metrics.allsurplus.sellers.map((s) => sellerRow(s, "AD")),
-        ...metrics.govdeals.sellers.map((s) => sellerRow(s, "GD")),
-      ];
-      let sellersStored = 0;
-      let sellersError: string | null = null;
-      if (sellerRows.length > 0) {
-        try {
-          await azUpsertMarketplaceSellers(sellerRows);
-          sellersStored = sellerRows.length;
-        } catch (e) {
-          sellersError = e instanceof Error ? e.message : String(e);
-        }
-      }
-      // scrapeMarketplaceMetrics never throws; a total fetch failure returns
-      // empty metrics (sample_size 0, no sellers). Surface that as a failed run
-      // rather than a silent 0-row "success" (which would leave the freshness
-      // badge green during an outage).
-      const scrapeFailed = metrics.allsurplus.sample_size === 0 && metrics.govdeals.sample_size === 0;
-      return {
-        sellersStored,
-        sellersError,
-        scrapeFailed,
-        adSample: metrics.allsurplus.sample_size,
-        gdSample: metrics.govdeals.sample_size,
-        scrapeDebug: `AD: ${metrics.allsurplus.debug ?? "?"}; GD: ${metrics.govdeals.debug ?? "?"}`,
-      };
-    },
-    (r): SourceSummary => ({
-      status: r.sellersError || r.scrapeFailed ? "failed" : "success",
-      rows: r.sellersStored,
-      detail: { adSample: r.adSample, gdSample: r.gdSample, sellersStored: r.sellersStored },
-      error: r.sellersError ?? (r.scrapeFailed ? `marketplace scrape returned 0 listings (${r.scrapeDebug})` : null),
     }),
   );
 
@@ -307,9 +249,8 @@ export async function GET(request: Request) {
     }),
   );
 
-  const [listingResult, , , soldCaptureResult] = await Promise.all([
+  const [listingResult, , soldCaptureResult] = await Promise.all([
     listingsTask,
-    metricsTask,
     auctionsTask,
     soldCaptureTask,
   ]);
@@ -392,7 +333,7 @@ export async function GET(request: Request) {
 
   // Keep operational/history tables bounded. This runs after ingestion so it
   // cannot contend with the writers above (azRunRetention: cron_runs >90d,
-  // marketplace_sellers >548d, closed auctions >120d).
+  // closed auctions >120d).
   await logger.track(
     "retention",
     async () => {
@@ -401,7 +342,7 @@ export async function GET(request: Request) {
       }
       try {
         const c = await azRunRetention();
-        return { skipped: false, deleted: c.cron_runs + c.marketplace_sellers + c.auctions, error: null as string | null };
+        return { skipped: false, deleted: c.cron_runs + c.auctions, error: null as string | null };
       } catch (e) {
         return { skipped: false, deleted: 0, error: e instanceof Error ? e.message : String(e) };
       }

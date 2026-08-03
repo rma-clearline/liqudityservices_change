@@ -8,7 +8,7 @@
 import "server-only";
 import sql from "mssql";
 import { getPool } from "./azure-sql";
-import type { ListingRow, MarketplaceSellerRow, SellerDeltaRow } from "./supabase";
+import type { ListingRow } from "./supabase";
 
 // --- boundary helpers -------------------------------------------------------
 /** DATETIME2/DATETIMEOFFSET → ISO string (matches PostgREST's timestamptz text). */
@@ -90,75 +90,6 @@ export async function azUpsertListing(v: {
     );
 }
 
-// --- marketplace page reads -------------------------------------------------
-function mapSeller(r: Record<string, unknown>): MarketplaceSellerRow {
-  return {
-    ...(r as unknown as MarketplaceSellerRow),
-    id: Number(r.id),
-    listing_count: num(r.listing_count),
-    total_current_bid: num(r.total_current_bid),
-    total_bids: num(r.total_bids),
-    created_at: iso(r.created_at) as string,
-  };
-}
-
-export async function azFetchMarketplaceSellers(limit = 200): Promise<MarketplaceSellerRow[]> {
-  const pool = await getPool();
-  const res = await pool.request().query(
-    `SELECT TOP (${top(limit, 200)}) * FROM lqdt.marketplace_sellers ORDER BY date DESC, ${descNullsFirst("total_current_bid")}`,
-  );
-  return res.recordset.map(mapSeller);
-}
-
-// Inlines the Supabase marketplace_seller_deltas view (migration 019): compares
-// each platform's two most-recent snapshots. TOP bounds the result like the
-// old .limit(500).
-const DELTAS_SQL = `
-WITH ranked_dates AS (
-  SELECT platform, date, ROW_NUMBER() OVER (PARTITION BY platform ORDER BY date DESC) AS rn
-  FROM (SELECT DISTINCT platform, date FROM lqdt.marketplace_sellers) d
-),
-latest   AS (SELECT platform, date FROM ranked_dates WHERE rn = 1),
-previous AS (SELECT platform, date FROM ranked_dates WHERE rn = 2),
-cur AS (
-  SELECT s.platform, s.account_id, s.company_name, s.country, s.state,
-         s.listing_count, s.total_current_bid, s.total_bids, s.date
-  FROM lqdt.marketplace_sellers s JOIN latest l ON s.platform = l.platform AND s.date = l.date
-),
-pr AS (
-  SELECT s.platform, s.account_id, s.listing_count AS prev_listing_count,
-         s.total_current_bid AS prev_total_current_bid, s.date AS prev_date
-  FROM lqdt.marketplace_sellers s JOIN previous p ON s.platform = p.platform AND s.date = p.date
-)
-SELECT TOP (500)
-  COALESCE(cur.platform, pr.platform)     AS platform,
-  COALESCE(cur.account_id, pr.account_id) AS account_id,
-  cur.company_name, cur.country, cur.state,
-  cur.date AS snapshot_date, pr.prev_date,
-  cur.listing_count, pr.prev_listing_count,
-  COALESCE(cur.listing_count,0) - COALESCE(pr.prev_listing_count,0)         AS listing_count_delta,
-  cur.total_current_bid, pr.prev_total_current_bid,
-  COALESCE(cur.total_current_bid,0) - COALESCE(pr.prev_total_current_bid,0) AS gmv_delta,
-  CAST(CASE WHEN pr.account_id IS NULL THEN 1 ELSE 0 END AS BIT) AS is_new,
-  CAST(CASE WHEN cur.account_id IS NULL THEN 1 ELSE 0 END AS BIT) AS disappeared
-FROM cur FULL OUTER JOIN pr ON cur.platform = pr.platform AND cur.account_id = pr.account_id`;
-
-export async function azFetchSellerDeltas(): Promise<SellerDeltaRow[]> {
-  const pool = await getPool();
-  const res = await pool.request().query(DELTAS_SQL);
-  return res.recordset.map((r) => ({
-    ...(r as unknown as SellerDeltaRow),
-    listing_count: num(r.listing_count),
-    prev_listing_count: num(r.prev_listing_count),
-    listing_count_delta: num(r.listing_count_delta),
-    total_current_bid: num(r.total_current_bid),
-    prev_total_current_bid: num(r.prev_total_current_bid),
-    gmv_delta: num(r.gmv_delta),
-    is_new: r.is_new === true || r.is_new === 1,
-    disappeared: r.disappeared === true || r.disappeared === 1,
-  }));
-}
-
 // --- data-status ------------------------------------------------------------
 /** Composite freshness (mirrors the latest_data_freshness RPC). */
 export async function azFetchDataFreshness(): Promise<Record<string, string | null>> {
@@ -166,13 +97,11 @@ export async function azFetchDataFreshness(): Promise<Record<string, string | nu
   const res = await pool.request().query(
     "SELECT " +
       "(SELECT MAX(date) FROM lqdt.listings) AS listings, " +
-      "(SELECT MAX(date) FROM lqdt.marketplace_sellers) AS marketplace_sellers, " +
       "(SELECT MAX(last_seen_at) FROM lqdt.auctions) AS auctions",
   );
   const r = res.recordset[0] ?? {};
   return {
     listings: r.listings ?? null,
-    marketplace_sellers: r.marketplace_sellers ?? null,
     auctions: iso(r.auctions),
   };
 }
@@ -406,17 +335,6 @@ export async function azFetchAuctionsDebug(): Promise<{ rows: { platform: string
   };
 }
 
-// --- marketplace_sellers upsert ---
-const SELLER_COLS: Col[] = [
-  ["date", "NVARCHAR(10)"], ["platform", "NVARCHAR(2)"], ["account_id", "NVARCHAR(128)"],
-  ["company_name", "NVARCHAR(512)"], ["country", "NVARCHAR(128)"], ["state", "NVARCHAR(128)"],
-  ["listing_count", "INT"], ["total_current_bid", "REAL"], ["total_bids", "INT"],
-  ["top_bid_asset_id", "NVARCHAR(128)"], ["sub_business_id", "NVARCHAR(128)"],
-];
-export async function azUpsertMarketplaceSellers(rows: readonly object[]): Promise<number> {
-  const key = (r: unknown) => { const o = r as { date: string; platform: string; account_id: string }; return `${o.date}:${o.platform}:${o.account_id}`; };
-  return runJsonWrite(upsertMergeSql("lqdt.marketplace_sellers", SELLER_COLS, ["date", "platform", "account_id"]), dedupBy(rows, key));
-}
 
 // --- fx_rates upsert ---
 const FX_COLS: Col[] = [
@@ -473,19 +391,15 @@ export async function azUpsertForecastSnapshot(quarter: string, payload: unknown
 
 // --- retention (replaces the Supabase run_cost_retention RPC / migration 024) ---
 /** Bound the operational + duplicate-closed-auction history: cron_runs >90d,
- *  marketplace_sellers >548d, closed auctions >120d. Returns per-table delete counts. */
-export async function azRunRetention(): Promise<{ cron_runs: number; marketplace_sellers: number; auctions: number }> {
+ *  closed auctions >120d. Returns per-table delete counts. */
+export async function azRunRetention(): Promise<{ cron_runs: number; auctions: number }> {
   const pool = await getPool();
   const cron = await pool.request().query("DELETE FROM lqdt.cron_runs WHERE started_at < DATEADD(day, -90, SYSUTCDATETIME())");
-  const sellers = await pool
-    .request()
-    .query("DELETE FROM lqdt.marketplace_sellers WHERE date < CONVERT(NVARCHAR(10), DATEADD(day, -548, CAST(SYSUTCDATETIME() AS date)), 23)");
   const auctions = await pool
     .request()
     .query("DELETE FROM lqdt.auctions WHERE status <> 'open' AND close_time_utc < DATEADD(day, -120, SYSUTCDATETIME())");
   return {
     cron_runs: cron.rowsAffected[0] ?? 0,
-    marketplace_sellers: sellers.rowsAffected[0] ?? 0,
     auctions: auctions.rowsAffected[0] ?? 0,
   };
 }

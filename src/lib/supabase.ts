@@ -11,40 +11,6 @@ export type ListingRow = {
   created_at: string;
 };
 
-export type MarketplaceSellerRow = {
-  id: number;
-  date: string;
-  platform: "AD" | "GD";
-  account_id: string;
-  company_name: string;
-  country: string | null;
-  state: string | null;
-  listing_count: number | null;
-  total_current_bid: number | null;
-  total_bids: number | null;
-  top_bid_asset_id: string | null;
-  sub_business_id: string | null;
-  created_at: string;
-};
-
-export type SellerDeltaRow = {
-  platform: "AD" | "GD";
-  account_id: string;
-  company_name: string | null;
-  country: string | null;
-  state: string | null;
-  snapshot_date: string | null;
-  prev_date: string | null;
-  listing_count: number | null;
-  prev_listing_count: number | null;
-  listing_count_delta: number | null;
-  total_current_bid: number | null;
-  prev_total_current_bid: number | null;
-  gmv_delta: number | null;
-  is_new: boolean | null;
-  disappeared: boolean | null;
-};
-
 export type AuctionRow = {
   id: number;
   platform: "AD" | "GD";
