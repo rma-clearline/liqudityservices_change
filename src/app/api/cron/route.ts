@@ -238,7 +238,13 @@ export async function GET(request: Request) {
   // over successive daily runs without hammering Maestro. Own time budget so it can
   // never push the shared cron past maxDuration. Best-effort: failures are logged,
   // never fatal to the rest of the cron.
-  const sellerFeeTask = logger.track(
+  // NOT started here: this fans out 8 concurrent Maestro bidbox fetches for up to 30s,
+  // and Maestro is a shared, finite resource. Run inside the parallel group it starved
+  // the other Maestro consumers — sold_lots would blow its capture budget whenever this
+  // had a backlog to price (noon), which is what made the noon/5pm reports go stale.
+  // Invoked AFTER the report instead; the Take Rate page it feeds tolerates a lag of one
+  // run. Same lesson as a585b4b (fee ANALYTICS starving the pool) applied to the FETCH.
+  const runSellerFeeTask = () => logger.track(
     "seller_fees",
     async () => {
       if (!runSoldCapture || !isAzureSqlConfigured()) {
@@ -306,7 +312,6 @@ export async function GET(request: Request) {
     metricsTask,
     auctionsTask,
     soldCaptureTask,
-    sellerFeeTask,
   ]);
 
   // The capture's timeout rejects the TASK but does not cancel its write, which keeps
@@ -459,6 +464,11 @@ export async function GET(request: Request) {
   // Fired LAST, after the report email: it used to run before the forecast snapshot and
   // the email, and its (then concurrent) queries starved the pool so the email's
   // getSoldDaily timed out and mailed a live quarter collapsed to the sparse tracked feed.
+  // Seller-fee backfill runs HERE — after the capture, snapshot and report email — so its
+  // 8-way Maestro fan-out can no longer starve them (see runSellerFeeTask above). Awaited
+  // before the analytics refresh below so that refresh sees the fees this run just wrote.
+  await runSellerFeeTask();
+
   if (runSoldCapture && isAzureSqlConfigured()) {
     const analyticsFrom = new Date(Date.now() - 730 * 86_400_000).toISOString().slice(0, 10);
     void refreshFeeAnalytics(analyticsFrom)
