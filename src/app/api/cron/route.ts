@@ -18,7 +18,14 @@ import { etQuarterKey } from "@/lib/time";
 import { quarterDayKeys } from "@/lib/qtd-shared";
 import { sendReportEmail, type ReportEmailResult } from "@/lib/report-email";
 import { CronLogger, type SourceSummary } from "@/lib/cron-log";
-import { azUpsertListing, azUpsertMarketplaceSellers, azUpsertForecastSnapshot, azRunRetention } from "@/lib/azure-tables";
+import {
+  azUpsertListing,
+  azUpsertMarketplaceSellers,
+  azUpsertForecastSnapshot,
+  azRunRetention,
+  azClaimReportSend,
+  azReleaseReportSend,
+} from "@/lib/azure-tables";
 
 // Daily reconciliation also materializes the forecast after ingestion.
 export const maxDuration = 120;
@@ -387,14 +394,28 @@ export async function GET(request: Request) {
   const skipEmail = searchParams.get("sendEmail") === "0";
   const eveningReport = searchParams.get("sold") === "1" && eveningHours.includes(now.getHours());
   const shouldEmail = !skipEmail && (forceEmail || isDailyRun || eveningReport);
+  // Which once-a-day slot this send belongs to. The ledger claim below makes the
+  // slot idempotent: ANY extra invocation that reaches this step (a manual
+  // ?sold=1 refresh, a job retry, or a second fire overlapping a slow run) is a
+  // no-op instead of a second mail to the whole recipient list. ?sendEmail=1 is
+  // an explicit human "send one now", so it bypasses the claim by design.
+  const slot = isDailyRun ? "noon" : "evening";
   let emailResult: ReportEmailResult = {
     success: false,
     error: shouldEmail ? "skipped" : "skipped: not a report-hour run",
   };
   if (shouldEmail && process.env.RESEND_API_KEY) {
-    emailResult = await sendReportEmail({ date, timestamp });
-    // Persist the headline in the email row so the NEXT report can diff against it.
-    logger.push("email", emailResult.success ? "success" : "failed", null, { charts: emailResult.charts, headline: emailResult.headline ?? null }, emailResult.error ?? null);
+    const claimed = forceEmail || (await azClaimReportSend(date, slot, logger.runId));
+    if (!claimed) {
+      emailResult = { success: false, error: `skipped: ${slot} report already sent today` };
+      logger.push("email", "skipped", null, null, emailResult.error ?? null);
+    } else {
+      emailResult = await sendReportEmail({ date, timestamp });
+      // A failed send must not burn the slot — release it so a later run retries.
+      if (!emailResult.success && !forceEmail) await azReleaseReportSend(date, slot);
+      // Persist the headline in the email row so the NEXT report can diff against it.
+      logger.push("email", emailResult.success ? "success" : "failed", null, { charts: emailResult.charts, headline: emailResult.headline ?? null, slot }, emailResult.error ?? null);
+    }
   } else {
     logger.push("email", "skipped", null, null, emailResult.error ?? null);
   }

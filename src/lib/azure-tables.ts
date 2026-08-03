@@ -489,3 +489,49 @@ export async function azRunRetention(): Promise<{ cron_runs: number; marketplace
     auctions: auctions.rowsAffected[0] ?? 0,
   };
 }
+
+// --- report send ledger (one report per slot per day) ------------------------
+/**
+ * Atomically claim today's report slot. Returns true only for the caller that
+ * won — the PK on (send_date, slot) makes the INSERT the lock, so a concurrent
+ * second cron invocation gets a duplicate-key error (2627/2601) and returns
+ * false instead of mailing the list twice. A plain "already sent?" SELECT could
+ * not close this race: on 2026-08-03 two invocations were inside the email step
+ * simultaneously (the 21:00 run took ~8 min) and both would have seen "no".
+ *
+ * Fails OPEN (returns true) if the ledger itself is unreachable — a send is the
+ * job; losing the report because the guard's table is down would be worse than
+ * a rare duplicate.
+ */
+export async function azClaimReportSend(sendDate: string, slot: string, runId: string): Promise<boolean> {
+  try {
+    const pool = await getPool();
+    await pool
+      .request()
+      .input("d", sql.NVarChar(10), sendDate)
+      .input("s", sql.NVarChar(16), slot)
+      .input("r", sql.UniqueIdentifier, runId)
+      .query("INSERT INTO lqdt.report_sends (send_date, slot, run_id) VALUES (@d, @s, @r)");
+    return true;
+  } catch (e) {
+    const n = (e as { number?: number; originalError?: { info?: { number?: number } } })?.number ??
+      (e as { originalError?: { info?: { number?: number } } })?.originalError?.info?.number;
+    if (n === 2627 || n === 2601) return false; // already claimed → another run is sending/sent it
+    console.warn("[report] send-ledger unreachable, sending anyway:", e instanceof Error ? e.message : String(e));
+    return true; // fail open
+  }
+}
+
+/** Release a claim so a later run can retry the slot (used when the send fails). */
+export async function azReleaseReportSend(sendDate: string, slot: string): Promise<void> {
+  try {
+    const pool = await getPool();
+    await pool
+      .request()
+      .input("d", sql.NVarChar(10), sendDate)
+      .input("s", sql.NVarChar(16), slot)
+      .query("DELETE FROM lqdt.report_sends WHERE send_date = @d AND slot = @s");
+  } catch {
+    // best-effort: a stuck claim only means this slot won't retry today
+  }
+}
