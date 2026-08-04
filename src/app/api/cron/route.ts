@@ -93,7 +93,9 @@ export async function GET(request: Request) {
     }),
   );
 
-  const auctionsTask = logger.track(
+  // NOT started here — see the serialized await below. logger.track() runs on call,
+  // so these two stay thunks to keep them off Maestro at the same time.
+  const runAuctionsTask = () => logger.track(
     "auctions",
     () => ingestAuctions({ includeSold: runSoldCapture }),
     (r): SourceSummary => {
@@ -120,7 +122,7 @@ export async function GET(request: Request) {
   // GI) so the data is preserved before Maestro's ~12-month archive rolls it off.
   // Idempotent MERGE (row_key), so re-running each 4h just refreshes late-settling
   // lots. A short trailing window keeps it well within maxDuration.
-  const soldCaptureTask = logger.track(
+  const runSoldCaptureTask = () => logger.track(
     "sold_lots",
     async () => {
       if (!runSoldCapture) {
@@ -256,11 +258,22 @@ export async function GET(request: Request) {
     }),
   );
 
-  const [listingResult, , soldCaptureResult] = await Promise.all([
-    listingsTask,
-    auctionsTask,
-    soldCaptureTask,
-  ]);
+  // The sold capture and the auctions ingest are BOTH heavy Maestro pulls — and when
+  // the capture runs, `auctions` pulls the sold feed too (includeSold), so they were
+  // querying overlapping sold data simultaneously. Run concurrently they starved each
+  // other: on 2026-08-04 noon `auctions` took 69s and the capture blew its budget,
+  // while the identical capture took 4s at 16:04 with Maestro to itself. Serialize
+  // them, capture FIRST (it feeds the snapshot and the report, so it gets the clean
+  // shot). `listings` is a ~1s page scrape and stays parallel.
+  //
+  // The duplicate sold pull is NOT removed: those closed_sold rows are the only source
+  // of `sold` in the projection model's closeRate = sold/closed, so dropping
+  // includeSold would silently take every open-auction projection to $0 (~$7.5M of
+  // projected-remaining GMV). Serializing removes the contention without touching the
+  // numbers; de-duplicating the pull itself is a separate, riskier change.
+  const soldCaptureResult = await runSoldCaptureTask();
+  await runAuctionsTask();
+  const listingResult = await listingsTask;
 
   // The capture's timeout rejects the TASK but does not cancel its write, which keeps
   // running on this long-lived container and lands minutes later. Everything below reads
