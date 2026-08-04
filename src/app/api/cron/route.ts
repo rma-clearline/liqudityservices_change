@@ -108,10 +108,12 @@ export async function GET(request: Request) {
     },
   );
 
-  // Set when the capture times out: resolves true once the ABANDONED write (and its
-  // supersession re-mark) actually lands. Everything downstream reads sold_lots, so it
-  // must wait for this rather than compute on pre-capture data — see the wait below.
-  let lateCaptureWrite: Promise<boolean> | null = null;
+  // Set when the capture times out: resolves once the ABANDONED write (and its
+  // supersession re-mark) actually lands, carrying the row count so the log can be
+  // corrected from "failed" to "recovered". Everything downstream reads sold_lots, so
+  // it must wait for this rather than compute on pre-capture data — see the wait below.
+  type LateWrite = { ok: boolean; written: number };
+  let lateCaptureWrite: Promise<LateWrite> | null = null;
 
   // Durable per-lot capture into Azure SQL (lqdt.sold_lots). Writes the last few
   // ET days' COMPLETE, deduped feed (via fetchSoldRange — true marketplace, incl.
@@ -136,7 +138,12 @@ export async function GET(request: Request) {
       // can't push the shared 60s cron past maxDuration and get the function
       // killed — which would drop cron_runs logging and the noon email for every
       // task. On timeout this task is marked failed; the rest of the cron proceeds.
-      const timeoutMs = Number(process.env.SOLD_CAPTURE_TIMEOUT_MS) || 45000;
+      // 120s, not the original 45s: the capture legitimately needs longer while it
+      // competes with the auctions ingest for Maestro (2026-08-04 noon: auctions 69s
+      // and the capture blew a 45s budget; the identical work took 4s four minutes
+      // later when things were quiet). Since the run now WAITS for a late write
+      // anyway, a tight budget bought nothing but a misleading "failed" status.
+      const timeoutMs = Number(process.env.SOLD_CAPTURE_TIMEOUT_MS) || 120_000;
       const work = (async () => {
         const fetched = await fetchSoldRange(from, to, { maxPages: 400 });
         // A truncated fetch still writes its (real) rows but must not claim day
@@ -156,12 +163,12 @@ export async function GET(request: Request) {
         // SOLD_CURRENT until the next capture run. Chain a follow-up refresh onto the
         // abandoned write so a late landing re-marks immediately.
         lateCaptureWrite = work
-          .then(async () => {
+          .then(async (r) => {
             const s = await refreshSoldSupersession();
             console.log(`[cron] sold supersession (late capture write): ${s.changed} row(s) re-marked in ${s.ms}ms`);
-            return true;
+            return { ok: true, written: r.written };
           })
-          .catch(() => false);
+          .catch(() => ({ ok: false, written: 0 }));
         void lateCaptureWrite;
         return { written: 0, from, to, truncated: false, skipped: false, error: e instanceof Error ? e.message : String(e) };
       }
@@ -266,13 +273,22 @@ export async function GET(request: Request) {
   if (soldCaptureResult?.error && lateCaptureWrite) {
     const waitMs = Number(process.env.SOLD_CAPTURE_LATE_WAIT_MS) || 300_000;
     const t0 = Date.now();
-    lateCaptureLanded = await Promise.race([
+    const late = await Promise.race([
       lateCaptureWrite,
-      new Promise<boolean>((r) => setTimeout(() => r(false), waitMs)),
+      new Promise<LateWrite>((r) => setTimeout(() => r({ ok: false, written: 0 }), waitMs)),
     ]);
-    console.log(
-      `[cron] late sold-capture write ${lateCaptureLanded ? "landed" : "did NOT land"} after ${Math.round((Date.now() - t0) / 1000)}s`,
-    );
+    lateCaptureLanded = late.ok;
+    const secs = Math.round((Date.now() - t0) / 1000);
+    console.log(`[cron] late sold-capture write ${late.ok ? "landed" : "did NOT land"} after ${secs}s`);
+    // Downgrade the log from "failed" to "partial": the data IS in, so this is a
+    // recovery. Red must mean "figures are missing data" or the alert gets ignored.
+    if (late.ok) {
+      logger.amend("sold_lots", {
+        status: "partial",
+        rows_ingested: late.written,
+        error: `recovered: ${soldCaptureResult.error} — abandoned write landed after ${secs}s (${late.written} rows) before anything read it`,
+      });
+    }
   }
 
   // A relisted asset resells under a new auctionId, and row_key is keyed by auction, so

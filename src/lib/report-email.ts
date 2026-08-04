@@ -346,23 +346,44 @@ export type CronTaskState = { source: string; status: string; rows_ingested: num
  */
 function buildHealthLine(tasks: CronTaskState[] | undefined): string {
   if (!tasks || tasks.length === 0) return "";
-  const bad = tasks.filter((t) => t.status === "failed" || t.status === "partial");
-  if (bad.length === 0) {
+  const failed = tasks.filter((t) => t.status === "failed");
+  const partial = tasks.filter((t) => t.status === "partial");
+  if (failed.length === 0 && partial.length === 0) {
     const ok = tasks.filter((t) => t.status === "success").length;
     return `<p style="font-size:12px;color:#9ca3af;margin:10px 0 0;">Pipeline: all ${ok} task${ok === 1 ? "" : "s"} ok</p>`;
   }
-  const items = bad
-    .map((t) => {
-      const why = t.error ? String(t.error).replace(/\s+/g, " ").slice(0, 120) : t.status;
-      return `<li style="margin:2px 0;"><strong>${t.source}</strong> ${t.status} — ${why}</li>`;
-    })
-    .join("");
-  return `<div style="margin:12px 0 0;border:1px solid #fecaca;background:#fef2f2;border-radius:6px;padding:10px 12px;">
-    <div style="font-size:12px;font-weight:700;color:#b91c1c;margin-bottom:4px;">
-      &#9888; ${bad.length} pipeline task${bad.length === 1 ? "" : "s"} did not complete — the figures below may be stale or incomplete
-    </div>
-    <ul style="margin:0;padding-left:18px;font-size:12px;color:#7f1d1d;">${items}</ul>
-  </div>`;
+  const items = (list: CronTaskState[], color: string) =>
+    list
+      .map((t) => {
+        const why = t.error ? String(t.error).replace(/\s+/g, " ").slice(0, 160) : t.status;
+        return `<li style="margin:2px 0;color:${color};"><strong>${t.source}</strong> — ${why}</li>`;
+      })
+      .join("");
+  const block = (border: string, bg: string, fg: string, heading: string, body: string) =>
+    `<div style="margin:12px 0 0;border:1px solid ${border};background:${bg};border-radius:6px;padding:10px 12px;">
+      <div style="font-size:12px;font-weight:700;color:${fg};margin-bottom:4px;">${heading}</div>
+      <ul style="margin:0;padding-left:18px;font-size:12px;">${body}</ul>
+    </div>`;
+  // RED = data is actually missing, so the figures below can be wrong.
+  // AMBER = a task stumbled but recovered; the figures are complete. Keeping these
+  // visually distinct is the whole point — a banner that cries wolf gets ignored,
+  // which is how a genuinely broken task survived five weeks unnoticed.
+  const out: string[] = [];
+  if (failed.length) {
+    out.push(
+      block("#fecaca", "#fef2f2", "#b91c1c",
+        `&#9888; ${failed.length} pipeline task${failed.length === 1 ? "" : "s"} did not complete — the figures below may be stale or incomplete`,
+        items(failed, "#7f1d1d")),
+    );
+  }
+  if (partial.length) {
+    out.push(
+      block("#fde68a", "#fffbeb", "#b45309",
+        `${partial.length} task${partial.length === 1 ? "" : "s"} recovered — figures below are complete, no action needed`,
+        items(partial, "#78350f")),
+    );
+  }
+  return out.join("");
 }
 
 function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCids: { qtdYoy?: string; qtd?: string; listings?: string }, tasks?: CronTaskState[]): string {

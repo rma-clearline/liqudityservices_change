@@ -76,6 +76,19 @@ export class CronLogger {
     return this.records;
   }
 
+  /**
+   * Revise an already-recorded source's outcome, for the case where the REAL
+   * outcome is only knowable after the task returned. The sold capture is the
+   * motivating case: its budget rejects the task, but the abandoned write can
+   * still land — that is a recovery, not a failure, and logging it as `failed`
+   * trains readers to ignore the alert (the exact habit that let a broken task
+   * run unnoticed for five weeks).
+   */
+  amend(source: string, patch: Partial<Pick<CronRunRecord, "status" | "error" | "rows_ingested">>): void {
+    const rec = this.records.find((r) => r.source === source);
+    if (rec) Object.assign(rec, patch);
+  }
+
   /** Insert all records plus a run summary. Best-effort; never throws. */
   async flush(): Promise<CronRunRecord[]> {
     const ended = new Date();
