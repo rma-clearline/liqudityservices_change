@@ -310,14 +310,22 @@ export async function GET(request: Request) {
   // after the sold capture and before the forecast snapshot below, because it is what
   // keeps SOLD_CURRENT (the deduped read surface in azure-sql.ts that every aggregation
   // goes through) in step with what was just ingested.
+  // Logged as its own cron_runs source. It used to be console.error only, so when it
+  // failed (2026-08-06 noon) the ops log showed the CONSEQUENCE ("snapshot skipped")
+  // with no way to recover the cause — the underlying SQL error was unrecoverable
+  // after the fact. A guard that fires without saying why cannot be diagnosed.
   let supersessionOk = true;
   if (runSoldCapture && isAzureSqlConfigured()) {
+    const startedAt = new Date();
     try {
       const s = await refreshSoldSupersession();
       console.log(`[cron] sold supersession: ${s.changed} row(s) re-marked in ${s.ms}ms`);
+      logger.push("supersession", "success", s.changed, { ms: s.ms }, null, startedAt);
     } catch (e) {
       supersessionOk = false;
-      console.error("[cron] sold supersession failed:", e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("[cron] sold supersession failed:", msg);
+      logger.push("supersession", "failed", 0, null, msg, startedAt);
     }
   }
 
