@@ -65,25 +65,46 @@ Container Apps has no built-in cron, so scheduling lives in ACA **Jobs** (create
 `az containerapp job create --yaml`; multi-arg `command` needs the YAML form). All
 times are **UTC**.
 
-- **`lqdt-cron`** — the app's data pipeline. Cron `0 0,4,8,12,16,20 * * *` (every 4h).
+**Why :30, and why `replicaRetryLimit = 0`** (both set 2026-08-06 — do not revert):
+- The `cl-tool-rg` environment is shared with the `clmosaic-*` jobs, and several fire on
+  the hour — `clmosaic-gc-refresh-links` runs `0 11-23` (EVERY hour at :00), plus
+  `clmosaic-eia-daily` at `0 16` and `clmosaic-odp-daily` at `0 11,21`. The lqdt jobs
+  used to land on exactly those slots, so the heavy runs contended for CPU and Maestro.
+  Moving to :30 clears all of it; nothing else in the RG is scheduled at :30 in those hours.
+- ACA's ingress caps a request at **240s**. Once the pipeline grew past that, `curl -fsS`
+  died mid-run, the replica was marked failed, and `replicaRetryLimit: 1` re-ran the WHOLE
+  pipeline ~4½ min later — while the first run was still finishing server-side. Measured
+  over four days: 6/6 runs longer than 240s were followed by a duplicate; 0 shorter runs
+  were. That duplicate was the source of the double-sent report and of overlapping-run DB
+  contention. Retry is now 0: the work always completes server-side, so a timed-out curl
+  needs no retry, and the next scheduled fire is at most 4h away.
+- ⚠️ `az containerapp job update --replica-retry-limit 0` **silently does nothing** (the CLI
+  treats 0 as "unset"). It has to be set with an ARM PATCH:
+  `az rest --method patch --url ".../providers/Microsoft.App/jobs/<job>?api-version=2024-03-01"
+  --body '{"properties":{"configuration":{"replicaRetryLimit":0}}}'`
+
+- **`lqdt-cron`** — the app's data pipeline. Cron `30 0,4,8,12,16,20 * * *` (every 4h,
+  at :30 — see "Why :30" below).
   Runs `curl -fsS "$APP_URL/api/cron?secret=$CRON_SECRET"` (secret `cron-secret`). The
   scrapers run on every fire, but the once-daily work (`sold_lots` reconciliation, SAM,
   state contracts, retention, forecast snapshot) only on the **noon-ET** fire
-  (16:00 UTC = noon EDT / 11am EST; gated by `DAILY_INGEST_HOURS_ET=11,12`). Replaced the
+  (16:30 UTC = 12:30pm EDT / 11:30am EST; gated by `DAILY_INGEST_HOURS_ET=11,12` — both
+  DST states land on hour 12/11, inside the gate). Replaced the
   old Vercel cron. The **report email** fires on exactly two runs: the **noon** daily
   fire (`isDailyRun`, `DAILY_INGEST_HOURS_ET`) and the **~5pm** sold-capture fire
   (`?sold=1` at ET `REPORT_EVENING_HOURS_ET=16,17`, DST-safe). Tying the evening send to
-  the `?sold=1` flag is what keeps the every-4h 4pm-EDT `lqdt-cron` fire (20:00 UTC, ET
+  the `?sold=1` flag is what keeps the every-4h 4:30pm-EDT `lqdt-cron` fire (20:30 UTC, ET
   hour 16, no sold flag) from sending a spurious third report. Preview a report to
   rma@clearlinecap.com without running the pipeline via `?sendReportOnly=1&secret=…`.
 - **`lqdt-sold-capture`** — intraday `sold_lots` refreshes so the *current* day's GMV
   shows up same-day instead of waiting for the next noon reconciliation. Cron
-  `0 3,21 * * *` → **~5pm ET** (21:00 UTC — "halfway", ~66% of the day's GMV closed) and
-  **~11pm ET** (03:00 UTC — "end", ~99% closed). Runs
+  `30 3,21 * * *` → **~5:30pm ET** (21:30 UTC — "halfway", ~66% of the day's GMV closed) and
+  **~11:30pm ET** (03:30 UTC — "end", ~99% closed). Runs
   `curl -fsS "$APP_URL/api/cron?sold=1&secret=$CRON_SECRET"`; `sold=1` captures sold lots +
   refreshes the forecast snapshot, skipping the once-daily SAM/state/retention (so it never
-  burns the SAM daily quota). The 5pm fire also sends the report email (it is a report
-  hour); the 11pm fire (03:00 UTC → 22/23 ET) does not. Auction closings cluster in
+  burns the SAM daily quota). The 5:30pm fire also sends the report email (ET hour 17 EDT /
+  16 EST, both inside `REPORT_EVENING_HOURS_ET`); the 11:30pm fire (03:30 UTC → ET 23/22)
+  does not. Auction closings cluster in
   the evening ET (lot surge 7–10pm; only ~25% of GMV has closed by noon), which is why the
   noon fire alone left the current day near-empty until the next day. Two intraday fires +
   noon cover the day; reverting to every-4h capture is unnecessary cost. Times drift ±1h
