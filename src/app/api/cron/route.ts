@@ -29,6 +29,31 @@ import {
 export const maxDuration = 120;
 export const dynamic = "force-dynamic";
 
+/** The pipeline outlives its HTTP request (see the 202 below), so a second fire
+ *  could otherwise run it concurrently — two sold captures MERGEing the same rows
+ *  is exactly the contention that made the 2026-08-06 runs collide. One at a time. */
+let inFlight: { runId: string; startedAt: number } | null = null;
+const MAX_RUN_MS = 15 * 60_000; // a run stuck longer than this is treated as dead
+
+/**
+ * Keep the replica alive for the duration of a detached run. minReplicas is 0 with a
+ * 300s scale-in cooldown, and a background task is NOT a request — so without this the
+ * platform can terminate the replica mid-pipeline (a cold run is ~310s). A cheap ping to
+ * a PUBLIC page resets the HTTP scaler's idle timer, exactly as lqdt-keepwarm does.
+ * Returns a stop function. Never throws: a failed ping must not disturb the run.
+ */
+function keepReplicaAlive(): () => void {
+  // Same fallback chain as report-email.ts. Neither var is set on the container app
+  // today, so relying on APP_URL alone would silently make this a no-op — which is
+  // precisely the failure it exists to prevent.
+  const url = (process.env.APP_URL || process.env.NEXT_PUBLIC_APP_URL || "https://lqdt.clearlineflow.com").replace(/\/+$/, "");
+  if (!url) return () => {};
+  const timer = setInterval(() => {
+    void fetch(`${url}/login`, { cache: "no-store", signal: AbortSignal.timeout(10_000) }).catch(() => {});
+  }, 60_000);
+  return () => clearInterval(timer);
+}
+
 export async function GET(request: Request) {
   const cronSecret = process.env.CRON_SECRET?.trim();
   if (!cronSecret) {
@@ -68,7 +93,18 @@ export async function GET(request: Request) {
     return NextResponse.json({ mode: "report-preview", to: "rma@clearlinecap.com", date, timestamp, ...preview });
   }
 
+  // Refuse to start a second pipeline on top of a live one (see inFlight above).
+  if (inFlight && Date.now() - inFlight.startedAt < MAX_RUN_MS) {
+    return NextResponse.json(
+      { accepted: false, reason: "a pipeline run is already in progress", run_id: inFlight.runId },
+      { status: 409 },
+    );
+  }
+
   const logger = new CronLogger();
+
+  // The whole pipeline, so it can either be awaited (?wait=1) or detached (default).
+  const runPipeline = async () => {
 
   // Each source is a self-contained scrape + write that returns its cron_runs
   // summary alongside any payload later steps (email, response) need. Sources
@@ -457,12 +493,42 @@ export async function GET(request: Request) {
   }
 
   const runs = await logger.flush();
+  return { runs, email: emailResult };
+  }; // end runPipeline
 
-  return NextResponse.json({
-    run_id: logger.runId,
-    date,
-    timestamp,
-    runs,
-    email: emailResult,
-  });
+  // Detach by default. Container Apps' ingress cuts any request at 240s and that is NOT
+  // configurable (checked the app ingress, the managed environment, and the 2024-10-02
+  // preview ARM schema) — so a ~310s cold run always died at the client while completing
+  // server-side, which made `curl -fsS` fail and the job execution read "Failed" on a run
+  // that was actually fine. Returning 202 immediately decouples the two: the HTTP call is
+  // the trigger, cron_runs is the record of what happened.
+  inFlight = { runId: logger.runId, startedAt: Date.now() };
+  const stopKeepAlive = keepReplicaAlive();
+  const started = runPipeline()
+    .catch((e) => {
+      console.error("[cron] pipeline threw:", e instanceof Error ? e.message : String(e));
+      return { runs: [], email: { success: false, error: "pipeline threw" } as ReportEmailResult };
+    })
+    .finally(() => {
+      stopKeepAlive();
+      if (inFlight?.runId === logger.runId) inFlight = null;
+    });
+
+  // ?wait=1 keeps the old synchronous behaviour (manual runs, debugging) — still subject
+  // to the 240s ingress cut, but the run completes regardless.
+  if (searchParams.get("wait") === "1") {
+    const { runs, email } = await started;
+    return NextResponse.json({ run_id: logger.runId, date, timestamp, runs, email });
+  }
+
+  return NextResponse.json(
+    {
+      accepted: true,
+      run_id: logger.runId,
+      date,
+      timestamp,
+      note: "pipeline started; outcome is recorded in lqdt.cron_runs (add ?wait=1 to block)",
+    },
+    { status: 202 },
+  );
 }
