@@ -77,6 +77,8 @@ type ChartRow = {
   "Prior-yr shape": number | null;
   "Run rate": number | null;
   "Cumulative Y/Y": number | null;
+  "Guidance mid (implied FQ Y/Y)": number | null;
+  "Clearline (implied FQ Y/Y)": number | null;
   /** True when the row's projection values are Y/Y percentages, not dollars. */
   _yoyMode: boolean;
   _dailyCur: number | null;
@@ -132,7 +134,7 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "Projections in Y/Y % mode",
-        def: "The same paths drawn as implied cumulative Y/Y: projected cumulative ÷ LY cumulative at the same day − 1, converging at each method's implied full-quarter Y/Y. Prior-yr shape is flat by construction (it applies LY's shape at the current pace), so it reads as the extrapolated full-quarter Y/Y line. In Scaled mode, when LY reported GMV exists, these use the same reported anchor as the QTD Y/Y card (scaled cumulative ÷ LY reported prorated to the same day − 1).",
+        def: "Run rate is drawn as implied cumulative Y/Y (projected cumulative ÷ LY cumulative at the same day − 1). Prior-yr shape is NOT drawn in this mode: its implied cumulative Y/Y is algebraically the current QTD Y/Y (the LY-cumulative cancels), so the line would restate the solid one dressed as a forecast. Instead the Y/Y view draws the external calls as implied full-quarter Y/Y vs LY REPORTED GMV — Guidance midpoint (green) and the Clearline estimate (amber), from the last data day to quarter end, omitted when within 0.05pp of the current Y/Y (a line that restates another line is noise). Both sides of those ratios are total-company, so they are capture-rate-free in either display mode.",
       },
     ],
   },
@@ -502,6 +504,28 @@ export function QtdProgress() {
 
   const { dayKeys, D, d } = view;
   const yoyMode = metric === "yoy";
+
+  const est = view.estimate;
+  const guidanceLow = est?.guidance_low_usd ?? null;
+  const guidanceHigh = est?.guidance_high_usd ?? null;
+  const guidanceMid = guidanceLow && guidanceHigh ? (guidanceLow + guidanceHigh) / 2 : null;
+  const clearline = est?.clearline_estimate_usd ?? null;
+
+  // Implied full-quarter Y/Y of the external calls, vs LY REPORTED only (never vs a
+  // scaled/captured base — both sides are total-company, so the ratio is basis-free).
+  // These give the Y/Y view its benchmarks: where guidance and the Clearline model
+  // say the quarter LANDS, against where the QTD pace is running. Drawn only when
+  // the line adds information (differs from the current Y/Y — the mosaic addsInfo
+  // guard); a line that restates another line is noise.
+  const curYoyPct = yoyDisplay != null ? yoyDisplay * 100 : null;
+  const impliedFqYoy = (estUsd: number | null): number | null => {
+    if (!estUsd || view.lyReported == null || view.lyReported <= 0 || view.complete) return null;
+    const pct = (estUsd / view.lyReported - 1) * 100;
+    return curYoyPct != null && Math.abs(pct - curYoyPct) < 0.05 ? null : pct;
+  };
+  const guidanceYoy = impliedFqYoy(guidanceMid);
+  const clearlineYoy = impliedFqYoy(clearline);
+
   const rows: ChartRow[] = dayKeys.map((date, i) => {
     const inData = i < d;
     const lyVal = view.lyCum ? view.lyAt(i) : null;
@@ -530,20 +554,23 @@ export function QtdProgress() {
       // distributed by LY's captured shape — so its endpoint lands exactly on
       // the "Reported actual" reference line instead of captured × capture-rate.
       "Last year": reportedAnchor && lyRepAt ? lyRepAt(i) : lyVal != null ? lyVal * scale : null,
-      "Prior-yr shape": proj(view.shapeAvailable && projections.has("shape") && (anchor || i >= d) ? view.shapeAt(i) : null),
+      // Prior-yr shape is a $-mode line only. In Y/Y mode its implied cumulative Y/Y
+      // is ALGEBRAICALLY the current QTD Y/Y (shape(i)/lyCum(i) cancels to a constant) —
+      // a dashed line that looks like a forecast while restating the solid one. Mosaic's
+      // ODP explorer measured this (identical for all 457 prior-shape series) and dropped
+      // it from the Y/Y view; we follow.
+      "Prior-yr shape": yoyMode ? null : proj(view.shapeAvailable && projections.has("shape") && (anchor || i >= d) ? view.shapeAt(i) : null),
       "Run rate": proj(!view.complete && projections.has("runrate") && (anchor || i >= d) ? view.runRateAt(i) : null),
       "Cumulative Y/Y": yoyMode && inData ? impliedYoy(view.curCum[i]) : null,
+      // External calls as implied FQ Y/Y, drawn from the last data day to quarter end.
+      "Guidance mid (implied FQ Y/Y)": yoyMode && guidanceYoy != null && i >= d - 1 ? guidanceYoy : null,
+      "Clearline (implied FQ Y/Y)": yoyMode && clearlineYoy != null && i >= d - 1 ? clearlineYoy : null,
       _yoyMode: yoyMode,
       _dailyCur: inData ? (view.curCum[i] - (i > 0 ? view.curCum[i - 1] : 0)) : null,
       _dailyLy: view.lyCum && i < (view.lyCum.length ?? 0) ? view.lyCum[i] - (i > 0 ? view.lyCum[i - 1] : 0) : null,
     };
   });
 
-  const est = view.estimate;
-  const guidanceLow = est?.guidance_low_usd ?? null;
-  const guidanceHigh = est?.guidance_high_usd ?? null;
-  const guidanceMid = guidanceLow && guidanceHigh ? (guidanceLow + guidanceHigh) / 2 : null;
-  const clearline = est?.clearline_estimate_usd ?? null;
   const scaledFqe = view.primaryFqe * (1 / captureRate); // FQE in total-company terms
   const tickEvery = Math.max(1, Math.ceil(D / 13));
 
@@ -1406,13 +1433,19 @@ export function QtdProgress() {
             <>
               <ReferenceLine y={0} stroke="#9ca3af" />
               <Line type="monotone" dataKey="Cumulative Y/Y" stroke="#2563eb" strokeWidth={2.5} dot={false} />
-              {/* Projections as implied cumulative Y/Y (projected cum ÷ LY cum − 1).
-                  Prior-yr shape is flat by construction — the extrapolated-FQE line. */}
-              {view.shapeAvailable && projections.has("shape") && (
-                <Line type="monotone" dataKey="Prior-yr shape" stroke="#7c3aed" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
-              )}
+              {/* No prior-yr-shape line here: its implied cumulative Y/Y equals the current
+                  QTD Y/Y by construction, so it would restate the solid line dressed as a
+                  forecast (the mosaic ODP explorer's measured conclusion; see the rows map).
+                  Instead the Y/Y view gets the benchmarks that ARE informative: where the
+                  external calls land the quarter, vs where the QTD pace is running. */}
               {!view.complete && projections.has("runrate") && (
                 <Line type="monotone" dataKey="Run rate" stroke="#6b7280" strokeWidth={1} strokeDasharray="3 3" dot={false} connectNulls />
+              )}
+              {guidanceYoy != null && (
+                <Line type="monotone" dataKey="Guidance mid (implied FQ Y/Y)" stroke="#15803d" strokeWidth={1.5} strokeDasharray="4 2" dot={false} connectNulls />
+              )}
+              {clearlineYoy != null && (
+                <Line type="monotone" dataKey="Clearline (implied FQ Y/Y)" stroke="#d97706" strokeWidth={1.5} strokeDasharray="5 3" dot={false} connectNulls />
               )}
             </>
           )}
