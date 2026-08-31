@@ -150,20 +150,23 @@ const METRIC_ROWS = [
   { label: "CAG GMV", metric: "cag_gmv", mul: 1000 },
   { label: "Machinio Revs", metric: "machinio_revs", mul: 1000 },
   { label: "Revenue (I/S)", metric: "revenue", mul: 1000 },
-  { label: "Gross Profit", metric: "gross_profit", mul: 1000 },
+  // v16 renamed/dropped several rows (GP -> "Direct Profit", margin basis moved to
+  // DP/GMV, segment revs-take-rate rows removed). Optional so the extract still runs;
+  // a semantically-different replacement row must be mapped DELIBERATELY, never guessed.
+  { label: "Gross Profit", metric: "gross_profit", mul: 1000, optional: true },
   { label: "EBITDAS (SoCF)", metric: "ebitda", mul: 1000, optional: true },
   { label: "Adj EBITDA", metric: "adj_ebitda", mul: 1000, optional: true },
   { label: "Total GMV CH", metric: "gmv_consensus", mul: 1000, optional: true }, // sparse
   { label: "Total GMV Guidance Mid", metric: "gmv_guidance_mid", mul: 1e6, optional: true }, // $M, not $000
   { label: "Total Take Rate", metric: "total_take_rate", mul: 1 },
-  { label: "GovDeals Revs Take Rate", metric: "govdeals_take_rate", mul: 1 },
-  { label: "RSCG Revs Take Rate", metric: "rscg_take_rate", mul: 1 },
-  { label: "CAG Revs Take Rate", metric: "cag_take_rate", mul: 1 },
+  { label: "GovDeals Revs Take Rate", metric: "govdeals_take_rate", mul: 1, optional: true },
+  { label: "RSCG Revs Take Rate", metric: "rscg_take_rate", mul: 1, optional: true },
+  { label: "CAG Revs Take Rate", metric: "cag_take_rate", mul: 1, optional: true },
   { label: "Purchase GMV", metric: "purchase_gmv", mul: 1000, optional: true },
   { label: "Consignment GMV", metric: "consignment_gmv", mul: 1000, optional: true },
   { label: "Purchase Revs Take Rate", metric: "purchase_take_rate", mul: 1, optional: true },
   { label: "Consignment Revs Take Rate", metric: "consignment_take_rate", mul: 1, optional: true },
-  { label: "Gross Margin", metric: "gross_margin", mul: 1 },
+  { label: "Gross Margin", metric: "gross_margin", mul: 1, optional: true },
   { label: "Beat vs Mid", metric: "beat_vs_mid", mul: 1, optional: true },
   { label: "EPS", metric: "eps", mul: 1 },
   { label: "Completed Transactions", metric: "completed_transactions", mul: 1 },
@@ -197,15 +200,48 @@ function findLabelRow(sheetXml, sst, label) {
 }
 
 // --- locate the workbook ----------------------------------------------------
+// Reads the analyst's model straight from the synced OneDrive/SharePoint folder
+// (the clearline-mosaic extract_cl pattern), so a refresh never depends on someone
+// remembering to copy the workbook into scripts/. Selection is by VERSION NUMBER,
+// not mtime — OneDrive sync touches old versions' mtimes (v14 and v16 shared an
+// mtime on 2026-08-31), so mtime order can pick a superseded model.
+// Precedence: explicit .xlsm CLI arg > LQDT_MODEL_DIR env > the team folder > scripts/.
+const MODEL_DIRS = [
+  process.env.LQDT_MODEL_DIR,
+  "C:/Users/RyanMa/Clearline Capital/Majzner Team - Documents/General/Majzner Team/Companies/LQDT",
+  SCRIPTS_DIR,
+].filter(Boolean);
+const STALE_DAYS = 60; // mosaic freshness policy: older than ~2 months = warn loudly
+
 function findWorkbook() {
   const cliArg = process.argv.find((a) => a.toLowerCase().endsWith(".xlsm"));
   if (cliArg) return path.isAbsolute(cliArg) ? cliArg : path.join(SCRIPTS_DIR, cliArg);
-  const candidates = readdirSync(SCRIPTS_DIR)
-    .filter((f) => /^LQDT Nums v.*\.xlsm$/i.test(f))
-    .map((f) => ({ f, mtime: statSync(path.join(SCRIPTS_DIR, f)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime);
-  if (candidates.length === 0) throw new Error(`No "LQDT Nums v*.xlsm" found in ${SCRIPTS_DIR}`);
-  return path.join(SCRIPTS_DIR, candidates[0].f);
+  for (const dir of MODEL_DIRS) {
+    let names;
+    try {
+      names = readdirSync(dir).filter((f) => /^LQDT Nums v\d+.*\.xlsm$/i.test(f));
+    } catch {
+      continue; // folder not synced on this machine — fall through
+    }
+    if (names.length === 0) continue;
+    const candidates = names
+      .map((f) => ({
+        f,
+        ver: Number(/v(\d+)/i.exec(f)[1]),
+        mtime: statSync(path.join(dir, f)).mtimeMs,
+      }))
+      .sort((a, b) => b.ver - a.ver || b.mtime - a.mtime);
+    const pick = candidates[0];
+    const ageDays = (Date.now() - pick.mtime) / 86_400_000;
+    if (ageDays > STALE_DAYS) {
+      console.warn(
+        `WARNING: newest model (${pick.f}) was last modified ${Math.round(ageDays)} days ago — ` +
+          `the extracted estimates may be stale. Confirm the model is current before pushing.`,
+      );
+    }
+    return path.join(dir, pick.f);
+  }
+  throw new Error(`No "LQDT Nums v*.xlsm" found in any of: ${MODEL_DIRS.join(" ; ")}`);
 }
 
 function main() {
