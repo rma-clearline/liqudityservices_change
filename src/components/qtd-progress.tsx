@@ -76,6 +76,7 @@ type ChartRow = {
   "Last year": number | null;
   "Prior-yr shape": number | null;
   "Run rate": number | null;
+  "Momentum (T28D)": number | null;
   "Cumulative Y/Y": number | null;
   "Guidance mid (implied FQ Y/Y)": number | null;
   "Clearline (implied FQ Y/Y)": number | null;
@@ -133,8 +134,12 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
         def: "QTD daily average × days in the quarter. Crude (ignores seasonality) but always available; the fallback when prior-year data doesn't exist.",
       },
       {
+        term: "Momentum (T28D)",
+        def: "Rest-of-quarter projected at the RECENT pace: trailing-28-complete-days GMV vs the same LY days, applied to LY's daily shape from today forward (proj(i) = QTD + (LYcum(i) − LYcum(today)) × (1 + T28D Y/Y)). Seasonality-aware where run rate is not, and its implied cumulative Y/Y actually moves — it glides from today's Y/Y toward the recent pace, so it IS the projected-Y/Y line. The pace window ends at the last complete ET day (same rule as T7D). Needs 28 complete days in-quarter.",
+      },
+      {
         term: "Projections in Y/Y % mode",
-        def: "Run rate is drawn as implied cumulative Y/Y (projected cumulative ÷ LY cumulative at the same day − 1). Prior-yr shape is NOT drawn in this mode: its implied cumulative Y/Y is algebraically the current QTD Y/Y (the LY-cumulative cancels), so the line would restate the solid one dressed as a forecast. Instead the Y/Y view draws the external calls as implied full-quarter Y/Y vs LY REPORTED GMV — Guidance midpoint (green) and the Clearline estimate (amber), from the last data day to quarter end, omitted when within 0.05pp of the current Y/Y (a line that restates another line is noise). Both sides of those ratios are total-company, so they are capture-rate-free in either display mode.",
+        def: "Every projected Y/Y is the projection's $ path ÷ LY's $ path at the same day − 1. Momentum (purple) is the primary projected-Y/Y line — it bends toward the recent pace as LY's seasonal shape plays out. Run rate (gray) uses the same division but its straight-line $ path reads LY's September back-load as a growth collapse — trust its bend only in evenly-distributed quarters. Prior-yr shape is NOT drawn in this mode: its implied cumulative Y/Y is algebraically the current QTD Y/Y (the LY-cumulative cancels), so the line would restate the solid one dressed as a forecast. External calls appear as implied full-quarter Y/Y vs LY REPORTED GMV — Guidance midpoint (green) and the Clearline estimate (amber), from the last data day to quarter end, omitted when within 0.05pp of the current Y/Y. Both sides of those ratios are total-company, so they are capture-rate-free in either display mode.",
       },
     ],
   },
@@ -410,7 +415,7 @@ export function QtdProgress() {
   const [metric, setMetric] = useState<"dollars" | "yoy">("dollars");
   const [scaled, setScaled] = useState(false);
   const [captureInput, setCaptureInput] = useState(""); // "" = auto
-  const [projections, setProjections] = useState<Set<ProjectionKey>>(new Set(["shape", "runrate"]));
+  const [projections, setProjections] = useState<Set<ProjectionKey>>(new Set(["shape", "momentum", "runrate"]));
   // Guidance / Clearline edit panel ("" = blank field; values entered in $M).
   const [editOpen, setEditOpen] = useState(false);
   const [editLow, setEditLow] = useState("");
@@ -561,6 +566,7 @@ export function QtdProgress() {
       // it from the Y/Y view; we follow.
       "Prior-yr shape": yoyMode ? null : proj(view.shapeAvailable && projections.has("shape") && (anchor || i >= d) ? view.shapeAt(i) : null),
       "Run rate": proj(!view.complete && projections.has("runrate") && (anchor || i >= d) ? view.runRateAt(i) : null),
+      "Momentum (T28D)": proj(view.momAvailable && projections.has("momentum") && (anchor || i >= d) ? view.momAt(i) : null),
       "Cumulative Y/Y": yoyMode && inData ? impliedYoy(view.curCum[i]) : null,
       // External calls as implied FQ Y/Y, drawn from the last data day to quarter end.
       "Guidance mid (implied FQ Y/Y)": yoyMode && guidanceYoy != null && i >= d - 1 ? guidanceYoy : null,
@@ -1343,7 +1349,7 @@ export function QtdProgress() {
         <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
           Projections:
           {(Object.keys(PROJECTION_LABEL) as ProjectionKey[]).map((k) => {
-            const available = k === "shape" ? view.shapeAvailable : true;
+            const available = k === "shape" ? view.shapeAvailable : k === "momentum" ? view.momAvailable : true;
             return (
               <button
                 key={k}
@@ -1357,7 +1363,13 @@ export function QtdProgress() {
                   })
                 }
                 className={chip(projections.has(k) && available, available ? "" : "opacity-40 cursor-not-allowed")}
-                title={k === "shape" && !view.shapeAvailable ? "Needs prior-year daily data" : undefined}
+                title={
+                  k === "shape" && !view.shapeAvailable
+                    ? "Needs prior-year daily data"
+                    : k === "momentum" && !view.momAvailable
+                      ? "Needs 28 complete days in-quarter + prior-year daily data"
+                      : undefined
+                }
               >
                 {PROJECTION_LABEL[k]}
               </button>
@@ -1393,6 +1405,9 @@ export function QtdProgress() {
               )}
               {view.shapeAvailable && projections.has("shape") && (
                 <Line type="monotone" dataKey="Prior-yr shape" stroke="#7c3aed" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
+              )}
+              {view.momAvailable && projections.has("momentum") && (
+                <Line type="monotone" dataKey="Momentum (T28D)" stroke="#0d9488" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
               )}
               {!view.complete && projections.has("runrate") && (
                 <Line type="monotone" dataKey="Run rate" stroke="#6b7280" strokeWidth={1} strokeDasharray="3 3" dot={false} connectNulls />
@@ -1440,6 +1455,14 @@ export function QtdProgress() {
                   external calls land the quarter, vs where the QTD pace is running. */}
               {!view.complete && projections.has("runrate") && (
                 <Line type="monotone" dataKey="Run rate" stroke="#6b7280" strokeWidth={1} strokeDasharray="3 3" dot={false} connectNulls />
+              )}
+              {/* THE projected-Y/Y line: the momentum $ path ÷ LY $ path − 1. Bends from
+                  today's cumulative Y/Y toward the recent (T28D) pace as LY's seasonal
+                  shape plays out — non-degenerate (unlike prior-yr shape) and seasonality-
+                  aware (unlike run rate, whose implied Y/Y fakes a collapse in back-loaded
+                  quarters). */}
+              {view.momAvailable && projections.has("momentum") && (
+                <Line type="monotone" dataKey="Momentum (T28D)" stroke="#7c3aed" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
               )}
               {guidanceYoy != null && (
                 <Line type="monotone" dataKey="Guidance mid (implied FQ Y/Y)" stroke="#15803d" strokeWidth={1.5} strokeDasharray="4 2" dot={false} connectNulls />

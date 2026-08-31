@@ -32,16 +32,18 @@ export type QtdData = {
   model_estimates_by_quarter?: QtdEstimate[];
 };
 
-export type ProjectionKey = "shape" | "runrate";
+export type ProjectionKey = "shape" | "runrate" | "momentum";
 
 export const PROJECTION_LABEL: Record<ProjectionKey, string> = {
   shape: "Prior-yr shape",
+  momentum: "Momentum (T28D)",
   runrate: "Run rate",
 };
 
 export const FALLBACK_CAPTURE = 0.535;
 
 export type QtdModel = {
+  todayKey: string;
   realizedByDate: Map<string, number>;
   siteByDate: Map<string, { ad: number; gd: number; gi: number }>;
   lastDataDate: string;
@@ -88,7 +90,7 @@ export function buildModel(data: QtdData, todayKey: string, currentQuarter: stri
   const recent = captures.slice(-3);
   const autoCapture = recent.length ? recent.reduce((s, c) => s + c.rate, 0) / recent.length : FALLBACK_CAPTURE;
 
-  return { realizedByDate, siteByDate, lastDataDate, earliest, quarters, reported, estimates, autoCapture, captureQuarters: recent };
+  return { todayKey, realizedByDate, siteByDate, lastDataDate, earliest, quarters, reported, estimates, autoCapture, captureQuarters: recent };
 }
 
 /** Everything the page derives for one quarter (cumulatives, Y/Y, projections,
@@ -138,6 +140,26 @@ export function buildQuarterView(model: QtdModel, selected: string) {
   const shapeAt = (i: number) => qtd + (lyAt(i) - lyAt(d - 1)) * (qtd / lyAt(d - 1));
   const runRateAt = (i: number) => (qtd / d) * (i + 1);
 
+  // Momentum projection: the RECENT pace (trailing-28-complete-days Y/Y) applied to
+  // LY's daily shape for the rest of the quarter. Seasonality-aware where run-rate is
+  // not (LY put ~40% of Q3 GMV in the last 30 days — a straight-line $ path reads that
+  // as a growth collapse), and non-degenerate where prior-yr shape is (that one's
+  // implied cumulative Y/Y is the current QTD Y/Y by construction). Its implied Y/Y
+  // path glides from today's cumulative Y/Y toward the recent pace — the projected
+  // Y/Y line. The window ends at the last COMPLETE ET day for the same reason T7D
+  // does: today is only partially captured until its auctions close in the evening.
+  const MOMENTUM_WINDOW = 28;
+  const gEnd = d - 1 - (model.lastDataDate === model.todayKey ? 1 : 0);
+  const gStart = gEnd - MOMENTUM_WINDOW;
+  let momPace: number | null = null;
+  if (!complete && lyCum != null && gStart >= 0) {
+    const curWin = curCum[gEnd] - curCum[gStart];
+    const lyWin = lyAt(gEnd) - lyAt(gStart);
+    if (lyWin > 0 && curWin >= 0) momPace = curWin / lyWin - 1;
+  }
+  const momAvailable = momPace != null && lyAt(d - 1) > 0;
+  const momAt = (i: number) => qtd + (lyAt(i) - lyAt(d - 1)) * (1 + (momPace ?? 0));
+
   const fqe = {
     shape: shapeAvailable ? shapeAt(D - 1) : null,
     runrate: !complete ? runRateAt(D - 1) : null,
@@ -162,7 +184,7 @@ export function buildQuarterView(model: QtdModel, selected: string) {
   return {
     dayKeys, D, d, startKey, endKey, dataThrough, complete,
     curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable, lyReported, lyReportedAt,
-    shapeAvailable, shapeAt, runRateAt,
+    shapeAvailable, shapeAt, runRateAt, momAvailable, momAt, momPace,
     fqe, primaryFqe, primaryMethod, wow,
     reported: model.reported.get(selected) ?? null,
     estimate: model.estimates.get(selected) ?? null,
