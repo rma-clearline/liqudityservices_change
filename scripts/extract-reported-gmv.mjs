@@ -149,7 +149,7 @@ const METRIC_ROWS = [
   { label: "RSCG GMV", metric: "rscg_gmv", mul: 1000 },
   { label: "CAG GMV", metric: "cag_gmv", mul: 1000 },
   { label: "Machinio Revs", metric: "machinio_revs", mul: 1000 },
-  { label: "Revenue (I/S)", metric: "revenue", mul: 1000 },
+  { label: "Revenue (I/S)", metric: "revenue", mul: 1000, nearAnchor: true },
   // v16 renamed/dropped several rows (GP -> "Direct Profit", margin basis moved to
   // DP/GMV, segment revs-take-rate rows removed). Optional so the extract still runs;
   // a semantically-different replacement row must be mapped DELIBERATELY, never guessed.
@@ -186,17 +186,68 @@ const FORECAST_HORIZON_DAYS = 370; // ~4 quarters
 
 /** Row number whose column-A cell equals `label`. Handles both encodings the
  *  model uses: shared-string labels (t="s") and formula-result labels (t="str"). */
-function findLabelRow(sheetXml, sst, label) {
-  const idx = sst.findIndex((s) => s.trim() === label);
-  if (idx >= 0) {
-    const m = new RegExp(`<c\\s+r="A(\\d+)"[^>]*\\st="s"[^>]*>\\s*<v>${idx}</v>`).exec(sheetXml);
-    if (m) return Number(m[1]);
+// A duplicated label is an ERROR, never a first-hit guess (the mosaic extract_cl
+// rule): v16 carries a second ticker's block on the same Model sheet, so a bare
+// duplicate label would silently read the wrong company's row.
+function findLabelRows(sheetXml, sst, label) {
+  const rows = new Set();
+  for (let idx = 0; idx < sst.length; idx++) {
+    if (sst[idx].trim() !== label) continue;
+    for (const m of sheetXml.matchAll(new RegExp(`<c\\s+r="A(\\d+)"[^>]*\\st="s"[^>]*>\\s*<v>${idx}</v>`, "g"))) {
+      rows.add(Number(m[1]));
+    }
   }
   for (const m of sheetXml.matchAll(/<c\s+r="A(\d+)"[^>]*\st="str"[^>]*>(.*?)<\/c>/gs)) {
     const v = /<v>([^<]*)<\/v>/.exec(m[2]);
-    if (v && v[1].trim() === label) return Number(m[1]);
+    if (v && v[1].trim() === label) rows.add(Number(m[1]));
   }
-  return null;
+  return [...rows].sort((a, b) => a - b);
+}
+
+function findLabelRow(sheetXml, sst, label, opts = {}) {
+  const rows = findLabelRows(sheetXml, sst, label);
+  if (rows.length > 1) {
+    // Opt-in disambiguation only: a registry entry marked nearAnchor takes the
+    // duplicate closest to the "Total GMV" anchor (the P&L block moves as a unit
+    // between versions; helper copies live in distant sections like WORKING
+    // CAPITAL). Everything else stays fatal — never a silent first-hit guess.
+    if (opts.nearAnchor && opts.anchorRow) {
+      const pick = rows.reduce((a, b) => (Math.abs(b - opts.anchorRow) < Math.abs(a - opts.anchorRow) ? b : a));
+      console.warn(
+        `Note: "${label}" appears at rows ${rows.join(", ")}; using row ${pick} (nearest the Total GMV anchor at ${opts.anchorRow}).`,
+      );
+      return pick;
+    }
+    throw new Error(
+      `Column-A label "${label}" appears at rows ${rows.join(", ")} — ambiguous (second ticker block?). ` +
+        `Refusing to guess; qualify the label in the registry or mark it nearAnchor.`,
+    );
+  }
+  return rows[0] ?? null;
+}
+
+// --- workbook health: cached formula errors (the mosaic #NAME? census) ---------
+// An .xlsm saved on a machine without the Bloomberg add-in caches every BDP-dependent
+// cell as an error (t="e", value "#NAME?"). Numeric readers skip those cells, so a fully
+// modelled forward row silently reads as "never built forward" — the estimates would
+// publish EMPTY without this gate. Recoverable: restore the workbook from version
+// history, or re-save it on a machine with the add-in.
+function sheetErrorCensus(sheetXml) {
+  const out = {};
+  for (const m of sheetXml.matchAll(/<c\s+[^>]*\bt="e"[^>]*>(.*?)<\/c>/gs)) {
+    const v = /<v>([^<]*)<\/v>/.exec(m[1]);
+    if (v) out[v[1]] = (out[v[1]] ?? 0) + 1;
+  }
+  return out;
+}
+
+function errorRowCells(sheetXml, row) {
+  const out = {};
+  for (const m of sheetXml.matchAll(new RegExp(`<c\\s+r="([A-Z]+)${row}"[^>]*\\bt="e"[^>]*>(.*?)</c>`, "gs"))) {
+    const v = /<v>([^<]*)<\/v>/.exec(m[2]);
+    if (v) out[colToIndex(m[1])] = v[1];
+  }
+  return out;
 }
 
 // --- locate the workbook ----------------------------------------------------
@@ -276,6 +327,28 @@ function main() {
   const dateCells = numericRowCells(sheetXml, 2); // colIndex -> Excel serial
   const gmvCells = numericRowCells(sheetXml, gmvRow); // colIndex -> $000
 
+  // Workbook-health gate (mosaic): error-cached cells on the anchor row mean the
+  // workbook was saved without its add-in — the numeric reader would silently skip
+  // them and the estimates would publish incomplete. Refuse rather than publish wrong.
+  const census = sheetErrorCensus(sheetXml);
+  if (Object.keys(census).length) {
+    console.warn(
+      "Workbook health: cached formula errors on the Model sheet:",
+      Object.entries(census).map(([code, n]) => `${code} x${n}`).join(", "),
+    );
+  }
+  const gmvErrors = errorRowCells(sheetXml, gmvRow);
+  const gmvErrCols = Object.keys(gmvErrors)
+    .map(Number)
+    .filter((c) => c in dateCells && isQuarterEnd(serialToDate(dateCells[c])));
+  if (gmvErrCols.length) {
+    throw new Error(
+      `"Total GMV" carries ${gmvErrCols.length} error-cached quarter cell(s) (${[...new Set(gmvErrCols.map((c) => gmvErrors[c]))].join(", ")}). ` +
+        `The workbook was likely saved without the Bloomberg add-in — restore it from version history ` +
+        `or re-save on a machine with the add-in. Refusing to publish an incomplete series.`,
+    );
+  }
+
   // Columns that carry both a date header and a GMV value, ordered left->right.
   const cols = Object.keys(dateCells)
     .map(Number)
@@ -314,6 +387,28 @@ function main() {
 
   if (series.length === 0) throw new Error("No reported quarterly actuals extracted — check the sheet layout");
 
+  // Reported history is append-only in the normal case. A changed past quarter is
+  // either a genuine restatement or a wrong-row/wrong-scale read — surface it loudly
+  // either way (mosaic's reconcile-gate instinct, applied to our own prior extract).
+  try {
+    const prev = new Map(
+      readFileSync(OUT_CSV, "utf8").trim().split(/\r?\n/).slice(1)
+        .map((l) => l.split(","))
+        .filter((c) => /^\d{4}Q[1-4]$/.test(c[0]))
+        .map((c) => [c[0], Number(c[2])]),
+    );
+    const changed = series.filter((r) => prev.has(r.quarter) && prev.get(r.quarter) !== r.reported_gmv_usd);
+    for (const r of changed) {
+      console.warn(
+        `WARNING: reported ${r.quarter} changed vs the previous extract: ` +
+          `$${(prev.get(r.quarter) / 1e6).toFixed(1)}M -> $${(r.reported_gmv_usd / 1e6).toFixed(1)}M. ` +
+          `Restatement, or a wrong read — verify before pushing.`,
+      );
+    }
+  } catch {
+    // no previous CSV — first extract on this machine
+  }
+
   const csv =
     "quarter,quarter_end,reported_gmv_usd\n" +
     series.map((r) => `${r.quarter},${r.quarter_end},${r.reported_gmv_usd}`).join("\n") +
@@ -351,9 +446,15 @@ function main() {
     console.warn('Warning: "Total GMV Guidance" row not found — guidance columns left empty.');
   }
   const estRows = [...estimates.values()].sort((a, b) => a.quarter_end.localeCompare(b.quarter_end));
+  // Trailing vintage columns (mosaic model_tier, reduced to provenance): which workbook,
+  // saved when. The loader surfaces these so the page can badge a stale CL estimate
+  // instead of presenting a six-week-old number as current — column-count tolerant, so
+  // the app keeps accepting older CSVs without them.
+  const wbName = path.basename(wbPath);
+  const wbMtime = new Date(statSync(wbPath).mtimeMs).toISOString().slice(0, 10);
   const estCsv =
-    "quarter,quarter_end,guidance_low_usd,guidance_high_usd,clearline_estimate_usd\n" +
-    estRows.map((r) => `${r.quarter},${r.quarter_end},${r.low},${r.high},${r.cl}`).join("\n") +
+    "quarter,quarter_end,guidance_low_usd,guidance_high_usd,clearline_estimate_usd,source_workbook,source_mtime\n" +
+    estRows.map((r) => `${r.quarter},${r.quarter_end},${r.low},${r.high},${r.cl},${wbName},${wbMtime}`).join("\n") +
     "\n";
   writeFileSync(OUT_ESTIMATES_CSV, estCsv);
 
@@ -381,8 +482,16 @@ function main() {
     seenMetric.add(key);
     metricRecords.push({ quarter: quarterKey(x.date), quarter_end: ymd(x.date), metric, value, kind: colKind.get(x.col) });
   };
-  for (const { label, metric, mul, optional } of METRIC_ROWS) {
-    const row = findLabelRow(sheetXml, sst, label);
+  for (const { label, metric, mul, optional, nearAnchor } of METRIC_ROWS) {
+    let row;
+    try {
+      row = findLabelRow(sheetXml, sst, label, { nearAnchor, anchorRow: gmvRow });
+    } catch (e) {
+      // Ambiguous label: for an optional row, skipping beats guessing; a required row
+      // must be disambiguated in the registry before anything publishes.
+      if (optional) { console.warn(`Warning: optional row "${label}" skipped — ${e.message}`); continue; }
+      throw e;
+    }
     if (!row) {
       if (optional) { console.warn(`Warning: optional row "${label}" not found — skipped.`); continue; }
       throw new Error(`Column-A cell "${label}" not found in the Model sheet`);

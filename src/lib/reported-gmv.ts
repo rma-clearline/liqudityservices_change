@@ -56,6 +56,18 @@ let cached: ReportedQuarterGmv[] | null = null;
 let cachedEstimates: ModelQuarterEstimate[] | null = null;
 let cachedMetrics: ModelMetricRow[] | null = null;
 
+/** Which model workbook the estimates were extracted from, and when it was last
+ *  saved — trailing columns the extractor stamps on every estimates row. Lets the
+ *  UI badge a stale Clearline estimate instead of presenting it as current. Null
+ *  on CSVs from before the columns existed. */
+export type ModelVintage = { workbook: string; as_of: string };
+let cachedVintage: ModelVintage | null = null;
+
+export async function loadModelVintage(): Promise<ModelVintage | null> {
+  await loadModelEstimates();
+  return cachedVintage;
+}
+
 /** The prod files arrive as Container App secrets encoded base64(gzip(csv)) —
  *  base64 survives CLI quoting and gzip keeps the `az` command line far below
  *  cmd.exe's 32K limit (the metrics CSV alone would blow it raw). Older pushes
@@ -105,8 +117,12 @@ export async function loadModelEstimates(): Promise<ModelQuarterEstimate[]> {
     const raw = decodeMaybeBase64(await readFile(MODEL_ESTIMATES_PATH, "utf8"));
     for (const line of raw.trim().split(/\r?\n/).slice(1)) {
       // Columns: quarter,quarter_end,guidance_low_usd,guidance_high_usd,clearline_estimate_usd
-      const [quarter, , lowRaw, highRaw, clRaw] = line.split(",");
+      // (+ optional trailing source_workbook,source_mtime — absent on older CSVs)
+      const [quarter, , lowRaw, highRaw, clRaw, wbRaw, mtimeRaw] = line.split(",");
       if (!/^\d{4}Q[1-4]$/.test(quarter ?? "")) continue;
+      if (!cachedVintage && wbRaw && /^\d{4}-\d{2}-\d{2}$/.test(mtimeRaw ?? "")) {
+        cachedVintage = { workbook: wbRaw, as_of: mtimeRaw };
+      }
       const num = (s: string | undefined) => {
         const n = Number(s);
         return s !== "" && s != null && Number.isFinite(n) && n > 0 ? n : null;

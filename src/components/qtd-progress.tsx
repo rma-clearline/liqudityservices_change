@@ -1221,6 +1221,16 @@ export function QtdProgress() {
         {view.startKey} → {view.endKey}
         {scaled && <> · scaled @ {(captureRate * 100).toFixed(1)}%</>}
         {!view.lyAvailable && <> · prior-year overlay unavailable (daily data begins {model.earliest})</>}
+        {state.data?.model_vintage && (
+          <>
+            {" · CL model "}
+            {state.data.model_vintage.workbook.replace(/^LQDT Nums /i, "").replace(/\.xlsm$/i, "")} (
+            {state.data.model_vintage.as_of})
+            {state.data.model_vintage.stale && (
+              <span className="font-medium text-amber-600"> — stale, refresh the model export</span>
+            )}
+          </>
+        )}
       </p>
 
       {/* Stat cards */}
@@ -1265,6 +1275,7 @@ export function QtdProgress() {
               {clearline && (
                 <span>
                   vs Clearline {fmtM(clearline)}: {fmtPct(scaledFqe / clearline - 1)}
+                  {state.data?.model_vintage?.stale && <span className="text-amber-600"> (model stale)</span>}
                 </span>
               )}
               {!guidanceLow && !clearline && "no guidance / model estimate for this quarter"}

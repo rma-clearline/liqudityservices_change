@@ -6,6 +6,7 @@ import {
   consignmentTakeRate,
   loadModelEstimatesMerged,
   loadModelMetrics,
+  loadModelVintage,
   loadReportedQuarterlyGmv,
 } from "@/lib/reported-gmv";
 import { azFetchLatestForecastSnapshot } from "@/lib/azure-tables";
@@ -38,11 +39,18 @@ export async function GET(request: Request) {
   // Attach the reported-GMV benchmark + model estimates here (not in the snapshot):
   // full-history, take-rate-independent, and cheap, so they're always fresh regardless
   // of the selected quarter or when the cron last regenerated the snapshot.
-  const [reported_gmv_by_quarter, model_estimates_by_quarter, model_metrics] = await Promise.all([
+  const [reported_gmv_by_quarter, model_estimates_by_quarter, model_metrics, vintage] = await Promise.all([
     loadReportedQuarterlyGmv(),
     loadModelEstimatesMerged(),
     loadModelMetrics(),
+    loadModelVintage(),
   ]);
+  // Stale = the workbook missed an earnings cycle (~a quarter + reporting lag).
+  // The mosaic freshness-tier idea, reduced to one flag the QTD page can badge.
+  const STALE_MODEL_DAYS = 120;
+  const model_vintage = vintage
+    ? { ...vintage, stale: Date.now() - Date.parse(vintage.as_of) > STALE_MODEL_DAYS * 86_400_000 }
+    : null;
 
   // Default take rate = the model's consignment (auction) take rate, matched to the
   // quarter actually being served. An explicit ?takeRate still wins — this only decides
@@ -80,6 +88,7 @@ export async function GET(request: Request) {
     reported_gmv_by_quarter,
     model_estimates_by_quarter,
     model_metrics,
+    model_vintage,
     ...(sold_by_bucket_daily ? { sold_by_bucket_daily } : {}),
   });
 }

@@ -26,6 +26,7 @@ export type QtdEstimate = {
 
 export type QtdData = {
   daily: QtdDailyPoint[];
+  model_vintage?: { workbook: string; as_of: string; stale: boolean } | null;
   earliest_data_date: string;
   reported_gmv_by_quarter?: { quarter: string; reported_gmv_usd: number }[];
   model_estimates_by_quarter?: QtdEstimate[];
