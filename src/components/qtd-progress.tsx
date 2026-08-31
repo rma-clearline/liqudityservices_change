@@ -139,7 +139,7 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "Projections in Y/Y % mode",
-        def: "Every projected Y/Y is the projection's $ path ÷ LY's $ path at the same day − 1. Momentum (purple) is the primary projected-Y/Y line — it bends toward the recent pace as LY's seasonal shape plays out. Run rate (gray) uses the same division but its straight-line $ path reads LY's September back-load as a growth collapse — trust its bend only in evenly-distributed quarters. Prior-yr shape is NOT drawn in this mode: its implied cumulative Y/Y is algebraically the current QTD Y/Y (the LY-cumulative cancels), so the line would restate the solid one dressed as a forecast. External calls appear as implied full-quarter Y/Y vs LY REPORTED GMV — Guidance midpoint (green) and the Clearline estimate (amber), from the last data day to quarter end, omitted when within 0.05pp of the current Y/Y. Both sides of those ratios are total-company, so they are capture-rate-free in either display mode.",
+        def: "Every projected Y/Y is the projection's $ path ÷ LY's $ path at the same day − 1. Momentum (purple) is the primary projected-Y/Y line — it bends toward the recent pace as LY's seasonal shape plays out. Run rate (gray) uses the same division but its straight-line $ path reads LY's September back-load as a growth collapse — trust its bend only in evenly-distributed quarters. Prior-yr shape is NOT drawn in this mode: its implied cumulative Y/Y is algebraically the current QTD Y/Y (the LY-cumulative cancels), so the line would restate the solid one dressed as a forecast. External calls appear as implied full-quarter Y/Y vs LY REPORTED GMV — Guidance midpoint (green) and the Clearline estimate (amber), from the last data day to quarter end, omitted when within 0.05pp of the current Y/Y. Both sides of those ratios are total-company, so they are capture-rate-free in either display mode. The solid Y/Y line starts once a week has elapsed AND LY cumulative ≥ 10% of its full quarter: a cumulative ratio on a days-old base swings hundreds of points (2026Q3 day 2 read +473%) and drags the whole axis with it — headline numbers are unaffected, only where the line begins.",
       },
     ],
   },
@@ -567,7 +567,7 @@ export function QtdProgress() {
       "Prior-yr shape": yoyMode ? null : proj(view.shapeAvailable && projections.has("shape") && (anchor || i >= d) ? view.shapeAt(i) : null),
       "Run rate": proj(!view.complete && projections.has("runrate") && (anchor || i >= d) ? view.runRateAt(i) : null),
       "Momentum (T28D)": proj(view.momAvailable && projections.has("momentum") && (anchor || i >= d) ? view.momAt(i) : null),
-      "Cumulative Y/Y": yoyMode && inData ? impliedYoy(view.curCum[i]) : null,
+      "Cumulative Y/Y": yoyMode && inData && i >= view.yoyStableFrom ? impliedYoy(view.curCum[i]) : null,
       // External calls as implied FQ Y/Y, drawn from the last data day to quarter end.
       "Guidance mid (implied FQ Y/Y)": yoyMode && guidanceYoy != null && i >= d - 1 ? guidanceYoy : null,
       "Clearline (implied FQ Y/Y)": yoyMode && clearlineYoy != null && i >= d - 1 ? clearlineYoy : null,

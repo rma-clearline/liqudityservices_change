@@ -160,6 +160,22 @@ export function buildQuarterView(model: QtdModel, selected: string) {
   const momAvailable = momPace != null && lyAt(d - 1) > 0;
   const momAt = (i: number) => qtd + (lyAt(i) - lyAt(d - 1)) * (1 + (momPace ?? 0));
 
+  // First day index at which the cumulative Y/Y is worth drawing. A ratio on a few
+  // days' base swings hundreds of points (2026Q3 day 2 read +473%) and drags the
+  // whole Y/Y chart's scale with it — and the earliest days are also the most
+  // distorted by the archive's start boundary (2025-07-01 is missing, so early LY
+  // cumulatives are understated). Rule: at least a week elapsed AND LY cumulative
+  // >= 10% of its full quarter. Headline numbers are unaffected — this only gates
+  // where the LINE starts.
+  const lyTotal = lyCum ? lyCum[lyCum.length - 1] : 0;
+  let yoyStableFrom = 0;
+  if (lyCum && lyTotal > 0) {
+    yoyStableFrom = D; // never, until proven stable
+    for (let i = 6; i < D; i++) {
+      if (lyAt(i) >= 0.1 * lyTotal) { yoyStableFrom = i; break; }
+    }
+  }
+
   const fqe = {
     shape: shapeAvailable ? shapeAt(D - 1) : null,
     runrate: !complete ? runRateAt(D - 1) : null,
@@ -184,7 +200,7 @@ export function buildQuarterView(model: QtdModel, selected: string) {
   return {
     dayKeys, D, d, startKey, endKey, dataThrough, complete,
     curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable, lyReported, lyReportedAt,
-    shapeAvailable, shapeAt, runRateAt, momAvailable, momAt, momPace,
+    shapeAvailable, shapeAt, runRateAt, momAvailable, momAt, momPace, yoyStableFrom,
     fqe, primaryFqe, primaryMethod, wow,
     reported: model.reported.get(selected) ?? null,
     estimate: model.estimates.get(selected) ?? null,
@@ -302,7 +318,7 @@ export function computeQtdHeadline(
       current: inData ? view.curCum[i] * scale : null,
       lastYear: reportedAnchor && lyRepAt ? lyRepAt(i) : lyVal != null ? lyVal * scale : null,
       shape: view.shapeAvailable && (anchor || i >= view.d) ? view.shapeAt(i) * scale : null,
-      yoy: inData ? impliedYoy(view.curCum[i], i) : null,
+      yoy: inData && i >= view.yoyStableFrom ? impliedYoy(view.curCum[i], i) : null,
     };
   });
 
