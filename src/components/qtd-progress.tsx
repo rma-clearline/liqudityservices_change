@@ -10,6 +10,7 @@
 
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
+  Brush,
   ComposedChart,
   Line,
   XAxis,
@@ -1472,6 +1473,19 @@ export function QtdProgress() {
               )}
             </>
           )}
+          {/* Zoom: drag the handles (or a range) to window the days; both axes
+              rescale to the visible window (Y domain is auto), so narrowing to
+              the recent weeks reads the 20-30% band at full height. Keyed by
+              quarter+metric so switching either resets to the full quarter. */}
+          <Brush
+            key={`${selected}-${metric}`}
+            dataKey="date"
+            height={20}
+            stroke="#9ca3af"
+            fill="#fafafa"
+            travellerWidth={8}
+            tickFormatter={(v) => shortDate(String(v))}
+          />
         </ComposedChart>
       </ResponsiveContainer>
 
