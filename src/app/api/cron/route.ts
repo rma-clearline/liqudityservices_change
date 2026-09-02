@@ -9,11 +9,12 @@ import {
   getSellerFeesFresh,
   upsertSellerFees,
   refreshFeeAnalytics,
+  getSoldDailyByBucket,
   refreshSoldSupersession,
   type SellerFeeRow,
 } from "@/lib/azure-sql";
 import { fetchBidbox } from "@/lib/asset-fees";
-import { etQuarterKey } from "@/lib/time";
+import { etQuarterKey, etTodayKey } from "@/lib/time";
 import { quarterDayKeys } from "@/lib/qtd-shared";
 import { sendReportEmail, type ReportEmailResult } from "@/lib/report-email";
 import { CronLogger, type SourceSummary } from "@/lib/cron-log";
@@ -392,7 +393,16 @@ export async function GET(request: Request) {
       try {
         const payload = await computeRevenueForecast(1);
         await azUpsertForecastSnapshot(payload.quarter, payload);
-        return { skipped: false, stored: 1, error: null };
+        // The QTD page asks for quarter=ALL (full history) plus the daily take-rate
+        // bucket split; neither matched the current-quarter snapshot, so every cache
+        // miss recomputed them live (~1-2 min on a cold replica — "why is each tab so
+        // slow"). Nothing but this cron writes sold data, so a snapshot taken here is
+        // exact until the next run, not stale. Fixed keys; /api/forecast reads them.
+        const all = await computeRevenueForecast(1, "ALL");
+        await azUpsertForecastSnapshot("ALL", all);
+        const buckets = await getSoldDailyByBucket(all.earliest_data_date, etTodayKey());
+        await azUpsertForecastSnapshot("ALL_BUCKETS", buckets);
+        return { skipped: false, stored: 3, error: null };
       } catch (error) {
         return { skipped: false, stored: 0, error: error instanceof Error ? error.message : String(error) };
       }

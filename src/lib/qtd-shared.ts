@@ -46,6 +46,8 @@ export type MCol = {
   nominal: number;
   yoy: number | null;
   lyReported?: number | null;
+  /** True when `yoy` is scaled-vs-LY-REPORTED (Scaled mode) — tables mark it with *. */
+  anchored?: boolean;
   hl?: boolean;
   total?: boolean;
   // Cumulative quarter-to-date Y/Y as it stood at this period's END (resets each

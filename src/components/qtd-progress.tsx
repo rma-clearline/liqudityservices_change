@@ -10,6 +10,7 @@
 
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
+  Bar,
   Brush,
   ComposedChart,
   Line,
@@ -139,6 +140,10 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
         def: "Rest-of-quarter projected at the RECENT pace: trailing-28-complete-days GMV vs the same LY days, applied to LY's daily shape from today forward (proj(i) = QTD + (LYcum(i) − LYcum(today)) × (1 + T28D Y/Y)). Seasonality-aware where run rate is not, and its implied cumulative Y/Y actually moves — it glides from today's Y/Y toward the recent pace, so it IS the projected-Y/Y line. The pace window ends at the last complete ET day (same rule as T7D). Needs 28 complete days in-quarter.",
       },
       {
+        term: "Comp shape",
+        def: "Below the chart for the live quarter: LY's daily GMV in day-of-quarter weeks for its FULL quarter vs this year's weeks to date, with how much of LY's quarter is still ahead, LY's remaining-days run-rate vs its to-date run-rate (the comp gets tougher when the rest of LY's quarter ran hotter than its start), and LY's biggest single days still to lap. LY's own Y/Y curve needs the year before that as well — available from 2027Q3.",
+      },
+      {
         term: "Projections in Y/Y % mode",
         def: "Every projected Y/Y is the projection's $ path ÷ LY's $ path at the same day − 1. Momentum (purple) is the primary projected-Y/Y line — it bends toward the recent pace as LY's seasonal shape plays out. Run rate (gray) uses the same division but its straight-line $ path reads LY's September back-load as a growth collapse — trust its bend only in evenly-distributed quarters. Prior-yr shape is NOT drawn in this mode: its implied cumulative Y/Y is algebraically the current QTD Y/Y (the LY-cumulative cancels), so the line would restate the solid one dressed as a forecast. External calls appear as implied full-quarter Y/Y vs LY REPORTED GMV — Guidance midpoint (green) and the Clearline estimate (amber), from the last data day to quarter end, omitted when within 0.05pp of the current Y/Y. Both sides of those ratios are total-company, so they are capture-rate-free in either display mode. Every day's Y/Y is drawn, but the zoom brush OPENS at the first stable day (a week elapsed AND LY cumulative ≥ 10% of its full quarter) — a cumulative ratio on a days-old base swings hundreds of points (2026Q3 day 2 read +473%) and would drag the whole axis with it. Drag the brush's left handle to see the early ramp; note the earliest 2026Q3 ratios are also inflated by the archive's start boundary (LY's 2025-07-01 is uncovered).",
       },
@@ -170,7 +175,7 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "Quarters / QTD",
-        def: "Last completed fiscal quarter (full) and the current QTD; Y/Y aligned by day-of-quarter. A * marks Y/Y computed as scaled value vs LY REPORTED total (used when captured prior-year data doesn't exist yet).",
+        def: "Last completed fiscal quarter (full) and the current QTD; Y/Y aligned by day-of-quarter. Y/Y basis follows the $ toggle everywhere on the page: in Scaled mode every Y/Y (card, tables, T7D, chart) is the scaled value vs LY REPORTED GMV prorated to the same window by LY's captured shape, marked *; in As-captured mode every Y/Y is captured vs captured. Card and table therefore always agree.",
       },
       {
         term: "Model (total co.) columns",
@@ -604,6 +609,40 @@ export function QtdProgress() {
     const lySum = sumRange(lyFrom, lyTo);
     return lySum > 0 ? cur / lySum - 1 : null;
   };
+  const nextQuarterKey = (q: string) => {
+    const y = Number(q.slice(0, 4));
+    const n = Number(q.slice(5));
+    return n === 4 ? `${y + 1}Q1` : `${y}Q${n + 1}`;
+  };
+  // LY REPORTED GMV for an arbitrary LY window, prorated by LY's captured shape within
+  // each quarter the window touches — the Scaled-mode Y/Y denominator EVERYWHERE on the
+  // page (card, tables, T7D), so every Y/Y answers the toggle the same way.
+  const lyReportedProrated = (lyFrom: string, lyTo: string): number | null => {
+    if (!coveredFrom(lyFrom) || lyFrom > lyTo) return null;
+    let total = 0;
+    for (let q = etQuarterKey(lyFrom); ; q = nextQuarterKey(q)) {
+      const qk = quarterDayKeys(q);
+      if (!qk.length) return null;
+      const rep = model.reported.get(q);
+      const qTot = sumRange(qk[0], qk[qk.length - 1]);
+      if (!rep || qTot <= 0) return null;
+      const from = lyFrom > qk[0] ? lyFrom : qk[0];
+      const to = lyTo < qk[qk.length - 1] ? lyTo : qk[qk.length - 1];
+      if (from <= to) total += rep * (sumRange(from, to) / qTot);
+      if (qk[qk.length - 1] >= lyTo) break;
+    }
+    return total > 0 ? total : null;
+  };
+  // Basis-aware Y/Y: Scaled mode anchors to LY reported (prorated) when it exists —
+  // the same basis as the QTD Y/Y card — else captured-vs-captured. `anchored` lets
+  // the tables star the reported basis.
+  const yoyBasis = (cur: number, lyFrom: string, lyTo: string): { yoy: number | null; anchored: boolean } => {
+    if (scaled) {
+      const rep = lyReportedProrated(lyFrom, lyTo);
+      if (rep != null) return { yoy: (cur * scale) / rep - 1, anchored: true };
+    }
+    return { yoy: yoyOf(cur, lyFrom, lyTo), anchored: false };
+  };
   const addYearsKey = (key: string, n: number) => {
     const [y, m, dd] = key.split("-").map(Number);
     return new Date(Date.UTC(y + n, m - 1, dd)).toISOString().slice(0, 10);
@@ -619,7 +658,7 @@ export function QtdProgress() {
     const cur = sumRange(qk[0], end);
     const lyqk = quarterDayKeys(priorYearQuarter(q));
     if (lyqk.length < elapsed) return null;
-    return yoyOf(cur, lyqk[0], lyqk[elapsed - 1]);
+    return yoyBasis(cur, lyqk[0], lyqk[elapsed - 1]).yoy;
   };
   // Annualized growth (CAGR) of `nominal` over [start,end] vs the same window N
   // years earlier. null until the data reaches back that far ("as available").
@@ -649,7 +688,7 @@ export function QtdProgress() {
       key: ym,
       top: monthLabel(ym),
       nominal,
-      yoy: yoyOf(nominal, `${lyYm}-01`, `${lyYm}-${String(lastDayOfMonth(lyYm)).padStart(2, "0")}`),
+      ...yoyBasis(nominal, `${lyYm}-01`, `${lyYm}-${String(lastDayOfMonth(lyYm)).padStart(2, "0")}`),
       qtdYoy: qtdYoyAsOf(end),
       cagr: [cagrOf(nominal, start, end, 2), cagrOf(nominal, start, end, 3), cagrOf(nominal, start, end, 4)],
     });
@@ -661,7 +700,7 @@ export function QtdProgress() {
       key: "mtd",
       top: `MTD ${shortDate(last)}`,
       nominal,
-      yoy: yoyOf(nominal, `${lyYm}-01`, `${lyYm}-${String(Math.min(lastDom, lastDayOfMonth(lyYm))).padStart(2, "0")}`),
+      ...yoyBasis(nominal, `${lyYm}-01`, `${lyYm}-${String(Math.min(lastDom, lastDayOfMonth(lyYm))).padStart(2, "0")}`),
       qtdYoy: qtdYoyAsOf(last),
       cagr: [cagrOf(nominal, `${mtdYm}-01`, last, 2), cagrOf(nominal, `${mtdYm}-01`, last, 3), cagrOf(nominal, `${mtdYm}-01`, last, 4)],
       hl: true,
@@ -687,7 +726,7 @@ export function QtdProgress() {
       top: formatQuarterLabel(q, "cy"),
       sub: `(${formatQuarterLabel(q, "fq")})`,
       nominal,
-      yoy: lyKeys.length ? yoyOf(nominal, lyKeys[0], lyKeys[lyKeys.length - 1]) : null,
+      ...(lyKeys.length ? yoyBasis(nominal, lyKeys[0], lyKeys[lyKeys.length - 1]) : { yoy: null, anchored: false }),
       lyReported: model.reported.get(priorYearQuarter(q)) ?? null,
     });
   }
@@ -699,7 +738,7 @@ export function QtdProgress() {
       top: `QTD ${shortDate(last)}`,
       sub: `(${formatQuarterLabel(nowQ, "fq")})`,
       nominal,
-      yoy: lyKeys.length ? yoyOf(nominal, lyKeys[0], lyKeys[lyKeys.length - 1]) : null,
+      ...(lyKeys.length ? yoyBasis(nominal, lyKeys[0], lyKeys[lyKeys.length - 1]) : { yoy: null, anchored: false }),
       hl: true,
     });
   }
@@ -740,7 +779,7 @@ export function QtdProgress() {
     const nominal = sumRange(start, end);
     t7dCols.push({
       key: `t7d-${end}`, top: shortDate(end), nominal,
-      yoy: yoyOf(nominal, addDaysKey(start, -364), addDaysKey(end, -364)),
+      ...yoyBasis(nominal, addDaysKey(start, -364), addDaysKey(end, -364)),
       qtdYoy: qtdYoyAsOf(end),
       cagr: [cagrOf(nominal, start, end, 2), cagrOf(nominal, start, end, 3), cagrOf(nominal, start, end, 4)],
       hl: off === 0,
@@ -1492,6 +1531,71 @@ export function QtdProgress() {
           />
         </ComposedChart>
       </ResponsiveContainer>
+
+      {/* Comp shape — what the rest of the quarter has to lap. LY's daily GMV binned into
+          day-of-quarter weeks for its FULL quarter against this year's bins to date, plus
+          the numbers that decide whether the comp gets tougher: how much of LY's quarter
+          is still ahead, LY's remaining-days run-rate vs its to-date run-rate, and LY's
+          biggest single days still to come (lumpy transactions). Needs only LY dailies;
+          the comp's own Y/Y curve (mosaic's "if 2-yr stack holds") needs the year before
+          that too and unlocks in 2027Q3. */}
+      {!view.complete && view.lyCum && (() => {
+        const lyKeys = quarterDayKeys(priorYearQuarter(selected));
+        const lyVal = (i: number) => (i < lyKeys.length ? realized.get(lyKeys[i]) ?? 0 : 0);
+        const curVal = (i: number) => (i < d ? realized.get(dayKeys[i]) ?? 0 : 0);
+        const bins: { week: string; "Last year": number; "This year": number | null }[] = [];
+        for (let i = 0; i < D; i += 7) {
+          let ly = 0;
+          let cur = 0;
+          for (let j = i; j < Math.min(i + 7, D); j++) {
+            ly += lyVal(j);
+            cur += curVal(j);
+          }
+          bins.push({ week: `wk ${Math.floor(i / 7) + 1}`, "Last year": ly * scale, "This year": i < d ? cur * scale : null });
+        }
+        const lyTot = view.lyCum[view.lyCum.length - 1];
+        const lyToDate = view.lyAt(d - 1);
+        const lyRemaining = lyTot - lyToDate;
+        const remainingDays = D - d;
+        const lyRemainRate = remainingDays > 0 ? lyRemaining / remainingDays : 0;
+        const lyToDateRate = d > 0 ? lyToDate / d : 0;
+        const tougher = lyToDateRate > 0 ? lyRemainRate / lyToDateRate - 1 : 0;
+        const bigDays = lyKeys
+          .slice(d)
+          .map((k) => ({ k, v: realized.get(k) ?? 0 }))
+          .sort((a, b) => b.v - a.v)
+          .slice(0, 3);
+        return (
+          <div className="mt-3 rounded border border-gray-200 bg-gray-50/50 p-3">
+            <div className="mb-1 flex flex-wrap items-baseline justify-between gap-2">
+              <h3 className="text-sm font-semibold text-gray-800">Comp shape — what the rest of the quarter has to lap</h3>
+              <span className="text-xs text-gray-500">day-of-quarter weeks · {scaled ? "scaled to total" : "captured"} $</span>
+            </div>
+            <p className="mb-2 text-xs text-gray-600">
+              LY still ahead: <strong>{fmtM(lyRemaining * scale)}</strong> ({((lyRemaining / lyTot) * 100).toFixed(0)}% of LY&rsquo;s quarter
+              in the final {remainingDays} days) · LY ran <strong>{fmtM(lyRemainRate * scale)}/day</strong> over those days vs{" "}
+              {fmtM(lyToDateRate * scale)}/day before them — the comp gets{" "}
+              <strong className={tougher > 0.05 ? "text-amber-700" : "text-green-700"}>
+                {tougher > 0.05 ? `${(tougher * 100).toFixed(0)}% tougher` : "no tougher"}
+              </strong>
+              {bigDays.length > 0 && bigDays[0].v > 0 && (
+                <> · biggest LY days still to lap: {bigDays.map((b) => `${shortDate(b.k)} ${fmtM(b.v * scale)}`).join(", ")}</>
+              )}
+            </p>
+            <ResponsiveContainer width="100%" height={150}>
+              <ComposedChart data={bins} margin={{ top: 4, right: 16, bottom: 0, left: 20 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="week" tick={{ fontSize: 10 }} interval={0} />
+                <YAxis tick={{ fontSize: 10 }} tickFormatter={(v: number) => `${(v / 1e6).toFixed(0)}M`} />
+                <Tooltip formatter={(v) => (typeof v === "number" ? fmtM(v) : v)} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Bar dataKey="Last year" fill="#9ca3af" />
+                <Bar dataKey="This year" fill="#2563eb" />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+        );
+      })()}
 
       {/* Key metrics — Months & T7D vertical trend tables, then the horizontal quarter
           tape below (all pinned to the latest data, independent of the chart selector).

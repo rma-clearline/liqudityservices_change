@@ -10,19 +10,29 @@ import {
   loadReportedQuarterlyGmv,
 } from "@/lib/reported-gmv";
 import { azFetchLatestForecastSnapshot } from "@/lib/azure-tables";
-import { etTodayKey } from "@/lib/time";
+import { etTodayKey, quarterBounds } from "@/lib/time";
 
 export const dynamic = "force-dynamic";
 
 // Database work depends on the quarter, not the take rate. Cache a 100%-rate base
 // forecast and apply the requested rate in memory so slider changes are free.
 const forecastCache = ttlCache<RevenueForecast>(Number(process.env.FORECAST_CACHE_MS) || 15 * 60_000);
+// A completed quarter cannot change between cron runs (only the cron writes sold
+// data), so a live recompute of one is worth keeping far longer than 15 minutes.
+const completedCache = ttlCache<RevenueForecast>(Number(process.env.FORECAST_COMPLETED_CACHE_MS) || 24 * 3_600_000);
 // Full-history daily take-rate-bucket split for the QTD page (quarter=ALL only).
 const bucketDailyCache = ttlCache<SoldBucketDailyRow[]>(Number(process.env.FORECAST_CACHE_MS) || 15 * 60_000);
 
+const currentQuarterLabel = () => quarterBounds(new Date()).label;
+
+/** Snapshot-first. The cron materialises the current quarter (keyed by its label) and
+ *  the QTD page's full-history "ALL" view; anything else — a past quarter — is computed
+ *  live. Keyed lookups only: with several snapshots stored, "latest of any" would hand
+ *  the forecast tab the ALL payload. */
 async function loadBaseForecast(quarter?: string): Promise<RevenueForecast> {
-  const snap = await azFetchLatestForecastSnapshot<RevenueForecast>().catch(() => null);
-  if (snap?.payload && (!quarter || snap.payload.quarter === quarter)) return snap.payload;
+  const key = quarter?.toUpperCase() === "ALL" ? "ALL" : (quarter ?? currentQuarterLabel());
+  const snap = await azFetchLatestForecastSnapshot<RevenueForecast>(key).catch(() => null);
+  if (snap?.payload?.quarter === key) return snap.payload;
   return computeRevenueForecast(1, quarter);
 }
 
@@ -35,7 +45,8 @@ export async function GET(request: Request) {
   // Don't cache a degraded forecast (live-quarter store read failed → collapsed to
   // the sparse tracked feed). Caching one would serve the collapse for the full TTL;
   // skipping the store means the next request re-computes and recovers immediately.
-  const base = await forecastCache.get(key, () => loadBaseForecast(quarter), (f) => !f.store_degraded);
+  const isCompletedQuarter = !!quarter && quarter.toUpperCase() !== "ALL" && quarter !== currentQuarterLabel();
+  const base = await (isCompletedQuarter ? completedCache : forecastCache).get(key, () => loadBaseForecast(quarter), (f) => !f.store_degraded);
   // Attach the reported-GMV benchmark + model estimates here (not in the snapshot):
   // full-history, take-rate-independent, and cheap, so they're always fresh regardless
   // of the selected quarter or when the cron last regenerated the snapshot.
@@ -71,7 +82,12 @@ export async function GET(request: Request) {
     try {
       const timeoutMs = Number(process.env.FORECAST_SOLD_TIMEOUT_MS) || 25_000;
       sold_by_bucket_daily = await Promise.race([
-        bucketDailyCache.get("all", () => getSoldDailyByBucket(base.earliest_data_date, etTodayKey())),
+        bucketDailyCache.get("all", async () => {
+          // Cron-materialised copy first (see the snapshot task); live query as fallback.
+          const snap = await azFetchLatestForecastSnapshot<SoldBucketDailyRow[]>("ALL_BUCKETS").catch(() => null);
+          if (Array.isArray(snap?.payload) && snap.payload.length > 0) return snap.payload;
+          return getSoldDailyByBucket(base.earliest_data_date, etTodayKey());
+        }),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("sold-by-bucket timeout")), timeoutMs),
         ),

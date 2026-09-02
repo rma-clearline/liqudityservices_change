@@ -99,7 +99,7 @@ export function MetricsTable({
                       {((c.total ? c.nominal : c.nominal * scale) / 1e6).toFixed(1)}
                     </td>
                     {showQtd && <td className="px-2.5 py-1 text-right tabular-nums">{pctCell(c.qtdYoy)}</td>}
-                    <td className="px-2.5 py-1 text-right tabular-nums">{pctCell(v, derived != null)}</td>
+                    <td className="px-2.5 py-1 text-right tabular-nums">{pctCell(v, derived != null || !!c.anchored)}</td>
                     {cagrHz.map((h) => (
                       <td key={h} className="px-2.5 py-1 text-right tabular-nums">
                         {pctCell(c.cagr?.[h - 2])}

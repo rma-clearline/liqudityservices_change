@@ -607,6 +607,7 @@ function SalesDetailsModal({
 type FetchState = { forecast: Forecast | null; error: string | null; done: boolean };
 
 type ChartMetric = "gmv" | "revenue";
+type ChartDisplay = "dollars" | "yoy";
 
 /**
  * True if `dateKey` is old enough to have likely aged out of Maestro's rolling
@@ -693,6 +694,7 @@ function bucketDaily(daily: DailyPoint[], granularity: Granularity): DailyPoint[
 function DailyForecastChart({
   daily,
   metric,
+  display,
   market,
   source,
   granularity,
@@ -703,6 +705,7 @@ function DailyForecastChart({
 }: {
   daily: DailyPoint[];
   metric: ChartMetric;
+  display: ChartDisplay;
   market: SalesMarketFilter;
   source: SourceFilter;
   granularity: Granularity;
@@ -737,11 +740,40 @@ function DailyForecastChart({
       Reported: showReported ? reported.get(key) ?? null : null,
     };
   });
+  // Y/Y display: each bucket vs the same bucket a year earlier — day/week buckets shift
+  // 364 days (weekday-aligned, like T7D), month/quarter buckets one calendar year. Null
+  // (never 0) when the prior bucket is missing or empty. Quarter buckets also carry
+  // LQDT's REPORTED Y/Y where both years were reported; the current bucket adds the
+  // implied Y/Y including projected open auctions.
+  const yoyMode = display === "yoy";
+  const realizedByKey = new Map(data.map((r) => [r.date, r.Realized]));
+  const priorKey = (key: string): string => {
+    if (granularity === "month" || granularity === "quarter") return `${Number(key.slice(0, 4)) - 1}${key.slice(4)}`;
+    const dt = new Date(`${key}T00:00:00Z`);
+    dt.setUTCDate(dt.getUTCDate() - 364);
+    return dt.toISOString().slice(0, 10);
+  };
+  const yoyData = data.map((r) => {
+    const pk = priorKey(r.date);
+    const prior = realizedByKey.get(pk);
+    const base = prior != null && prior > 0 ? prior : null;
+    const priorRep = showReported ? reported.get(pk) : undefined;
+    return {
+      ...r, // keep the $ fields so the row type stays a superset of the $-mode rows
+      "Y/Y": base != null && r.Realized > 0 ? (r.Realized / base - 1) * 100 : null,
+      "Y/Y incl. projected": base != null && r.Projected > 0 ? ((r.Realized + r.Projected) / base - 1) * 100 : null,
+      "Reported Y/Y": showReported && r.Reported != null && priorRep ? (r.Reported / priorRep - 1) * 100 : null,
+    };
+  });
+  const hasYoy = yoyData.some((r) => r["Y/Y"] != null);
   const hasAny = data.some((d) => d.Realized > 0 || d.Projected > 0 || (d.Reported ?? 0) > 0);
   // Thin quarter ticks so the two-line CQ/FQ labels don't overlap (~14 max).
   const quarterInterval = Math.max(0, Math.ceil(data.length / 14) - 1);
   if (!hasAny) {
     return <p className="text-gray-500 text-sm py-8 text-center">No daily data yet - auctions table fills after the next cron run.</p>;
+  }
+  if (yoyMode && !hasYoy) {
+    return <p className="text-gray-500 text-sm py-8 text-center">Y/Y needs the same period a year earlier — the daily archive begins mid-2025, so Y/Y fills in from mid-2026.</p>;
   }
   const todayLabel = todayKey;
 
@@ -769,7 +801,7 @@ function DailyForecastChart({
       aria-label="Open sales for selected daily GMV date"
     >
       <ResponsiveContainer width="100%" height={340}>
-        <ComposedChart data={data} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
+        <ComposedChart data={yoyMode ? yoyData : data} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
           <CartesianGrid strokeDasharray="3 3" />
           {isQuarter ? (
             <XAxis dataKey="date" tick={<QuarterAxisTick />} height={40} interval={quarterInterval} />
@@ -778,27 +810,40 @@ function DailyForecastChart({
           )}
           <YAxis
             yAxisId="money"
-            tickFormatter={(v: number) => (v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : (v / 1000).toFixed(0) + "k")}
+            tickFormatter={(v: number) => (yoyMode ? `${v.toFixed(0)}%` : v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : (v / 1000).toFixed(0) + "k")}
             tick={{ fontSize: 11 }}
           />
-          <Tooltip formatter={(v) => (typeof v === "number" ? "$" + v.toLocaleString() : v)} />
+          <Tooltip formatter={(v) => (typeof v === "number" ? (yoyMode ? `${v.toFixed(1)}%` : "$" + v.toLocaleString()) : v)} />
           <Legend />
           {isCurrent && granularity === "day" && (
             <ReferenceLine x={todayLabel} stroke="#9ca3af" strokeDasharray="4 2" label={{ value: "today", position: "top", fontSize: 10, fill: "#6b7280" }} />
           )}
-          <Bar yAxisId="money" dataKey="Realized" stackId="a" fill="#2563eb" cursor="pointer" />
-          {showProjected && <Bar yAxisId="money" dataKey="Projected" stackId="a" fill="#93c5fd" cursor="pointer" />}
-          {showReported && (
-            <Line
-              yAxisId="money"
-              type="monotone"
-              dataKey="Reported"
-              name="Reported GMV (LQDT total)"
-              stroke="#15803d"
-              strokeWidth={2}
-              dot={{ r: 2 }}
-              connectNulls
-            />
+          {yoyMode ? (
+            <>
+              <ReferenceLine yAxisId="money" y={0} stroke="#9ca3af" />
+              <Bar yAxisId="money" dataKey="Y/Y" fill="#2563eb" cursor="pointer" />
+              {showProjected && <Bar yAxisId="money" dataKey="Y/Y incl. projected" fill="#93c5fd" cursor="pointer" />}
+              {showReported && (
+                <Line yAxisId="money" type="monotone" dataKey="Reported Y/Y" name="Reported Y/Y (LQDT total)" stroke="#15803d" strokeWidth={2} dot={{ r: 2 }} connectNulls />
+              )}
+            </>
+          ) : (
+            <>
+              <Bar yAxisId="money" dataKey="Realized" stackId="a" fill="#2563eb" cursor="pointer" />
+              {showProjected && <Bar yAxisId="money" dataKey="Projected" stackId="a" fill="#93c5fd" cursor="pointer" />}
+              {showReported && (
+                <Line
+                  yAxisId="money"
+                  type="monotone"
+                  dataKey="Reported"
+                  name="Reported GMV (LQDT total)"
+                  stroke="#15803d"
+                  strokeWidth={2}
+                  dot={{ r: 2 }}
+                  connectNulls
+                />
+              )}
+            </>
           )}
         </ComposedChart>
       </ResponsiveContainer>
@@ -1106,6 +1151,7 @@ export function RevenueForecast() {
   const [requestedTakeRate, setRequestedTakeRate] = useState<number | null>(null);
   const [quarter, setQuarter] = useState<string | null>(null);
   const [chartMetric, setChartMetric] = useState<ChartMetric>("gmv");
+  const [chartDisplay, setChartDisplay] = useState<ChartDisplay>("dollars");
   const [chartMarket, setChartMarket] = useState<SalesMarketFilter>(DEFAULT_CHART_MARKET);
   const [chartSource, setChartSource] = useState<SourceFilter>("all");
   const [granularity, setGranularity] = useState<Granularity>("day");
@@ -1349,11 +1395,28 @@ export function RevenueForecast() {
                 </button>
               ))}
             </div>
+            <div className="flex gap-1">
+              {(["dollars", "yoy"] as ChartDisplay[]).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setChartDisplay(m)}
+                  title={m === "yoy" ? "Each bucket vs the same bucket a year earlier (day/week: 364-day shift)" : "Absolute dollars"}
+                  className={`px-2 py-0.5 text-xs rounded border transition-colors ${
+                    chartDisplay === m
+                      ? "bg-gray-900 text-white border-gray-900"
+                      : "bg-white text-gray-600 border-gray-300 hover:border-gray-400"
+                  }`}
+                >
+                  {m === "dollars" ? "$" : "Y/Y"}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         <DailyForecastChart
           daily={chartDaily}
           metric={chartMetric}
+          display={chartDisplay}
           market={chartMarket}
           source={chartSource}
           granularity={granularity}
