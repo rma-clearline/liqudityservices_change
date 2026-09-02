@@ -149,7 +149,7 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       },
       {
         term: "Weekly / Monthly tracker",
-        def: "Third chart mode. Day-of-quarter bins — 7-day weeks (each holds every weekday once, so weeks compare cleanly) or calendar months — as grouped bars: last year for the WHOLE quarter (grey, so the heavy periods still ahead are visible) and this year to date. The CURRENT period is projected at this year's pace through the last complete day: LY period total × (this year through day k ÷ LY through day k) — if LY's week was $10M, LY had $1.2M by day 2 and we have $1.0M, the week is tracking $8.3M and 'Pace vs LY' reads −17%. The table adds each period's share of the quarter (LY of LY's actual, this year of the prior-yr-shape projected quarter) and Y/Y (actual for complete periods, projected for the current one). Today's partial day is excluded from the pace but included in the to-date bar.",
+        def: "Third chart mode. Day-of-quarter bins — 7-day weeks (each holds every weekday once, so weeks compare cleanly) or calendar months — as grouped bars: last year for the WHOLE quarter (grey, so the heavy periods still ahead are visible) and this year to date. The CURRENT period is projected at this year's pace: LY period total × (1 + pace), where pace = this year's complete days in the period vs the SAME WEEKDAYS last year (364-day shift — a day-of-quarter one-day ratio once compared a normal Tuesday with Labor Day and projected September at $413M). Until the period has 2 complete days, the trailing 7 complete days stand in, marked (T7D). Example: LY's week $10M, LY $1.2M over the first two weekdays, we did $1.0M → pace −17%, tracking $8.3M. The table adds each period's share of the quarter (LY of LY's actual, this year of the prior-yr-shape projected quarter) and Y/Y (actual for complete periods, projected for the current one). Today's partial day is excluded from the pace but included in the to-date bar.",
       },
       {
         term: "LY shape",
@@ -1490,24 +1490,37 @@ export function QtdProgress() {
           const rowsP = bins.map((b) => {
             let ly = 0;
             let cur = 0;
-            let lyTd = 0;
-            let curTd = 0;
             for (let j = b.s; j <= b.e; j++) {
               ly += lyVal(j);
               if (j < d) cur += curVal(j);
-              if (j <= lastComplete) {
-                lyTd += lyVal(j);
-                curTd += curVal(j);
-              }
             }
             const complete = b.e <= lastComplete;
             const started = b.s < d;
             const current = started && !complete;
-            const pace = current && lyTd > 0 ? curTd / lyTd - 1 : null;
-            const projected = current ? (lyTd > 0 ? ly * (curTd / lyTd) : null) : complete ? cur : null;
+            // Pace vs LY over COMPLETE days, SAME-WEEKDAY aligned (364-day shift). The
+            // day-of-quarter one-day ratio put 2026-09-01 (a normal Tuesday) against Labor
+            // Day 2025 and projected September at $413M. Fewer than MIN_PACE_DAYS complete
+            // days in the period → the trailing 7 complete days stand in (labelled T7D).
+            const MIN_PACE_DAYS = 2;
+            const paceOver = (from: number, to: number): number | null => {
+              if (to < from) return null;
+              let ty = 0;
+              let lyw = 0;
+              for (let j = Math.max(0, from); j <= to; j++) {
+                const k = addDaysKey(dayKeys[j], -364);
+                if (k < model.earliest) return null;
+                ty += curVal(j);
+                lyw += realizedMap.get(k) ?? 0;
+              }
+              return lyw > 0 ? ty / lyw - 1 : null;
+            };
+            const inPeriodDays = lastComplete - b.s + 1;
+            const paceSource: "period" | "t7d" | null = !current ? null : inPeriodDays >= MIN_PACE_DAYS ? "period" : "t7d";
+            const pace = paceSource === "period" ? paceOver(b.s, lastComplete) : paceSource === "t7d" ? paceOver(lastComplete - 6, lastComplete) : null;
+            const projected = current ? (pace != null ? ly * (1 + pace) : null) : complete ? cur : null;
             const yoy = complete && ly > 0 ? cur / ly - 1 : current && projected != null && ly > 0 ? projected / ly - 1 : null;
             const tyShare = projQtr > 0 && (complete || current) && projected != null ? projected / projQtr : null;
-            return { b, ly, cur, complete, started, current, pace, projected, yoy, lyShare: lyTot > 0 ? ly / lyTot : null, tyShare };
+            return { b, ly, cur, complete, started, current, pace, paceSource, projected, yoy, lyShare: lyTot > 0 ? ly / lyTot : null, tyShare };
           });
           const chartData = rowsP.map((r) => ({
             period: r.b.label.replace(/ \(.*\)$/, ""),
@@ -1527,7 +1540,7 @@ export function QtdProgress() {
                   </button>
                 ))}
                 <span className="ml-2">
-                  day-of-quarter aligned · {scaled ? "scaled to total" : "captured"} $ · current period projected at this year&rsquo;s pace through the last complete day
+                  day-of-quarter aligned · {scaled ? "scaled to total" : "captured"} $ · current period projected at this year&rsquo;s pace (complete days vs the same weekdays LY; T7D until 2 days are in)
                 </span>
               </div>
               <ResponsiveContainer width="100%" height={300}>
@@ -1550,7 +1563,7 @@ export function QtdProgress() {
                       <th className={cell + " font-semibold"}>LY</th>
                       <th className={cell + " font-semibold"} title="Last year's period as a share of last year's full quarter">LY % of qtr</th>
                       <th className={cell + " font-semibold"}>This year</th>
-                      <th className={cell + " font-semibold"} title="Current period: this year through the last complete day vs LY over the same days">Pace vs LY</th>
+                      <th className={cell + " font-semibold"} title="Current period: this year's complete days vs the SAME WEEKDAYS last year (364-day shift); (T7D) = fewer than 2 complete days in the period, so the trailing 7 complete days stand in">Pace vs LY</th>
                       <th className={cell + " font-semibold"} title="LY period total × this year's pace">Projected</th>
                       <th className={cell + " font-semibold"}>Y/Y</th>
                       <th className={cell + " font-semibold"} title="This year's period (projected for the current one) as a share of the projected full quarter (prior-yr shape)">% of proj. qtr</th>
@@ -1566,7 +1579,7 @@ export function QtdProgress() {
                         <td className={cell}>{fmtM(r.ly * scale)}</td>
                         <td className={cell + " text-gray-500"}>{r.lyShare != null ? fmtPct(r.lyShare) : "—"}</td>
                         <td className={cell}>{r.started ? fmtM(r.cur * scale) : <span className="text-gray-300">—</span>}</td>
-                        <td className={`${cell} ${tone(r.pace)}`}>{r.pace != null ? fmtPct(r.pace) : "—"}</td>
+                        <td className={`${cell} ${tone(r.pace)}`} title={r.paceSource === "t7d" ? "Fewer than 2 complete days in this period — trailing 7 complete days, same weekdays last year" : r.paceSource === "period" ? "This period's complete days vs the same weekdays last year" : undefined}>{r.pace != null ? `${fmtPct(r.pace)}${r.paceSource === "t7d" ? " (T7D)" : ""}` : "—"}</td>
                         <td className={cell}>{r.current && r.projected != null ? fmtM(r.projected * scale) : <span className="text-gray-300">—</span>}</td>
                         <td className={`${cell} font-semibold ${tone(r.yoy)}`}>{r.yoy != null ? fmtPct(r.yoy) : "—"}</td>
                         <td className={cell + " text-gray-500"}>{r.tyShare != null ? fmtPct(r.tyShare) : "—"}</td>
