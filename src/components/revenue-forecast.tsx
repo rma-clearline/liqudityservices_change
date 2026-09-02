@@ -695,6 +695,7 @@ function DailyForecastChart({
   daily,
   metric,
   display,
+  history,
   market,
   source,
   granularity,
@@ -706,6 +707,7 @@ function DailyForecastChart({
   daily: DailyPoint[];
   metric: ChartMetric;
   display: ChartDisplay;
+  history: DailyPoint[] | null;
   market: SalesMarketFilter;
   source: SourceFilter;
   granularity: Granularity;
@@ -746,7 +748,11 @@ function DailyForecastChart({
   // LQDT's REPORTED Y/Y where both years were reported; the current bucket adds the
   // implied Y/Y including projected open auctions.
   const yoyMode = display === "yoy";
-  const realizedByKey = new Map(data.map((r) => [r.date, r.Realized]));
+  // Prior-year lookups come from the full history, bucketed and filtered exactly like
+  // the chart's own data; the selected quarter's payload alone holds no prior year.
+  const baseline = history && history.length ? bucketDaily(history, granularity) : [];
+  const realizedByKey = new Map<string, number>(baseline.map((p) => [p.date, realizedValue(p, metric, market, source)]));
+  for (const r of data) realizedByKey.set(r.date, r.Realized);
   const priorKey = (key: string): string => {
     if (granularity === "month" || granularity === "quarter") return `${Number(key.slice(0, 4)) - 1}${key.slice(4)}`;
     const dt = new Date(`${key}T00:00:00Z`);
@@ -772,8 +778,11 @@ function DailyForecastChart({
   if (!hasAny) {
     return <p className="text-gray-500 text-sm py-8 text-center">No daily data yet - auctions table fills after the next cron run.</p>;
   }
+  if (yoyMode && history === null) {
+    return <p className="text-gray-500 text-sm py-8 text-center">Loading the prior-year baseline…</p>;
+  }
   if (yoyMode && !hasYoy) {
-    return <p className="text-gray-500 text-sm py-8 text-center">Y/Y needs the same period a year earlier — the daily archive begins mid-2025, so Y/Y fills in from mid-2026.</p>;
+    return <p className="text-gray-500 text-sm py-8 text-center">No prior-year data for this window yet — daily history begins 2025-07-02, so Y/Y is available from July 2026 onward.</p>;
   }
   const todayLabel = todayKey;
 
@@ -1152,6 +1161,8 @@ export function RevenueForecast() {
   const [quarter, setQuarter] = useState<string | null>(null);
   const [chartMetric, setChartMetric] = useState<ChartMetric>("gmv");
   const [chartDisplay, setChartDisplay] = useState<ChartDisplay>("dollars");
+  // Full-history baseline for the Y/Y view — the selected quarter's payload has no prior year.
+  const [history, setHistory] = useState<DailyPoint[] | null>(null);
   const [chartMarket, setChartMarket] = useState<SalesMarketFilter>(DEFAULT_CHART_MARKET);
   const [chartSource, setChartSource] = useState<SourceFilter>("all");
   const [granularity, setGranularity] = useState<Granularity>("day");
@@ -1194,6 +1205,23 @@ export function RevenueForecast() {
       cancelled = true;
     };
   }, [requestedTakeRate, quarter]);
+
+  useEffect(() => {
+    if (chartDisplay !== "yoy" || history !== null) return;
+    let cancelled = false;
+    // quarter=ALL is cron-snapshotted, so this is a row read, not a recompute.
+    fetch("/api/forecast?quarter=ALL&takeRate=1")
+      .then((r) => r.json())
+      .then((d) => {
+        if (!cancelled) setHistory(Array.isArray(d?.daily) ? (d.daily as DailyPoint[]) : []);
+      })
+      .catch(() => {
+        if (!cancelled) setHistory([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [chartDisplay, history]);
 
   const { forecast, error, done } = state;
   if (!done && !forecast) return <p className="text-gray-500 text-sm">Loading forecast...</p>;
@@ -1417,6 +1445,7 @@ export function RevenueForecast() {
           daily={chartDaily}
           metric={chartMetric}
           display={chartDisplay}
+          history={history}
           market={chartMarket}
           source={chartSource}
           granularity={granularity}

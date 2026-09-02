@@ -80,6 +80,7 @@ type ChartRow = {
   "Run rate": number | null;
   "Momentum (T28D)": number | null;
   "Cumulative Y/Y": number | null;
+  "LY daily": number | null;
   "Guidance mid (implied FQ Y/Y)": number | null;
   "Clearline (implied FQ Y/Y)": number | null;
   /** True when the row's projection values are Y/Y percentages, not dollars. */
@@ -138,6 +139,10 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       {
         term: "Momentum (T28D)",
         def: "Rest-of-quarter projected at the RECENT pace: trailing-28-complete-days GMV vs the same LY days, applied to LY's daily shape from today forward (proj(i) = QTD + (LYcum(i) − LYcum(today)) × (1 + T28D Y/Y)). Seasonality-aware where run rate is not, and its implied cumulative Y/Y actually moves — it glides from today's Y/Y toward the recent pace, so it IS the projected-Y/Y line. The pace window ends at the last complete ET day (same rule as T7D). Needs 28 complete days in-quarter.",
+      },
+      {
+        term: "LY daily shape",
+        def: "Background bars on the QTD chart (right axis, either mode): last year's GMV per day-of-quarter day, so the comparison's shape — where LY's dollars actually landed — sits directly under this year's line. Toggle with the Comp chip; the axis is stretched so the bars stay in the bottom third.",
       },
       {
         term: "Comp shape",
@@ -397,7 +402,7 @@ function QtdTooltip({ active, payload }: TooltipContentProps<ValueType, NameType
   if (!active || !payload?.length) return null;
   const row = payload[0]?.payload as ChartRow | undefined;
   if (!row) return null;
-  const lines = payload.filter((p) => p.value != null && !String(p.dataKey).startsWith("_"));
+  const lines = payload.filter((p) => p.value != null && !String(p.dataKey).startsWith("_") && p.dataKey !== "LY daily");
   return (
     <div className="rounded border bg-white px-3 py-2 text-xs shadow-md">
       <p className="mb-1 font-semibold text-gray-800">
@@ -422,6 +427,8 @@ export function QtdProgress() {
   const [scaled, setScaled] = useState(false);
   const [captureInput, setCaptureInput] = useState(""); // "" = auto
   const [projections, setProjections] = useState<Set<ProjectionKey>>(new Set(["shape", "momentum", "runrate"]));
+  // LY's daily GMV as background bars on the chart — the shape of the comparison.
+  const [lyShape, setLyShape] = useState(true);
   // Guidance / Clearline edit panel ("" = blank field; values entered in $M).
   const [editOpen, setEditOpen] = useState(false);
   const [editLow, setEditLow] = useState("");
@@ -577,6 +584,7 @@ export function QtdProgress() {
       // External calls as implied FQ Y/Y, drawn from the last data day to quarter end.
       "Guidance mid (implied FQ Y/Y)": yoyMode && guidanceYoy != null && i >= d - 1 ? guidanceYoy : null,
       "Clearline (implied FQ Y/Y)": yoyMode && clearlineYoy != null && i >= d - 1 ? clearlineYoy : null,
+      "LY daily": lyShape && view.lyCum && i < view.lyCum.length ? (view.lyCum[i] - (i > 0 ? view.lyCum[i - 1] : 0)) * scale : null,
       _yoyMode: yoyMode,
       _dailyCur: inData ? (view.curCum[i] - (i > 0 ? view.curCum[i - 1] : 0)) : null,
       _dailyLy: view.lyCum && i < (view.lyCum.length ?? 0) ? view.lyCum[i] - (i > 0 ? view.lyCum[i - 1] : 0) : null,
@@ -1417,6 +1425,18 @@ export function QtdProgress() {
           })}
         </div>
       )}
+      {view.lyAvailable && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
+          Comp:
+          <button
+            onClick={() => setLyShape((v) => !v)}
+            className={chip(lyShape)}
+            title="Last year's daily GMV, day-of-quarter aligned, as background bars on the right axis — the shape of the comparison you are lapping"
+          >
+            LY daily shape
+          </button>
+        </div>
+      )}
 
       {/* Chart */}
       <ResponsiveContainer width="100%" height={metric === "dollars" && scaled ? 460 : 380}>
@@ -1435,8 +1455,23 @@ export function QtdProgress() {
             tick={{ fontSize: 11 }}
             domain={metric === "yoy" ? ["auto", "auto"] : [0, "auto"]}
           />
+          {/* Right axis for LY's daily bars: domain stretched so the bars sit in the
+              bottom third as background — the comp's shape, not a competing scale. */}
+          <YAxis
+            yAxisId="right"
+            orientation="right"
+            hide={!lyShape || !view.lyAvailable}
+            tick={{ fontSize: 10 }}
+            tickFormatter={(v: number) => `${(v / 1e6).toFixed(1)}M`}
+            domain={[0, (max: number) => max * 3]}
+          />
           <Tooltip content={QtdTooltip} />
           <Legend wrapperStyle={{ fontSize: 11 }} />
+          {/* Last year's daily GMV, day-of-quarter aligned, drawn first so it sits behind
+              the lines: the September bulge is visible under the Y/Y line itself. */}
+          {lyShape && view.lyAvailable && (
+            <Bar yAxisId="right" dataKey="LY daily" name="LY daily GMV" fill="#d1d5db" fillOpacity={0.6} isAnimationActive={false} />
+          )}
           {metric === "dollars" ? (
             <>
               <Line type="monotone" dataKey="Current" stroke="#2563eb" strokeWidth={2.5} dot={false} connectNulls={false} />
