@@ -12,7 +12,6 @@ import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type R
 import {
   Bar,
   Brush,
-  Cell,
   ComposedChart,
   Line,
   XAxis,
@@ -85,10 +84,6 @@ type ChartRow = {
   "LY daily": number | null;
   "LY % of quarter": number | null;
   "LY cumulative Y/Y": number | null;
-  "This year (day)": number | null;
-  "Last year (same weekday)": number | null;
-  _dailyMode: boolean;
-  _dayYoy: number | null;
   "Guidance mid (implied FQ Y/Y)": number | null;
   "Clearline (implied FQ Y/Y)": number | null;
   /** True when the row's projection values are Y/Y percentages, not dollars. */
@@ -153,8 +148,8 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
         def: "Rest-of-quarter projected at the RECENT pace: trailing-28-complete-days GMV vs the same LY days, applied to LY's daily shape from today forward (proj(i) = QTD + (LYcum(i) − LYcum(today)) × (1 + T28D Y/Y)). Seasonality-aware where run rate is not, and its implied cumulative Y/Y actually moves — it glides from today's Y/Y toward the recent pace, so it IS the projected-Y/Y line. The pace window ends at the last complete ET day (same rule as T7D). Needs 28 complete days in-quarter.",
       },
       {
-        term: "Daily tracker",
-        def: "Third chart mode. Grouped bars per day of quarter: last year for the WHOLE quarter (grey — so the comps still ahead, e.g. September's big days, are visible) and this year to date, coloured green when the day beat the same weekday last year and red when it fell short. Days are matched to the same weekday a year earlier (364-day shift) because a single day's comp is meaningless across a weekday change; the cumulative lines elsewhere stay day-of-quarter aligned. Today's bar is partial until the evening capture. Use the brush to zoom into a stretch of days.",
+        term: "Weekly / Monthly tracker",
+        def: "Third chart mode. Day-of-quarter bins — 7-day weeks (each holds every weekday once, so weeks compare cleanly) or calendar months — as grouped bars: last year for the WHOLE quarter (grey, so the heavy periods still ahead are visible) and this year to date. The CURRENT period is projected at this year's pace through the last complete day: LY period total × (this year through day k ÷ LY through day k) — if LY's week was $10M, LY had $1.2M by day 2 and we have $1.0M, the week is tracking $8.3M and 'Pace vs LY' reads −17%. The table adds each period's share of the quarter (LY of LY's actual, this year of the prior-yr-shape projected quarter) and Y/Y (actual for complete periods, projected for the current one). Today's partial day is excluded from the pace but included in the to-date bar.",
       },
       {
         term: "LY shape",
@@ -430,16 +425,8 @@ function QtdTooltip({ active, payload }: TooltipContentProps<ValueType, NameType
           {p.dataKey === "Cumulative Y/Y" || row._yoyMode ? fmtPct(Number(p.value) / 100) : fmtM(Number(p.value))}
         </p>
       ))}
-      {row._dailyMode ? (
-        row._dayYoy != null && (
-          <p className={`mt-1 font-medium ${row._dayYoy >= 0 ? "text-green-700" : "text-red-700"}`}>vs same weekday LY: {fmtPct(row._dayYoy)}</p>
-        )
-      ) : (
-        <>
-          {row._dailyCur != null && <p className="mt-1 text-gray-500">Day GMV: {fmtM(row._dailyCur)}</p>}
-          {row._dailyLy != null && <p className="text-gray-400">LY day GMV: {fmtM(row._dailyLy)}</p>}
-        </>
-      )}
+      {row._dailyCur != null && <p className="mt-1 text-gray-500">Day GMV: {fmtM(row._dailyCur)}</p>}
+      {row._dailyLy != null && <p className="text-gray-400">LY day GMV: {fmtM(row._dailyLy)}</p>}
     </div>
   );
 }
@@ -447,7 +434,9 @@ function QtdTooltip({ active, payload }: TooltipContentProps<ValueType, NameType
 export function QtdProgress() {
   const [state, setState] = useState<{ data: QtdData | null; error: string | null }>({ data: null, error: null });
   const [quarter, setQuarter] = useState<string | null>(null); // null until data arrives (defaults to current)
-  const [metric, setMetric] = useState<"dollars" | "yoy" | "daily">("dollars");
+  const [metric, setMetric] = useState<"dollars" | "yoy" | "periods">("dollars");
+  // Weekly / Monthly tracker grain.
+  const [periodGrain, setPeriodGrain] = useState<"week" | "month">("week");
   const [scaled, setScaled] = useState(false);
   const [captureInput, setCaptureInput] = useState(""); // "" = auto
   const [projections, setProjections] = useState<Set<ProjectionKey>>(new Set(["shape", "momentum", "flat", "runrate"]));
@@ -546,20 +535,7 @@ export function QtdProgress() {
 
   const { dayKeys, D, d } = view;
   const yoyMode = metric === "yoy";
-  // Daily tracker: each day vs the SAME WEEKDAY last year (364-day shift). Day-of-quarter
-  // alignment would pit a Saturday against a Friday; for single days the weekday is
-  // what matters. LY is drawn for the whole quarter so the comps still ahead are visible.
-  const dailyMode = metric === "daily";
   const realizedMap = model.realizedByDate;
-  const lyWk = (date: string): number | null => {
-    const k = addDaysKey(date, -364);
-    return k >= model.earliest ? (realizedMap.get(k) ?? 0) : null;
-  };
-  const dayYoy = (date: string): number | null => {
-    const ly = lyWk(date);
-    const cur = realizedMap.get(date) ?? 0;
-    return ly != null && ly > 0 ? cur / ly - 1 : null;
-  };
 
   const est = view.estimate;
   const guidanceLow = est?.guidance_low_usd ?? null;
@@ -628,10 +604,6 @@ export function QtdProgress() {
       // (right axis) and — when LY-1 dailies exist — LY's own cumulative Y/Y curve.
       "LY % of quarter": yoyMode && lyShape && view.lyCum ? (view.lyAt(i) / view.lyCum[view.lyCum.length - 1]) * 100 : null,
       "LY cumulative Y/Y": yoyMode && lyShape && view.lyYoyAvailable ? (() => { const v = view.lyYoyAt(i); return v == null ? null : v * 100; })() : null,
-      "This year (day)": dailyMode && inData ? (realizedMap.get(date) ?? 0) * scale : null,
-      "Last year (same weekday)": dailyMode && lyWk(date) != null ? (lyWk(date) as number) * scale : null,
-      _dailyMode: dailyMode,
-      _dayYoy: dailyMode && inData ? dayYoy(date) : null,
       _yoyMode: yoyMode,
       _dailyCur: inData ? (view.curCum[i] - (i > 0 ? view.curCum[i - 1] : 0)) : null,
       _dailyLy: view.lyCum && i < (view.lyCum.length ?? 0) ? view.lyCum[i] - (i > 0 ? view.lyCum[i - 1] : 0) : null,
@@ -1222,15 +1194,15 @@ export function QtdProgress() {
           )}
         </div>
         <div className="flex gap-1">
-          {(["dollars", "yoy", "daily"] as const).map((m) => (
+          {(["dollars", "yoy", "periods"] as const).map((m) => (
             <button
               key={m}
               onClick={() => setMetric(m)}
               disabled={m !== "dollars" && !view.lyAvailable}
               className={chip(metric === m, m !== "dollars" && !view.lyAvailable ? "opacity-40 cursor-not-allowed" : "")}
-              title={m !== "dollars" && !view.lyAvailable ? "Prior-year daily data begins Jul 2025" : m === "daily" ? "Each day vs the same weekday last year; LY drawn for the whole quarter so the comps ahead are visible" : undefined}
+              title={m !== "dollars" && !view.lyAvailable ? "Prior-year daily data begins Jul 2025" : m === "periods" ? "Weeks or months vs last year, each period's share of the quarter, and the current period projected at this year's pace" : undefined}
             >
-              {m === "dollars" ? "$ QTD" : m === "yoy" ? "Y/Y %" : "Daily tracker"}
+              {m === "dollars" ? "$ QTD" : m === "yoy" ? "Y/Y %" : "Weekly / Monthly"}
             </button>
           ))}
         </div>
@@ -1486,6 +1458,127 @@ export function QtdProgress() {
       )}
 
       {/* Chart */}
+      {metric === "periods" ? (
+        (() => {
+          // Weekly / Monthly tracker. Day-of-quarter bins (a 7-day bin holds each weekday
+          // once, so weeks compare cleanly; months are calendar months). The CURRENT bin is
+          // projected at this year's pace through the last COMPLETE day: LY bin total ×
+          // (this year through day k ÷ LY through day k) — the analyst's "LY week was 10M,
+          // LY was 1.2M by day 2, we're at 1.0M by day 2 → tracking 8.3M, slowing".
+          const lyKeys = quarterDayKeys(priorYearQuarter(selected));
+          const lyVal = (i: number) => (i < lyKeys.length ? realizedMap.get(lyKeys[i]) ?? 0 : 0);
+          const curVal = (i: number) => realizedMap.get(dayKeys[i]) ?? 0;
+          const partialToday = model.lastDataDate === model.todayKey;
+          const lastComplete = d - 1 - (partialToday ? 1 : 0);
+          const bins: { s: number; e: number; label: string }[] = [];
+          if (periodGrain === "week") {
+            for (let s = 0; s < D; s += 7) {
+              const e = Math.min(s + 6, D - 1);
+              bins.push({ s, e, label: `Wk ${bins.length + 1} (${shortDate(dayKeys[s])}–${shortDate(dayKeys[e])})` });
+            }
+          } else {
+            let s = 0;
+            for (let i = 1; i <= D; i++) {
+              if (i === D || dayKeys[i].slice(0, 7) !== dayKeys[s].slice(0, 7)) {
+                bins.push({ s, e: i - 1, label: MONTHS_ABBR[Number(dayKeys[s].slice(5, 7)) - 1] });
+                s = i;
+              }
+            }
+          }
+          const lyTot = view.lyCum ? view.lyCum[view.lyCum.length - 1] : 0;
+          const projQtr = view.primaryFqe;
+          const rowsP = bins.map((b) => {
+            let ly = 0;
+            let cur = 0;
+            let lyTd = 0;
+            let curTd = 0;
+            for (let j = b.s; j <= b.e; j++) {
+              ly += lyVal(j);
+              if (j < d) cur += curVal(j);
+              if (j <= lastComplete) {
+                lyTd += lyVal(j);
+                curTd += curVal(j);
+              }
+            }
+            const complete = b.e <= lastComplete;
+            const started = b.s < d;
+            const current = started && !complete;
+            const pace = current && lyTd > 0 ? curTd / lyTd - 1 : null;
+            const projected = current ? (lyTd > 0 ? ly * (curTd / lyTd) : null) : complete ? cur : null;
+            const yoy = complete && ly > 0 ? cur / ly - 1 : current && projected != null && ly > 0 ? projected / ly - 1 : null;
+            const tyShare = projQtr > 0 && (complete || current) && projected != null ? projected / projQtr : null;
+            return { b, ly, cur, complete, started, current, pace, projected, yoy, lyShare: lyTot > 0 ? ly / lyTot : null, tyShare };
+          });
+          const chartData = rowsP.map((r) => ({
+            period: r.b.label.replace(/ \(.*\)$/, ""),
+            "Last year": r.ly * scale,
+            "This year": r.started ? r.cur * scale : null,
+            "Projected remainder": r.current && r.projected != null ? Math.max(0, r.projected - r.cur) * scale : null,
+          }));
+          const cell = "px-2 py-1 text-right tabular-nums";
+          const tone = (v: number | null) => (v == null ? "text-gray-300" : v >= 0 ? "text-green-700" : "text-red-700");
+          return (
+            <div>
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                Period:
+                {(["week", "month"] as const).map((g) => (
+                  <button key={g} onClick={() => setPeriodGrain(g)} className={chip(periodGrain === g)}>
+                    {g === "week" ? "Weeks" : "Months"}
+                  </button>
+                ))}
+                <span className="ml-2">
+                  day-of-quarter aligned · {scaled ? "scaled to total" : "captured"} $ · current period projected at this year&rsquo;s pace through the last complete day
+                </span>
+              </div>
+              <ResponsiveContainer width="100%" height={300}>
+                <ComposedChart data={chartData} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="period" tick={{ fontSize: 10 }} interval={0} />
+                  <YAxis tick={{ fontSize: 11 }} tickFormatter={(v: number) => `${(v / 1e6).toFixed(0)}M`} />
+                  <Tooltip formatter={(v) => (typeof v === "number" ? fmtM(v) : v)} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Bar dataKey="Last year" fill="#d1d5db" isAnimationActive={false} />
+                  <Bar dataKey="This year" stackId="ty" fill="#2563eb" isAnimationActive={false} />
+                  <Bar dataKey="Projected remainder" stackId="ty" fill="#93c5fd" isAnimationActive={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
+              <div className="mt-2 overflow-x-auto">
+                <table className="w-full border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b text-gray-600">
+                      <th className="px-2 py-1 text-left font-semibold">Period</th>
+                      <th className={cell + " font-semibold"}>LY</th>
+                      <th className={cell + " font-semibold"} title="Last year's period as a share of last year's full quarter">LY % of qtr</th>
+                      <th className={cell + " font-semibold"}>This year</th>
+                      <th className={cell + " font-semibold"} title="Current period: this year through the last complete day vs LY over the same days">Pace vs LY</th>
+                      <th className={cell + " font-semibold"} title="LY period total × this year's pace">Projected</th>
+                      <th className={cell + " font-semibold"}>Y/Y</th>
+                      <th className={cell + " font-semibold"} title="This year's period (projected for the current one) as a share of the projected full quarter (prior-yr shape)">% of proj. qtr</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rowsP.map((r) => (
+                      <tr key={r.b.label} className={`border-b border-gray-100 ${r.current ? "bg-blue-50" : ""}`}>
+                        <td className="px-2 py-1 font-medium text-gray-700">
+                          {r.b.label}
+                          {r.current && <span className="ml-1 text-[10px] text-blue-700">current</span>}
+                        </td>
+                        <td className={cell}>{fmtM(r.ly * scale)}</td>
+                        <td className={cell + " text-gray-500"}>{r.lyShare != null ? fmtPct(r.lyShare) : "—"}</td>
+                        <td className={cell}>{r.started ? fmtM(r.cur * scale) : <span className="text-gray-300">—</span>}</td>
+                        <td className={`${cell} ${tone(r.pace)}`}>{r.pace != null ? fmtPct(r.pace) : "—"}</td>
+                        <td className={cell}>{r.current && r.projected != null ? fmtM(r.projected * scale) : <span className="text-gray-300">—</span>}</td>
+                        <td className={`${cell} font-semibold ${tone(r.yoy)}`}>{r.yoy != null ? fmtPct(r.yoy) : "—"}</td>
+                        <td className={cell + " text-gray-500"}>{r.tyShare != null ? fmtPct(r.tyShare) : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          );
+        })()
+      ) : (
       <ResponsiveContainer width="100%" height={metric === "dollars" && scaled ? 460 : 380}>
         <ComposedChart data={rows} margin={{ top: 10, right: 16, bottom: 5, left: 20 }}>
           <CartesianGrid strokeDasharray="3 3" />
@@ -1507,7 +1600,7 @@ export function QtdProgress() {
           <YAxis
             yAxisId="right"
             orientation="right"
-            hide={!lyShape || !view.lyAvailable || dailyMode}
+            hide={!lyShape || !view.lyAvailable}
             tick={{ fontSize: 10 }}
             tickFormatter={(v: number) => (yoyMode ? `${v.toFixed(0)}%` : `${(v / 1e6).toFixed(1)}M`)}
             domain={yoyMode ? [0, 100] : [0, (max: number) => max * 3]}
@@ -1519,18 +1612,7 @@ export function QtdProgress() {
           {metric === "dollars" && lyShape && view.lyAvailable && (
             <Bar yAxisId="right" dataKey="LY daily" name="LY daily GMV" fill="#d1d5db" fillOpacity={0.6} isAnimationActive={false} />
           )}
-          {metric === "daily" ? (
-            <>
-              {/* Grouped bars: LY for the FULL quarter (the comps ahead), this year to date
-                  coloured green/red by better/worse than the same weekday last year. */}
-              <Bar dataKey="Last year (same weekday)" fill="#d1d5db" isAnimationActive={false} />
-              <Bar dataKey="This year (day)" fill="#2563eb" isAnimationActive={false}>
-                {rows.map((r, idx) => (
-                  <Cell key={idx} fill={r._dayYoy == null ? "#2563eb" : r._dayYoy >= 0 ? "#16a34a" : "#dc2626"} />
-                ))}
-              </Bar>
-            </>
-          ) : metric === "dollars" ? (
+          {metric === "dollars" ? (
             <>
               <Line type="monotone" dataKey="Current" stroke="#2563eb" strokeWidth={2.5} dot={false} connectNulls={false} />
               {view.lyAvailable && (
@@ -1650,6 +1732,7 @@ export function QtdProgress() {
           />
         </ComposedChart>
       </ResponsiveContainer>
+      )}
 
       {/* Comp shape — what the rest of the quarter has to lap. LY's daily GMV binned into
           day-of-quarter weeks for its FULL quarter against this year's bins to date, plus
@@ -1713,17 +1796,6 @@ export function QtdProgress() {
                 </p>
               );
             })()}
-            <ResponsiveContainer width="100%" height={150}>
-              <ComposedChart data={bins} margin={{ top: 4, right: 16, bottom: 0, left: 20 }}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="week" tick={{ fontSize: 10 }} interval={0} />
-                <YAxis tick={{ fontSize: 10 }} tickFormatter={(v: number) => `${(v / 1e6).toFixed(0)}M`} />
-                <Tooltip formatter={(v) => (typeof v === "number" ? fmtM(v) : v)} />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Bar dataKey="Last year" fill="#9ca3af" />
-                <Bar dataKey="This year" fill="#2563eb" />
-              </ComposedChart>
-            </ResponsiveContainer>
           </div>
         );
       })()}
