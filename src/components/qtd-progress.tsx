@@ -80,6 +80,7 @@ type ChartRow = {
   "Prior-yr shape": number | null;
   "Run rate": number | null;
   "Momentum (T28D)": number | null;
+  "Match LY (0% growth)": number | null;
   "Cumulative Y/Y": number | null;
   "LY daily": number | null;
   "LY % of quarter": number | null;
@@ -142,6 +143,10 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
       {
         term: "Run rate",
         def: "QTD daily average × days in the quarter. Crude (ignores seasonality) but always available; the fallback when prior-year data doesn't exist.",
+      },
+      {
+        term: "Match LY (0% growth)",
+        def: "The comp floor: from today, this year's remaining days are assumed to merely MATCH last year's day for day. Its cumulative Y/Y path (red dashed, Y/Y mode) shows what the QTD Y/Y decays to purely because of last year's remaining shape — if LY's September was heavy, the line falls hard. The gap between today's Y/Y and this line's endpoint is the comp-toughness in Y/Y points; the other projections (momentum, prior-yr shape) show how much of it growth would recover. Same path in $ mode = QTD + LY's remaining dollars.",
       },
       {
         term: "Momentum (T28D)",
@@ -445,7 +450,7 @@ export function QtdProgress() {
   const [metric, setMetric] = useState<"dollars" | "yoy" | "daily">("dollars");
   const [scaled, setScaled] = useState(false);
   const [captureInput, setCaptureInput] = useState(""); // "" = auto
-  const [projections, setProjections] = useState<Set<ProjectionKey>>(new Set(["shape", "momentum", "runrate"]));
+  const [projections, setProjections] = useState<Set<ProjectionKey>>(new Set(["shape", "momentum", "flat", "runrate"]));
   // LY's daily GMV as background bars on the chart — the shape of the comparison.
   const [lyShape, setLyShape] = useState(true);
   // Guidance / Clearline edit panel ("" = blank field; values entered in $M).
@@ -613,6 +618,7 @@ export function QtdProgress() {
       "Prior-yr shape": yoyMode ? null : proj(view.shapeAvailable && projections.has("shape") && (anchor || i >= d) ? view.shapeAt(i) : null),
       "Run rate": proj(!view.complete && projections.has("runrate") && (anchor || i >= d) ? view.runRateAt(i) : null),
       "Momentum (T28D)": proj(view.momAvailable && projections.has("momentum") && (anchor || i >= d) ? view.momAt(i) : null),
+      "Match LY (0% growth)": proj(view.flatAvailable && projections.has("flat") && (anchor || i >= d) ? view.flatAt(i) : null),
       "Cumulative Y/Y": yoyMode && inData ? impliedYoy(view.curCum[i]) : null,
       // External calls as implied FQ Y/Y, drawn from the last data day to quarter end.
       "Guidance mid (implied FQ Y/Y)": yoyMode && guidanceYoy != null && i >= d - 1 ? guidanceYoy : null,
@@ -1438,7 +1444,7 @@ export function QtdProgress() {
         <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
           Projections:
           {(Object.keys(PROJECTION_LABEL) as ProjectionKey[]).map((k) => {
-            const available = k === "shape" ? view.shapeAvailable : k === "momentum" ? view.momAvailable : true;
+            const available = k === "shape" ? view.shapeAvailable : k === "momentum" ? view.momAvailable : k === "flat" ? view.flatAvailable : true;
             return (
               <button
                 key={k}
@@ -1536,6 +1542,9 @@ export function QtdProgress() {
               {view.momAvailable && projections.has("momentum") && (
                 <Line type="monotone" dataKey="Momentum (T28D)" stroke="#0d9488" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
               )}
+              {view.flatAvailable && projections.has("flat") && (
+                <Line type="monotone" dataKey="Match LY (0% growth)" stroke="#dc2626" strokeWidth={1.5} strokeDasharray="4 2" dot={false} connectNulls />
+              )}
               {!view.complete && projections.has("runrate") && (
                 <Line type="monotone" dataKey="Run rate" stroke="#6b7280" strokeWidth={1} strokeDasharray="3 3" dot={false} connectNulls />
               )}
@@ -1608,6 +1617,11 @@ export function QtdProgress() {
                   quarters). */}
               {view.momAvailable && projections.has("momentum") && (
                 <Line type="monotone" dataKey="Momentum (T28D)" stroke="#7c3aed" strokeWidth={1.5} strokeDasharray="6 3" dot={false} connectNulls />
+              )}
+              {/* The comp floor: rest of quarter merely matches LY. Where this line falls from
+                  today's point is the pure shape-of-the-comp drag on the full-quarter Y/Y. */}
+              {view.flatAvailable && projections.has("flat") && (
+                <Line type="monotone" dataKey="Match LY (0% growth)" stroke="#dc2626" strokeWidth={1.5} strokeDasharray="4 2" dot={false} connectNulls />
               )}
               {guidanceYoy != null && (
                 <Line type="monotone" dataKey="Guidance mid (implied FQ Y/Y)" stroke="#15803d" strokeWidth={1.5} strokeDasharray="4 2" dot={false} connectNulls />
@@ -1687,6 +1701,18 @@ export function QtdProgress() {
                 <> · biggest LY days still to lap: {bigDays.map((b) => `${shortDate(b.k)} ${fmtM(b.v * scale)}`).join(", ")}</>
               )}
             </p>
+            {lyTot > 0 && (() => {
+              const fqYoy = (raw: number) => (reportedAnchor && lyRepAt ? (raw * scale) / lyRepAt(D - 1) - 1 : raw / lyTot - 1);
+              return (
+                <p className="mb-2 text-xs text-gray-700">
+                  Full-quarter Y/Y if the rest of the quarter{" "}
+                  <strong className="text-red-700">merely matches LY: {fmtPct(fqYoy(view.flatAt(D - 1)))}</strong>
+                  {view.momAvailable && <> · runs at the T28D pace: <strong>{fmtPct(fqYoy(view.momAt(D - 1)))}</strong></>}
+                  {view.shapeAvailable && <> · holds the QTD pace: <strong>{fmtPct(fqYoy(view.shapeAt(D - 1)))}</strong></>}
+                  {" "}(same basis as the QTD Y/Y card)
+                </p>
+              );
+            })()}
             <ResponsiveContainer width="100%" height={150}>
               <ComposedChart data={bins} margin={{ top: 4, right: 16, bottom: 0, left: 20 }}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} />

@@ -32,11 +32,12 @@ export type QtdData = {
   model_estimates_by_quarter?: QtdEstimate[];
 };
 
-export type ProjectionKey = "shape" | "runrate" | "momentum";
+export type ProjectionKey = "shape" | "runrate" | "momentum" | "flat";
 
 export const PROJECTION_LABEL: Record<ProjectionKey, string> = {
   shape: "Prior-yr shape",
   momentum: "Momentum (T28D)",
+  flat: "Match LY (0% growth)",
   runrate: "Run rate",
 };
 
@@ -177,6 +178,12 @@ export function buildQuarterView(model: QtdModel, selected: string) {
     if (lyWin > 0 && curWin >= 0) momPace = curWin / lyWin - 1;
   }
   const momAvailable = momPace != null && lyAt(d - 1) > 0;
+  // The comp floor: the rest of the quarter merely MATCHES last year day for day (0%
+  // growth on the remaining days). Its implied cumulative Y/Y is what the QTD Y/Y
+  // decays to purely because of LY's remaining shape — the "big September
+  // transactions" worry, as a line. Same construction as momentum with pace 0.
+  const flatAvailable = !complete && lyCum != null;
+  const flatAt = (i: number) => qtd + (lyAt(i) - lyAt(d - 1));
   const momAt = (i: number) => qtd + (lyAt(i) - lyAt(d - 1)) * (1 + (momPace ?? 0));
 
   // First day index at which the cumulative Y/Y is worth drawing. A ratio on a few
@@ -219,7 +226,7 @@ export function buildQuarterView(model: QtdModel, selected: string) {
   return {
     dayKeys, D, d, startKey, endKey, dataThrough, complete,
     curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable, lyReported, lyReportedAt,
-    shapeAvailable, shapeAt, runRateAt, momAvailable, momAt, momPace, yoyStableFrom, lyYoyAvailable, lyYoyAt, lyFqYoy,
+    shapeAvailable, shapeAt, runRateAt, momAvailable, momAt, momPace, flatAvailable, flatAt, yoyStableFrom, lyYoyAvailable, lyYoyAt, lyFqYoy,
     fqe, primaryFqe, primaryMethod, wow,
     reported: model.reported.get(selected) ?? null,
     estimate: model.estimates.get(selected) ?? null,
