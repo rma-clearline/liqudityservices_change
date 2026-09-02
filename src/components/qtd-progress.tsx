@@ -81,6 +81,8 @@ type ChartRow = {
   "Momentum (T28D)": number | null;
   "Cumulative Y/Y": number | null;
   "LY daily": number | null;
+  "LY % of quarter": number | null;
+  "LY cumulative Y/Y": number | null;
   "Guidance mid (implied FQ Y/Y)": number | null;
   "Clearline (implied FQ Y/Y)": number | null;
   /** True when the row's projection values are Y/Y percentages, not dollars. */
@@ -141,8 +143,8 @@ const DEFINITIONS: { group: string; items: { term: string; def: string }[] }[] =
         def: "Rest-of-quarter projected at the RECENT pace: trailing-28-complete-days GMV vs the same LY days, applied to LY's daily shape from today forward (proj(i) = QTD + (LYcum(i) − LYcum(today)) × (1 + T28D Y/Y)). Seasonality-aware where run rate is not, and its implied cumulative Y/Y actually moves — it glides from today's Y/Y toward the recent pace, so it IS the projected-Y/Y line. The pace window ends at the last complete ET day (same rule as T7D). Needs 28 complete days in-quarter.",
       },
       {
-        term: "LY daily shape",
-        def: "Background bars on the QTD chart (right axis, either mode): last year's GMV per day-of-quarter day, so the comparison's shape — where LY's dollars actually landed — sits directly under this year's line. Toggle with the Comp chip; the axis is stretched so the bars stay in the bottom third.",
+        term: "LY shape",
+        def: "The comparison you are lapping, drawn on the QTD chart. $ mode: LY's GMV per day-of-quarter day as background bars (right axis, stretched to the bottom third). Y/Y mode, all in percent terms: LY's cumulative % of its own quarter (dotted, right axis 0-100% — a steep stretch is where LY's dollars landed), LY's reported full-quarter Y/Y as a reference line (the comp's own growth, so QTD Y/Y + this = the 2-year stack), and LY's day-by-day cumulative Y/Y curve — which needs the year-before-last's dailies and therefore appears from 2027Q3 (archive starts 2025-07-02). Toggle with the Comp chip.",
       },
       {
         term: "Comp shape",
@@ -585,6 +587,10 @@ export function QtdProgress() {
       "Guidance mid (implied FQ Y/Y)": yoyMode && guidanceYoy != null && i >= d - 1 ? guidanceYoy : null,
       "Clearline (implied FQ Y/Y)": yoyMode && clearlineYoy != null && i >= d - 1 ? clearlineYoy : null,
       "LY daily": lyShape && view.lyCum && i < view.lyCum.length ? (view.lyCum[i] - (i > 0 ? view.lyCum[i - 1] : 0)) * scale : null,
+      // Y/Y-mode comp shape, in percent terms: LY's cumulative share of its own quarter
+      // (right axis) and — when LY-1 dailies exist — LY's own cumulative Y/Y curve.
+      "LY % of quarter": yoyMode && lyShape && view.lyCum ? (view.lyAt(i) / view.lyCum[view.lyCum.length - 1]) * 100 : null,
+      "LY cumulative Y/Y": yoyMode && lyShape && view.lyYoyAvailable ? (() => { const v = view.lyYoyAt(i); return v == null ? null : v * 100; })() : null,
       _yoyMode: yoyMode,
       _dailyCur: inData ? (view.curCum[i] - (i > 0 ? view.curCum[i - 1] : 0)) : null,
       _dailyLy: view.lyCum && i < (view.lyCum.length ?? 0) ? view.lyCum[i] - (i > 0 ? view.lyCum[i - 1] : 0) : null,
@@ -1431,9 +1437,9 @@ export function QtdProgress() {
           <button
             onClick={() => setLyShape((v) => !v)}
             className={chip(lyShape)}
-            title="Last year's daily GMV, day-of-quarter aligned, as background bars on the right axis — the shape of the comparison you are lapping"
+            title="$ mode: LY's daily GMV as background bars. Y/Y mode: LY's cumulative % of its quarter (right axis), LY's reported full-quarter Y/Y, and — once the year-before-last is in the archive — LY's own cumulative Y/Y curve"
           >
-            LY daily shape
+            LY shape
           </button>
         </div>
       )}
@@ -1462,14 +1468,14 @@ export function QtdProgress() {
             orientation="right"
             hide={!lyShape || !view.lyAvailable}
             tick={{ fontSize: 10 }}
-            tickFormatter={(v: number) => `${(v / 1e6).toFixed(1)}M`}
-            domain={[0, (max: number) => max * 3]}
+            tickFormatter={(v: number) => (yoyMode ? `${v.toFixed(0)}%` : `${(v / 1e6).toFixed(1)}M`)}
+            domain={yoyMode ? [0, 100] : [0, (max: number) => max * 3]}
           />
           <Tooltip content={QtdTooltip} />
           <Legend wrapperStyle={{ fontSize: 11 }} />
           {/* Last year's daily GMV, day-of-quarter aligned, drawn first so it sits behind
               the lines: the September bulge is visible under the Y/Y line itself. */}
-          {lyShape && view.lyAvailable && (
+          {!yoyMode && lyShape && view.lyAvailable && (
             <Bar yAxisId="right" dataKey="LY daily" name="LY daily GMV" fill="#d1d5db" fillOpacity={0.6} isAnimationActive={false} />
           )}
           {metric === "dollars" ? (
@@ -1523,6 +1529,24 @@ export function QtdProgress() {
             <>
               <ReferenceLine y={0} stroke="#9ca3af" />
               <Line type="monotone" dataKey="Cumulative Y/Y" stroke="#2563eb" strokeWidth={2.5} dot={false} />
+              {/* The comp in percent terms. LY's cumulative share of its own quarter (right
+                  axis, 0-100%): a steep stretch is where LY's dollars landed — the part of
+                  the comp still to lap. LY's own cumulative Y/Y curve (the mosaic line the
+                  analyst asked for) needs LY-1 dailies and draws itself from 2027Q3. */}
+              {lyShape && view.lyAvailable && (
+                <Line yAxisId="right" type="monotone" dataKey="LY % of quarter" stroke="#9ca3af" strokeWidth={1.25} strokeDasharray="1 3" dot={false} />
+              )}
+              {lyShape && view.lyYoyAvailable && (
+                <Line type="monotone" dataKey="LY cumulative Y/Y" stroke="#6b7280" strokeWidth={1.5} dot={false} connectNulls />
+              )}
+              {lyShape && view.lyFqYoy != null && (
+                <ReferenceLine
+                  y={view.lyFqYoy * 100}
+                  stroke="#6b7280"
+                  strokeDasharray="2 4"
+                  label={{ value: `LY full-qtr Y/Y (reported): ${fmtPct(view.lyFqYoy)}`, position: "insideLeft", fontSize: 10, fill: "#6b7280" }}
+                />
+              )}
               {/* No prior-yr-shape line here: its implied cumulative Y/Y equals the current
                   QTD Y/Y by construction, so it would restate the solid line dressed as a
                   forecast (the mosaic ODP explorer's measured conclusion; see the rows map).

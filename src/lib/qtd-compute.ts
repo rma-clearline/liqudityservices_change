@@ -123,6 +123,25 @@ export function buildQuarterView(model: QtdModel, selected: string) {
   const lyQtd = lyCum ? lyAt(d - 1) : null;
   const yoy = lyQtd && lyQtd > 0 ? qtd / lyQtd - 1 : null;
 
+  // The comp's OWN cumulative Y/Y curve (mosaic's "prior-year quarter YoY, full quarter"):
+  // LY cumulative ÷ the year-before-last cumulative, day-aligned. Needs LY-1 dailies —
+  // the archive starts 2025-07-02, so this is null until 2027Q3 and then just appears.
+  const ly2Keys = quarterDayKeys(priorYearQuarter(priorYearQuarter(selected)));
+  const ly2Available =
+    lyCum != null && ly2Keys.length > 0 && ly2Keys[0] >= model.earliest && ly2Keys[ly2Keys.length - 1] <= lastDataDate;
+  const ly2Cum = ly2Available ? cumulate(ly2Keys, realizedByDate) : null;
+  const lyYoyAvailable = ly2Cum != null;
+  const lyYoyAt = (i: number): number | null => {
+    if (!lyCum || !ly2Cum) return null;
+    const base = ly2Cum[Math.min(i, ly2Cum.length - 1)];
+    return base > 0 ? lyAt(i) / base - 1 : null;
+  };
+  // LY's full-quarter Y/Y from REPORTED totals (LY vs LY-1) — the one comp-growth
+  // number that exists for every quarter regardless of the daily archive.
+  const lyRepPrev = model.reported.get(priorYearQuarter(priorYearQuarter(selected))) ?? null;
+  const lyReportedForFq = model.reported.get(priorYearQuarter(selected)) ?? null;
+  const lyFqYoy = lyReportedForFq != null && lyRepPrev != null && lyRepPrev > 0 ? lyReportedForFq / lyRepPrev - 1 : null;
+
   // LY REPORTED GMV prorated to day i using LY's captured daily shape — the
   // denominator for the reported-anchored Y/Y shown in Scaled mode. Using
   // lyCum's true final value (not lyAt(D-1)) makes lyReportedAt(D-1) equal
@@ -200,7 +219,7 @@ export function buildQuarterView(model: QtdModel, selected: string) {
   return {
     dayKeys, D, d, startKey, endKey, dataThrough, complete,
     curCum, qtd, lyCum, lyAt, lyQtd, yoy, lyAvailable, lyReported, lyReportedAt,
-    shapeAvailable, shapeAt, runRateAt, momAvailable, momAt, momPace, yoyStableFrom,
+    shapeAvailable, shapeAt, runRateAt, momAvailable, momAt, momPace, yoyStableFrom, lyYoyAvailable, lyYoyAt, lyFqYoy,
     fqe, primaryFqe, primaryMethod, wow,
     reported: model.reported.get(selected) ?? null,
     estimate: model.estimates.get(selected) ?? null,
