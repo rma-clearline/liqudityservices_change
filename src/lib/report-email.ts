@@ -39,10 +39,26 @@ const APP_URL = (process.env.APP_URL || process.env.NEXT_PUBLIC_APP_URL || "http
  *  show "since last report" deltas. Kept tiny + stable. */
 export type HeadlineSnapshot = { fqe: number; qtdScaled: number; yoy: number | null; dataThrough: string };
 
-/** Most recent successful scheduled report's headline (for "since last report"),
- *  read from the cron_runs email log. Previews don't write, so this only ever
- *  reflects the last real send. Null on the first report / any read failure. */
-async function loadPreviousReportHeadline(): Promise<HeadlineSnapshot | null> {
+/** ET calendar date + hour of an ISO timestamp, for slotting report sends. */
+function etParts(iso: string): { date: string; hour: number } {
+  const dt = new Date(iso);
+  const date = dt.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const hour = Number(dt.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "2-digit", hour12: false }).slice(0, 2)) % 24;
+  return { date, hour };
+}
+/** noon vs 5pm slot: the evening report fires after 15:00 ET. */
+const slotOf = (hour: number): "noon" | "evening" => (hour >= 15 ? "evening" : "noon");
+const SLOT_LABEL = { noon: "noon", evening: "5 PM" } as const;
+
+export type PreviousReport = HeadlineSnapshot & { label: string };
+
+/** The comparison baseline for "since …": the SAME SLOT's report on the most recent
+ *  earlier ET day (noon vs yesterday's noon, 5 PM vs yesterday's 5 PM). The
+ *  immediately preceding report is the wrong baseline — the 5 PM send always shows
+ *  an increase over noon simply because the day's auctions closed in between.
+ *  Falls back to the latest report of an earlier day, then to none. Read from the
+ *  cron_runs email log; previews don't write, so only real sends count. */
+async function loadPreviousReportHeadline(todayKey: string, currentSlot: "noon" | "evening"): Promise<PreviousReport | null> {
   // Optional manual baseline (JSON): seeds the first report's deltas before any
   // prior send exists, and lets the deltas be tested where cron_runs isn't
   // reachable. Ignored once real sends log their own headline.
@@ -50,16 +66,22 @@ async function loadPreviousReportHeadline(): Promise<HeadlineSnapshot | null> {
   if (override) {
     try {
       const h = JSON.parse(override);
-      if (h && typeof h.fqe === "number") return h as HeadlineSnapshot;
+      if (h && typeof h.fqe === "number") return { ...(h as HeadlineSnapshot), label: "the previous report" };
     } catch {
       // malformed override → fall through to the log
     }
   }
   try {
-    const rows = await azFetchRecentEmailRuns(10);
-    for (const row of rows) {
-      const hl = (row.detail as { headline?: HeadlineSnapshot } | null)?.headline;
-      if (hl && typeof hl.fqe === "number") return hl;
+    const rows = await azFetchRecentEmailRuns(20);
+    const usable = rows
+      .map((row) => ({ hl: (row.detail as { headline?: HeadlineSnapshot } | null)?.headline, et: etParts(row.started_at) }))
+      .filter((r): r is { hl: HeadlineSnapshot; et: { date: string; hour: number } } => !!r.hl && typeof r.hl.fqe === "number" && r.et.date < todayKey);
+    const pick = usable.find((r) => slotOf(r.et.hour) === currentSlot) ?? usable[0];
+    if (pick) {
+      const slot = slotOf(pick.et.hour);
+      const yesterday = addDaysKey(todayKey, -1);
+      const when = pick.et.date === yesterday ? `yesterday's ${SLOT_LABEL[slot]} report` : `the ${SLOT_LABEL[slot]} report on ${pick.et.date}`;
+      return { ...pick.hl, label: when };
     }
   } catch {
     // best-effort — no deltas if the log is unreadable
@@ -74,7 +96,7 @@ type ReportData = {
   listings: ListingsDay[];
   latest: { allsurplus: number | null; govdeals: number | null; date: string | null };
   /** Change vs the previous scheduled report (null on the first send). */
-  sinceLast: { fqePct: number | null; yoyPp: number | null; prevDataThrough: string } | null;
+  sinceLast: { fqePct: number | null; yoyPp: number | null; prevDataThrough: string; prevLabel: string } | null;
   /** Days between the data-through date and "today" (freshness guardrail). */
   daysBehind: number | null;
   /** Current headline, returned so the cron can log it for next time's deltas. */
@@ -174,7 +196,7 @@ async function loadReportData(todayKey: string): Promise<ReportData> {
   }
 
   // "Since last report" deltas + freshness, both keyed off the current headline.
-  const prev = await loadPreviousReportHeadline();
+  const prev = await loadPreviousReportHeadline(todayKey, slotOf(etParts(new Date().toISOString()).hour));
   let sinceLast: ReportData["sinceLast"] = null;
   let snapshot: HeadlineSnapshot | null = null;
   let daysBehind: number | null = null;
@@ -185,6 +207,7 @@ async function loadReportData(todayKey: string): Promise<ReportData> {
         fqePct: prev.fqe > 0 ? headline.scaledFqe / prev.fqe - 1 : null,
         yoyPp: headline.yoyDisplay != null && prev.yoy != null ? headline.yoyDisplay - prev.yoy : null,
         prevDataThrough: prev.dataThrough,
+        prevLabel: prev.label,
       };
     }
     // Days from data-through to today (ET), counting calendar days.
@@ -495,7 +518,7 @@ function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCid
     if (d.sinceLast.fqePct != null) parts.push(`FQE ${chg(d.sinceLast.fqePct)}`);
     if (d.sinceLast.yoyPp != null)
       parts.push(`QTD Y/Y <span style="color:${chgColor(d.sinceLast.yoyPp)}">${d.sinceLast.yoyPp >= 0 ? "+" : ""}${(d.sinceLast.yoyPp * 100).toFixed(1)}pp</span>`);
-    sinceLine = `<p style="font-size:12px;color:#6b7280;margin:8px 0 0;">Since last report (${d.sinceLast.prevDataThrough}): ${parts.join(" · ")}</p>`;
+    sinceLine = `<p style="font-size:12px;color:#6b7280;margin:8px 0 0;">Since ${d.sinceLast.prevLabel} (data through ${d.sinceLast.prevDataThrough}): ${parts.join(" · ")}</p>`;
   }
 
   const qtdYoyImg = chartCids.qtdYoy ? `<img src="cid:${chartCids.qtdYoy}" style="width:100%;max-width:720px;margin:12px 0;" alt="QTD cumulative Y/Y chart" />` : "";
