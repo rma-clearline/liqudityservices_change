@@ -279,12 +279,25 @@ function buildQtdChartConfig(h: QtdHeadline) {
 }
 
 // --- QTD cumulative Y/Y chart (shown ABOVE the dollar chart) ----------------
-function buildQtdYoyChartConfig(h: QtdHeadline) {
+// Null when there is nothing worth drawing (first two days of a quarter): the
+// caller then shows a one-line note instead of an empty frame.
+function buildQtdYoyChartConfig(h: QtdHeadline): Record<string, unknown> | null {
   const labels = h.series.map((p) => p.date.slice(5)); // MM-DD
+  const raw = h.series.map((p) => (p.yoy == null ? null : p.yoy * 100));
+  const drawn = raw.filter((v): v is number => v != null);
+  if (h.d < 3 || drawn.length === 0) return null;
+  // Axis from the STABLE region (a week in + LY cum >= 10% of its quarter) when it
+  // exists, else from everything drawn; padded 10pp and snapped to 5s. Early small-
+  // base outliers are clamped to the edge so they cannot flatten the real line.
+  const stable = raw.slice(h.yoyStableFrom).filter((v): v is number => v != null);
+  const base = stable.length ? stable : drawn;
+  const lo = Math.floor((Math.min(0, ...base) - 10) / 5) * 5;
+  const hi = Math.ceil((Math.max(0, ...base) + 10) / 5) * 5;
+  const early = h.d < h.yoyStableFrom;
   const datasets: Record<string, unknown>[] = [
     {
       label: "Cumulative Y/Y",
-      data: h.series.map((p) => (p.yoy == null ? null : p.yoy * 100)),
+      data: raw.map((v) => (v == null ? null : Math.max(lo, Math.min(hi, v)))),
       borderColor: "#2563eb",
       borderWidth: 2.5,
       pointRadius: 0,
@@ -308,11 +321,11 @@ function buildQtdYoyChartConfig(h: QtdHeadline) {
     options: {
       title: {
         display: true,
-        text: `QTD ${formatQuarterLabel(h.currentQuarter)} — cumulative Y/Y % (through ${h.dataThrough}, day ${h.d}/${h.D})`,
+        text: `QTD ${formatQuarterLabel(h.currentQuarter)} — cumulative Y/Y % (through ${h.dataThrough}, day ${h.d}/${h.D})${early ? " · early days on a small base" : ""}`,
       },
       scales: {
         xAxes: [{ ticks: { maxTicksLimit: 13, fontSize: 10 } }],
-        yAxes: [{ scaleLabel: { display: true, labelString: "Cumulative Y/Y (%)" } }],
+        yAxes: [{ scaleLabel: { display: true, labelString: "Cumulative Y/Y (%)" }, ticks: { min: lo, max: hi } }],
       },
       legend: { position: "bottom", labels: { fontSize: 10 } },
     },
@@ -521,7 +534,11 @@ function buildHtml(d: ReportData, dateLabel: string, timeLabel: string, chartCid
     sinceLine = `<p style="font-size:12px;color:#6b7280;margin:8px 0 0;">Since ${d.sinceLast.prevLabel} (data through ${d.sinceLast.prevDataThrough}): ${parts.join(" · ")}</p>`;
   }
 
-  const qtdYoyImg = chartCids.qtdYoy ? `<img src="cid:${chartCids.qtdYoy}" style="width:100%;max-width:720px;margin:12px 0;" alt="QTD cumulative Y/Y chart" />` : "";
+  const qtdYoyImg = chartCids.qtdYoy
+    ? `<img src="cid:${chartCids.qtdYoy}" style="width:100%;max-width:720px;margin:12px 0;" alt="QTD cumulative Y/Y chart" />`
+    : d.headline && d.headline.d < 3
+      ? `<p style="font-size:12px;color:#6b7280;margin:12px 0;">Cumulative Y/Y chart starts on day 3 of the quarter — a ratio on a one- or two-day base is noise.</p>`
+      : "";
   const qtdImg = chartCids.qtd ? `<img src="cid:${chartCids.qtd}" style="width:100%;max-width:720px;margin:12px 0;" alt="QTD GMV chart" />` : "";
   const listingsImg = chartCids.listings ? `<img src="cid:${chartCids.listings}" style="width:100%;max-width:720px;margin:12px 0;" alt="Listings chart" />` : "";
 
@@ -608,7 +625,8 @@ export async function sendReportEmail({
 
   if (data.headline) {
     // Y/Y % chart first (rendered on top), then the cumulative-dollar chart.
-    const yoy = await renderChartPng(buildQtdYoyChartConfig(data.headline), { width: 800, height: 400 });
+    const yoyCfg = buildQtdYoyChartConfig(data.headline);
+    const yoy = yoyCfg ? await renderChartPng(yoyCfg, { width: 800, height: 400 }) : { image: null, debug: "skipped: fewer than 3 in-data days" };
     debug.qtdYoy = yoy.debug;
     if (yoy.image) {
       attachments.push({ filename: "qtd-yoy.png", content: yoy.image, content_type: "image/png", contentId: "chart_qtd_yoy" });

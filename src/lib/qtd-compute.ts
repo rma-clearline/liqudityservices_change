@@ -240,6 +240,9 @@ export type QtdHeadline = {
   dataThrough: string;
   d: number;
   D: number;
+  /** First day index where the cumulative Y/Y ratio is on a meaningful base (the
+   *  email chart sizes its axis from here; the page's brush opens here). */
+  yoyStableFrom: number;
   captureRate: number;
   qtdCaptured: number;
   qtdScaled: number;
@@ -344,7 +347,10 @@ export function computeQtdHeadline(
       current: inData ? view.curCum[i] * scale : null,
       lastYear: reportedAnchor && lyRepAt ? lyRepAt(i) : lyVal != null ? lyVal * scale : null,
       shape: view.shapeAvailable && (anchor || i >= view.d) ? view.shapeAt(i) * scale : null,
-      yoy: inData && i >= view.yoyStableFrom ? impliedYoy(view.curCum[i], i) : null,
+      // From day 3: the one- and two-day ratios are pure noise; later days are drawn
+      // and the email chart clamps its axis to the stable region instead of hiding them
+      // (a hard gate left the chart BLANK for the first ~9 days of every quarter).
+      yoy: inData && i >= 2 ? impliedYoy(view.curCum[i], i) : null,
     };
   });
 
@@ -353,6 +359,7 @@ export function computeQtdHeadline(
     dataThrough: view.dataThrough,
     d: view.d,
     D: view.D,
+    yoyStableFrom: view.yoyStableFrom,
     captureRate,
     qtdCaptured: view.qtd,
     qtdScaled: view.qtd * scale,
