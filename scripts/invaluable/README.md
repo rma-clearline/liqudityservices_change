@@ -71,3 +71,19 @@ thousand requests (one per lot); run it in the background.
 - Currency is native per lot; FX conversion is not yet applied.
 - Regenerating these modules through a Bash heredoc collapses doubled backslashes;
   use the editor tools for files with regex escapes.
+
+## Panel discovery and reading the numbers (2026-10-31)
+
+Private-label houses are found by probing an established house's own domain:
+`/api/auctions/catalog/ZZZZZZZZZZ` answers with a Spring-style JSON 404 on platform
+sites; then either `/auctions/past-auctions/` links the catalogs directly or
+`/hksn-preview-sale-sitemap.xml` lists one page per sale, each linking its catalog
+(`sale_sitemap` in the panel). Client-rendered sites (e.g. live.clars.com) expose
+nothing and are skipped. Run one house per invocation.
+
+The series is published as a range: **strict** online-won (top online bid equals the
+result AND at least one online bid) and **loose** (equality alone, an upper bound).
+Y/Y is **like-for-like** — only houses with sales in both periods, with the count
+shown — so a house joining never reads as growth; the open period is flagged.
+Regional houses run 2–9% online share vs the platform's 14.7%, which is expected
+and why levels are not comparable to disclosed GMS; growth is the comparable.
