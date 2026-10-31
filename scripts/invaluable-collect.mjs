@@ -7,7 +7,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { get, catalogPathsIn, linksUnder, pageOne, schedulePremium, deriveLot, stats } from "./invaluable/lib.mjs";
+import { get, catalogPathsIn, linksUnder, pageOne, schedulePremium, catalogRates, deriveLot, stats } from "./invaluable/lib.mjs";
 import { connect, upsertHouse, upsertCatalog, completeRefs, upsertLots, monthlySummary } from "./invaluable/db.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -117,8 +117,11 @@ async function collectCatalog(h, ref, pth) {
       if (found.size >= p1.nbHits) break;
     }
   }
+  // Premium rate per lot, resolved across the catalog (lib.mjs: the naive lot rate
+  // and the schedule disagree for several houses; whole-dollar hammers decide).
+  const rates = catalogRates([...found.values()], cat);
   const rows = [...found.values()].map((v) => {
-    const d = deriveLot(v, cat);
+    const d = deriveLot(v, cat, rates);
     return {
       lot_ref: v.ref, lot_id: v.lotId ?? null, catalog_ref: ref, lot_number: String(v.lotNumber ?? "") + (v.lotNumberExtension ?? ""),
       title: (v.title ?? "").slice(0, 400), category: v.categoryName ?? v.category ?? null, subcategory: v.subcategoryName ?? null,

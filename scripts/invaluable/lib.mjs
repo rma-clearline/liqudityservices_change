@@ -80,26 +80,92 @@ export const schedulePremium = (meta) => {
   return Number.isFinite(Number(p)) && Number(p) > 0 ? Number(p) / 100 : null;
 };
 
-/** Per-lot derivations from the lot API's itemView + catalog meta.
- *  Online bids are hammer-basis; posted results may include the premium. A lot was
- *  won through the platform when the top online bid, premium-adjusted, equals the
- *  result (timed sales: every sold lot is online by construction). */
-export function deriveLot(v, cat) {
+// --- premium-rate resolution ---------------------------------------------------
+// Where a house posts results premium-inclusive, the hammer is result / (1 + rate),
+// and the rate is NOT reliably known: the lot API's buyersPremium is a naive
+// rate x result that can carry a different schedule from the one the results were
+// computed with (Crescent City: 23% vs the 28% the results embed; Grogan: the
+// reverse, the current 30% schedule vs the 25% in force at the sale). The right
+// rate is the one under which results divide back to whole-dollar hammers (bids
+// move in whole increments), chosen per lot among the candidates, with the
+// catalog's dominant rate breaking ties.
+const ROUND_TOL = 0.011;
+const isWhole = (x) => Math.abs(x - Math.round(x)) < ROUND_TOL;
+const r4 = (x) => Math.round(x * 10000) / 10000;
+
+/** Candidate rates for a catalog: the schedule first, then each distinct naive
+ *  rate the lot records carry. */
+export function rateCandidates(lots, cat) {
+  const out = [];
+  const add = (r) => {
+    if (!Number.isFinite(r) || r <= 0) return;
+    const v = r4(r);
+    if (!out.some((x) => Math.abs(x - v) < 0.0005)) out.push(v);
+  };
+  add(Number(cat?.premiumRate));
+  for (const v of lots) {
+    const pr = Number(v.priceResult) || 0, bp = Number(v.buyersPremium) || 0;
+    if (v.isSold && pr > 0 && bp > 0) add(bp / pr);
+  }
+  return out;
+}
+
+/** The candidate under which the most sold results are whole-dollar hammers;
+ *  the first candidate when none is, null without candidates. */
+export function dominantRate(results, candidates) {
+  if (!candidates.length) return null;
+  let best = candidates[0], bestN = -1;
+  for (const r of candidates) {
+    let n = 0;
+    for (const pr of results) if (pr > 0 && isWhole(pr / (1 + r))) n++;
+    if (n > bestN) { best = r; bestN = n; }
+  }
+  return best;
+}
+
+/** The one candidate that makes this result a whole-dollar hammer, else the dominant. */
+export function lotRate(priceResult, candidates, dominant) {
+  const whole = candidates.filter((r) => isWhole(priceResult / (1 + r)));
+  return whole.length === 1 ? whole[0] : dominant;
+}
+
+/** Hammer from a posted result (to the cent). */
+export function hammerOf(priceResult, rate, includePremium) {
+  const h = includePremium && rate != null ? priceResult / (1 + rate) : priceResult;
+  return Math.round(h * 100) / 100;
+}
+
+/** Won through the platform: timed sales by construction; live sales when the top
+ *  online bid equals the hammer and at least one online bid was placed (with none,
+ *  the online figure is the opening bid, which a floor buyer can pay exactly). */
+export function onlineWon({ sold, hammer, onlineHammer, bids, isTimed }) {
+  if (!sold || hammer == null || !(hammer > 0)) return false;
+  if (isTimed) return true;
+  return bids >= 1 && Math.abs(onlineHammer - hammer) <= Math.max(1, hammer * 0.005);
+}
+
+/** Resolved rates for a whole catalog (pass to deriveLot). */
+export function catalogRates(lots, cat) {
+  const candidates = rateCandidates(lots, cat);
+  const results = lots.filter((v) => v.isSold).map((v) => Number(v.priceResult) || 0);
+  return { candidates, dominant: dominantRate(results, candidates) };
+}
+
+/** Per-lot derivations from the lot API's itemView + catalog meta. Online bids are
+ *  hammer-basis; posted results may include the premium (see above). `rates` from
+ *  catalogRates() resolves the premium per lot; without it the naive lot rate is used. */
+export function deriveLot(v, cat, rates = null) {
   const sold = !!v.isSold;
   const pr = Number(v.priceResult) || 0;
   const bp = Number(v.buyersPremium) || 0;
-  const rate = sold && pr > 0 && bp > 0 ? bp / pr : cat.premiumRate;
-  const hammer = sold && pr > 0 ? (cat.resultsIncludePremium && rate != null ? pr / (1 + rate) : pr) : null;
-  // Top online bid: the per-lot API gives it premium-inclusive (currentBidAllIn); the
-  // catalog lots list gives it hammer-basis as `price`. Either way we land on hammer.
+  const naive = sold && pr > 0 && bp > 0 ? bp / pr : cat.premiumRate;
+  const rate = rates && sold && pr > 0 && cat.resultsIncludePremium ? lotRate(pr, rates.candidates, rates.dominant) : naive;
+  const hammer = sold && pr > 0 ? hammerOf(pr, rate, !!cat.resultsIncludePremium) : null;
+  // Top online bid: the catalog lots list gives it hammer-basis as `price`; the
+  // per-lot API (fallback path) gives it premium-inclusive (currentBidAllIn).
   const hasAllIn = v.currentBidAllIn != null && Number.isFinite(Number(v.currentBidAllIn));
   const onlineAllIn = hasAllIn ? Number(v.currentBidAllIn) : (rate != null ? (Number(v.price) || 0) * (1 + rate) : Number(v.price) || 0);
   const onlineHammer = hasAllIn ? (rate != null ? onlineAllIn / (1 + rate) : onlineAllIn) : Number(v.price) || 0;
-  // Live sales also require at least one online bid: with none, `price` is the
-  // opening bid, and a floor buyer paying exactly that would otherwise read as online.
   const bids = Number(v.bidCount) || 0;
-  const onlineWon = sold && hammer != null && hammer > 0
-    ? (cat.isTimed ? true : bids >= 1 && Math.abs(onlineHammer - hammer) <= Math.max(1, hammer * 0.005))
-    : false;
-  return { rate, hammer, onlineAllIn, onlineHammer, onlineWon };
+  return { rate, hammer, onlineAllIn, onlineHammer, onlineWon: onlineWon({ sold, hammer, onlineHammer, bids, isTimed: !!cat.isTimed }) };
 }

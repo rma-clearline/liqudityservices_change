@@ -64,11 +64,13 @@ thousand requests (one per lot); run it in the background.
 
 ## Known limits
 
-- Price basis is per catalog (`resultsIncludePremium`); the lot API's `buyersPremium`
-  is a naive rate × result and is used only to recover the rate.
+- Price basis is per catalog (`resultsIncludePremium`). The premium rate itself is
+  resolved per lot (next section); the lot API's `buyersPremium` and the schedule
+  are only candidates.
 - Ties and absentee bids executed by the house can mis-classify a lot; the
   online-won flag is an inference, unvalidated against any disclosed GMS so far.
-- Currency is native per lot; FX conversion is not yet applied.
+- Currency is native per lot; the report, the API and the page convert with
+  `lqdt.fx_rates` (stored as units per USD) at the sale date.
 - Regenerating these modules through a Bash heredoc collapses doubled backslashes;
   use the editor tools for files with regex escapes.
 
@@ -87,3 +89,32 @@ Y/Y is **like-for-like** — only houses with sales in both periods, with the co
 shown — so a house joining never reads as growth; the open period is flagged.
 Regional houses run 2–9% online share vs the platform's 14.7%, which is expected
 and why levels are not comparable to disclosed GMS; growth is the comparable.
+
+## Premium-rate resolution (2026-10-31)
+
+Where results are posted premium-inclusive, hammer = result ÷ (1 + rate), and the
+rate is not reliably known: the lot API's `buyersPremium` is a naive rate × result
+that can carry a different schedule from the one the results embed (Crescent City
+reports 23% while its results divide cleanly at the 28% schedule; Grogan is the
+reverse, the current 30–33% schedule against the 25–28% in force at the sale).
+With the wrong rate the hammer is never equal to the top online bid, so every online
+win is missed — Crescent City read 0 online lots on $7M of hammer.
+
+`lib.mjs` now resolves the rate per lot: candidates are the schedule rate plus
+every distinct naive lot rate in the catalog (`rateCandidates`); a result that
+divides to a whole-dollar hammer under exactly one candidate takes it (`lotRate`,
+bids move in whole increments); otherwise the catalog's dominant rate, the one that
+makes the most results whole (`dominantRate`). The collector applies it per
+catalog (`catalogRates`); `node scripts/invaluable-rederive.mjs` recomputes stored
+lots from their raw fields (idempotent). Effect of the first run: Crescent City 0 →
+1,431 online lots ($0.79M), Fontaine's +$0.55M, Selkirk 19 → 212 lots; 2026Q1
+like-for-like online-won Y/Y moved from +64% to +30% against the disclosed +17%.
+`npm test` covers the resolution and the page's series math.
+
+## The dashboard page
+
+`/invaluable` (tab "Invaluable") charts `/api/invaluable`: online-won hammer as
+a strict-to-loose range, online share against the disclosed 14.7%, like-for-like
+Y/Y (dollar-weighted, median house, hammer) with the disclosed platform growth
+points, the stack by house, per-house share panels, and the period and house
+tables. Series math lives in `src/lib/invaluable-series.ts`.
