@@ -1,0 +1,53 @@
+// Invaluable panel report: the GMS proxy series and its validation against the few
+// figures Invaluable has disclosed. USD via lqdt.fx_rates (stored as units per USD).
+//   node scripts/invaluable-report.mjs [--house KEY] [--grain month|quarter]
+import { connect } from "./invaluable/db.mjs";
+
+const args = process.argv.slice(2);
+const opt = (k) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
+const grain = opt("--grain") === "quarter" ? "quarter" : "month";
+const fmtM = (n) => "$" + (Number(n) / 1e6).toFixed(2) + "M";
+const pct = (n) => (n == null ? "   —  " : ((n * 100).toFixed(1) + "%").padStart(6));
+
+const pool = await connect();
+const periodExpr = grain === "quarter"
+  ? "CONCAT(YEAR(c.event_date_local), 'Q', DATEPART(quarter, c.event_date_local))"
+  : "CONVERT(char(7), c.event_date_local, 126)";
+// Rate on the sale day, else the latest earlier rate; USD = native / units-per-USD.
+const q = `
+  WITH lots AS (
+    SELECT c.house_key, ${periodExpr} AS period, c.is_timed, l.is_sold, l.online_won, l.hammer, ISNULL(l.currency, 'USD') AS currency, c.event_date_local
+    FROM lqdt.inv_catalogs c JOIN lqdt.inv_lots l ON l.catalog_ref = c.catalog_ref
+    WHERE c.status IN ('complete','partial') AND c.lots_fetched >= 0.9 * c.nb_lots AND (@h IS NULL OR c.house_key = @h)
+  ), fx AS (
+    SELECT lots.*, CASE WHEN currency = 'USD' THEN 1.0 ELSE (
+      SELECT TOP (1) usd_per_unit FROM lqdt.fx_rates f WHERE f.currency = lots.currency AND f.date <= CONVERT(char(10), lots.event_date_local, 126) ORDER BY f.date DESC) END AS units_per_usd
+    FROM lots
+  )
+  SELECT house_key, period,
+    SUM(CASE WHEN is_sold = 1 THEN 1 ELSE 0 END) AS sold,
+    SUM(CASE WHEN is_sold = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS thv_usd,
+    SUM(CASE WHEN online_won = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS online_usd,
+    SUM(CASE WHEN online_won = 1 THEN 1 ELSE 0 END) AS online_lots,
+    SUM(CASE WHEN is_timed = 1 AND is_sold = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS timed_usd
+  FROM fx GROUP BY house_key, period ORDER BY period, house_key`;
+const rows = (await pool.request().input("h", opt("--house")).query(q)).recordset;
+await pool.close();
+
+// Panel total per period + Y/Y where the prior-year period exists.
+const byPeriod = new Map();
+for (const r of rows) {
+  const t = byPeriod.get(r.period) ?? { sold: 0, thv: 0, online: 0, timed: 0, houses: new Set() };
+  t.sold += r.sold; t.thv += Number(r.thv_usd); t.online += Number(r.online_usd); t.timed += Number(r.timed_usd); t.houses.add(r.house_key);
+  byPeriod.set(r.period, t);
+}
+const prior = (p) => (grain === "quarter" ? String(Number(p.slice(0, 4)) - 1) + p.slice(4) : String(Number(p.slice(0, 4)) - 1) + p.slice(4));
+console.log(`\nPanel GMS proxy by ${grain} (USD; online-won = inferred platform wins; share = online ÷ hammer)`);
+console.log("period    houses  sold       THV   online-won  share  timed%   THV Y/Y  online Y/Y");
+for (const [p, t] of [...byPeriod].sort()) {
+  const pr = byPeriod.get(prior(p));
+  const thvYoy = pr && pr.thv > 0 ? t.thv / pr.thv - 1 : null, onlYoy = pr && pr.online > 0 ? t.online / pr.online - 1 : null;
+  console.log(`${p.padEnd(9)} ${String(t.houses.size).padStart(5)} ${String(t.sold).padStart(5)} ${fmtM(t.thv).padStart(9)} ${fmtM(t.online).padStart(10)} ${pct(t.thv ? t.online / t.thv : null)} ${pct(t.thv ? t.timed / t.thv : null)}  ${pct(thvYoy)}    ${pct(onlYoy)}`);
+}
+console.log(`\nDisclosed reference points (Invaluable + AuctionZip, platform-wide): CY2025 GMS > $500M; Q1 2026 GMS $125M, +17% Y/Y, share of gavel 14.7%; May 2026 net GMS +20% Y/Y.`);
+console.log(`Validation = the panel's online-won Y/Y for the same windows vs those growth rates, and its share vs 14.7%; a level comparison needs the panel's share of the platform, which is unknown.`);

@@ -29,9 +29,20 @@ disclosed GMS quarters; levels depend on the panel's share of the platform.
   `resultsIncludePremium`), `/api/auctions/lot/<numeric id | ref>` (result, premium,
   online bid, bid count, estimates) and the page `/auction-catalog/catalog_<ref>`
   (search envelope `nbHits` + the first 20 lot ids).
-- Full catalogs without the search backend: a catalog's lots occupy a contiguous block
-  of numeric ids, so the collector anchors on page 1 and sweeps outward through the
-  lot API until `nbHits` lots are in (25 consecutive foreign ids end a direction).
+- Full catalogs: the house site's own `/api/auctions/catalog/<ref>/lots?page=N&size=500`
+  returns every lot as a paged list (exact; one request per 500 lots). Its `price` is
+  the hammer-basis top online bid, which is the field the online-won test uses: the
+  per-lot API's `currentBidAllIn` is computed with the house's CURRENT premium
+  schedule and mis-measures older sales. The id sweep from the page-1 anchors remains
+  only as a fallback for hosts without the list (edited catalogs scatter lots across
+  id blocks, so the sweep is not exact).
+- Live sales also require at least one online bid for an online win: with none,
+  `price` is the opening bid and a floor buyer paying exactly that would read as online.
+- `node scripts/invaluable-report.mjs [--grain quarter]` prints the panel series in
+  USD (fx_rates, stored as units per USD), online share, Y/Y, and the disclosed
+  reference points to validate against. `scripts/invaluable/discover.mjs <slug-file>`
+  walks public Invaluable house pages at the crawl delay, reads each house's
+  `connectBaseUrl`, and probes its site for the past-auctions structure.
 - Catalog discovery per house kind (`invaluable-panel.json`):
   `private_label` — the house's own site (`sellerModel.connectBaseUrl`) lists past
   sales (`past_list`), each linking its hosted catalog;

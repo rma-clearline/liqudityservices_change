@@ -90,10 +90,16 @@ export function deriveLot(v, cat) {
   const bp = Number(v.buyersPremium) || 0;
   const rate = sold && pr > 0 && bp > 0 ? bp / pr : cat.premiumRate;
   const hammer = sold && pr > 0 ? (cat.resultsIncludePremium && rate != null ? pr / (1 + rate) : pr) : null;
-  const onlineAllIn = Number(v.currentBidAllIn) || 0;
-  const onlineHammer = rate != null ? onlineAllIn / (1 + rate) : onlineAllIn;
+  // Top online bid: the per-lot API gives it premium-inclusive (currentBidAllIn); the
+  // catalog lots list gives it hammer-basis as `price`. Either way we land on hammer.
+  const hasAllIn = v.currentBidAllIn != null && Number.isFinite(Number(v.currentBidAllIn));
+  const onlineAllIn = hasAllIn ? Number(v.currentBidAllIn) : (rate != null ? (Number(v.price) || 0) * (1 + rate) : Number(v.price) || 0);
+  const onlineHammer = hasAllIn ? (rate != null ? onlineAllIn / (1 + rate) : onlineAllIn) : Number(v.price) || 0;
+  // Live sales also require at least one online bid: with none, `price` is the
+  // opening bid, and a floor buyer paying exactly that would otherwise read as online.
+  const bids = Number(v.bidCount) || 0;
   const onlineWon = sold && hammer != null && hammer > 0
-    ? (cat.isTimed ? true : Math.abs(onlineHammer - hammer) <= Math.max(1, hammer * 0.005))
+    ? (cat.isTimed ? true : bids >= 1 && Math.abs(onlineHammer - hammer) <= Math.max(1, hammer * 0.005))
     : false;
   return { rate, hammer, onlineAllIn, onlineHammer, onlineWon };
 }

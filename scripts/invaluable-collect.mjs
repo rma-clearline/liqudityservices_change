@@ -71,25 +71,39 @@ async function collectCatalog(h, ref, pth) {
   await upsertCatalog(pool, { ...cat, nbLots: p1.nbHits, status: "pending" });
 
   const found = new Map();
-  const probe = async (id) => {
-    const j = await get(`${base}/api/auctions/lot/${id}`, { json: true });
-    const v = j?.itemView;
-    if (!v || v.catalogRef !== ref) return false;
-    found.set(v.ref, v); return true;
-  };
-  for (const id of p1.ids) await probe(id);
-  const lo = Math.min(...p1.ids), hi = Math.max(...p1.ids);
-  // Two-stage sweep: the block is contiguous with small gaps (withdrawn lots, other
-  // catalogs' ids interleaved), so a short miss-run ends the cheap pass; if lots are
-  // still missing, a second pass pushes each edge out by up to nbHits more ids.
-  const edge = { 1: hi + 1, [-1]: lo - 1 };
-  for (const missRun of [MISS_RUN, MISS_RUN * 3]) {
-    for (const dir of [1, -1]) {
-      let id = edge[dir], misses = 0, steps = 0;
-      while (found.size < p1.nbHits && misses < missRun && steps < p1.nbHits + 100) { if (await probe(id)) misses = 0; else misses++; id += dir; steps++; }
-      edge[dir] = id;
+  // Primary enumeration: the site's own paged lot list for the catalog — every lot in
+  // one request per 500, with the same record the per-lot API returns (minus the
+  // premium-inclusive bid; `price` is the hammer-basis top online bid). Exact, so no
+  // guessing about id blocks: catalogs edited after upload scatter lots across blocks
+  // up to 1.4M ids apart, which the sweep below could only partly find.
+  let listed = false;
+  for (let page = 0, pages = 1; page < pages && page < 50; page++) {
+    const j = await get(`${base}/api/auctions/catalog/${ref}/lots?page=${page}&size=500`, { json: true });
+    const items = j?._embedded?.auctionLotUserItemViewList;
+    if (!Array.isArray(items)) break;
+    listed = true;
+    for (const it of items) { const v = it.itemView; if (v && v.catalogRef === ref) found.set(v.ref, v); }
+    pages = Number(j.page?.totalPages) || 1;
+  }
+  if (!listed) {
+    // Fallback: id sweep from the page-1 anchors (older template hosts without the list).
+    const probe = async (id) => {
+      const j = await get(`${base}/api/auctions/lot/${id}`, { json: true });
+      const v = j?.itemView;
+      if (!v || v.catalogRef !== ref) return false;
+      found.set(v.ref, v); return true;
+    };
+    for (const id of p1.ids) await probe(id);
+    const lo = Math.min(...p1.ids), hi = Math.max(...p1.ids);
+    const edge = { 1: hi + 1, [-1]: lo - 1 };
+    for (const missRun of [MISS_RUN, MISS_RUN * 3]) {
+      for (const dir of [1, -1]) {
+        let id = edge[dir], misses = 0, steps = 0;
+        while (found.size < p1.nbHits && misses < missRun && steps < p1.nbHits + 100) { if (await probe(id)) misses = 0; else misses++; id += dir; steps++; }
+        edge[dir] = id;
+      }
+      if (found.size >= p1.nbHits) break;
     }
-    if (found.size >= p1.nbHits) break;
   }
   const rows = [...found.values()].map((v) => {
     const d = deriveLot(v, cat);
