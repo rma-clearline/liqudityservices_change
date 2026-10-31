@@ -126,5 +126,5 @@ if (!flag("--summary-only")) {
 }
 const rows = await monthlySummary(pool, opt("--house"));
 console.log("\nmonth       house     cats  lots  sold      THV   online  share  timed");
-for (const r of rows) console.log(`${String(r.month).slice(0, 7)}  ${String(r.house_key).padEnd(9)} ${String(r.catalogs).padStart(4)} ${String(r.lots).padStart(5)} ${String(r.sold).padStart(5)} ${fmtM(r.thv).padStart(9)} ${fmtM(r.online_won).padStart(8)} ${(r.thv ? (r.online_won / r.thv) * 100 : 0).toFixed(1).padStart(5)}% ${fmtM(r.thv_timed).padStart(8)}`);
+for (const r of rows) console.log(`${new Date(r.month).toISOString().slice(0, 7)}  ${String(r.house_key).padEnd(9)} ${String(r.catalogs).padStart(4)} ${String(r.lots).padStart(5)} ${String(r.sold).padStart(5)} ${fmtM(r.thv).padStart(9)} ${fmtM(r.online_won).padStart(8)} ${(r.thv ? (r.online_won / r.thv) * 100 : 0).toFixed(1).padStart(5)}% ${fmtM(r.thv_timed).padStart(8)}`);
 await pool.close();
