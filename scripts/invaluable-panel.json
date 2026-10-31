@@ -17,6 +17,56 @@
       "house_page": "/auction-house/carrolls-auctioneers-appraisers-d1lffw771y",
       "_note": "No private-label site; catalog refs come from the public Invaluable house page, data from the www.auctionzip.com gateway — which challenges our client until allowlisted. Enable once LQDT has allowlisted the tracker UA/IP.",
       "enabled": false
+    },
+    {
+      "key": "neal",
+      "name": "Neal Auction Company",
+      "domain": "www.nealauction.com",
+      "kind": "private_label",
+      "past_list": "/auctions/past-auctions/"
+    },
+    {
+      "key": "thomaston",
+      "name": "Thomaston Place Auction Galleries",
+      "domain": "live.thomastonauction.com",
+      "kind": "private_label",
+      "past_list": "/auctions/past-auctions/"
+    },
+    {
+      "key": "crescentcity",
+      "name": "Crescent City Auction Gallery",
+      "domain": "www.crescentcityauctiongallery.com",
+      "kind": "private_label",
+      "past_list": "/auctions/past-auctions/"
+    },
+    {
+      "key": "nye",
+      "name": "Nye & Company Auctioneers",
+      "domain": "www.nyeandcompany.com",
+      "kind": "private_label",
+      "past_list": "/auctions/past-auctions/"
+    },
+    {
+      "key": "eldreds",
+      "name": "Eldred's",
+      "domain": "www.eldreds.com",
+      "kind": "private_label",
+      "sale_sitemap": "/hksn-preview-sale-sitemap.xml"
+    },
+    {
+      "key": "johnmoran",
+      "name": "John Moran Auctioneers",
+      "domain": "www.johnmoran.com",
+      "kind": "private_label",
+      "sale_sitemap": "/hksn-preview-sale-sitemap.xml"
+    },
+    {
+      "key": "fontaines",
+      "name": "Fontaine's Auction Gallery",
+      "domain": "www.fontainesauction.com",
+      "kind": "private_label",
+      "sale_sitemap": "/hksn-preview-sale-sitemap.xml"
     }
-  ]
+  ],
+  "min_event_date": "2022-01-01"
 }

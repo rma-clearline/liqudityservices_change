@@ -42,6 +42,16 @@ async function discover(h) {
     if (page) for (const m of page.matchAll(/\/catalog\/([A-Z0-9]{10})/g)) paths.set(m[1], `auction-catalog/catalog_${m[1]}`);
     return paths;
   }
+  if (h.sale_sitemap) {
+    // WordPress sale-post sitemap (hksn-preview-sale-sitemap.xml): one page per sale,
+    // each linking its hosted catalog. Deep history (Eldred's: 304 sales).
+    const xml = await get(base + h.sale_sitemap);
+    const locs = xml ? xml.split("<loc>").slice(1).map((x) => x.slice(0, x.indexOf("</loc>")).trim()).filter(Boolean) : [];
+    for (const loc of locs) {
+      const page = await get(loc);
+      if (page) for (const [r, p] of catalogPathsIn(page)) paths.set(r, p);
+    }
+  }
   if (h.past_list) {
     const list = await get(base + h.past_list);
     if (list) {
@@ -65,6 +75,8 @@ async function collectCatalog(h, ref, pth) {
     eventDateLocal: (meta.eventLocalDateIso8601 ?? "").slice(0, 10) || null, eventTsUtc: (meta.eventDateIso8601 ?? "").replace(/\[.*$/, "") || null,
   };
   if (meta.isUpcoming || meta.inProgress) { await upsertCatalog(pool, { ...cat, status: "upcoming" }); return "upcoming"; }
+  const floor = h.min_event_date ?? panel.min_event_date ?? null;
+  if (floor && cat.eventDateLocal && cat.eventDateLocal < floor) { await upsertCatalog(pool, { ...cat, status: "too-old" }); return "too-old"; }
   const html = await get(`${base}/${pth}`);
   const p1 = html ? pageOne(html) : null;
   if (!p1?.nbHits || !p1.ids.length) { await upsertCatalog(pool, { ...cat, status: "no-page" }); return "no-page"; }
@@ -116,7 +128,8 @@ async function collectCatalog(h, ref, pth) {
     };
   });
   await upsertLots(pool, rows);
-  const status = found.size >= p1.nbHits ? "complete" : "partial";
+  const posted = [...found.values()].some((v) => v.resultsPosted || v.isSold);
+  const status = !posted ? "no-results" : found.size >= p1.nbHits ? "complete" : "partial";
   await upsertCatalog(pool, { ...cat, nbLots: p1.nbHits, lotsFetched: found.size, status });
   lotsWritten += rows.length;
   const sold = rows.filter((r) => r.is_sold), thv = sold.reduce((s, r) => s + (r.hammer ?? 0), 0), online = sold.filter((r) => r.online_won).reduce((s, r) => s + (r.hammer ?? 0), 0);

@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { InvaluablePeriod } from "@/app/api/invaluable/route";
+import type { InvaluableHousePeriod, InvaluablePeriod } from "@/app/api/invaluable/route";
 
-type Payload = { month: InvaluablePeriod[]; quarter: InvaluablePeriod[]; houses: string[] };
+type Payload = { month: InvaluablePeriod[]; quarter: InvaluablePeriod[]; houses: string[]; byHouse: { month: InvaluableHousePeriod[]; quarter: InvaluableHousePeriod[] } };
 
 const fmtM = (n: number) => "$" + (n / 1e6).toFixed(2) + "M";
 const fmtPct = (n: number | null) => (n == null ? "—" : (n * 100).toFixed(1) + "%");
@@ -33,8 +33,22 @@ export function InvaluablePanel() {
   if (!data) return <p className="mt-8 text-sm text-gray-500">Loading Invaluable panel…</p>;
   const rows = data[grain];
   if (rows.length === 0) return null;
-  const byPeriod = new Map(rows.map((r) => [r.period, r]));
   const prior = (p: string) => String(Number(p.slice(0, 4)) - 1) + p.slice(4);
+  // Like-for-like Y/Y: only houses with sales in both periods, so a house joining the
+  // panel never reads as growth. n = houses compared.
+  const hp = data.byHouse[grain];
+  const lfl = (p: string) => {
+    let thv = 0, pthv = 0, onl = 0, ponl = 0, n = 0;
+    for (const a of hp) {
+      if (a.period !== p || a.thv_usd <= 0) continue;
+      const b = hp.find((x) => x.house === a.house && x.period === prior(p));
+      if (!b || b.thv_usd <= 0) continue;
+      n++; thv += a.thv_usd; pthv += b.thv_usd; onl += a.online_usd; ponl += b.online_usd;
+    }
+    return { n, hy: n && pthv > 0 ? thv / pthv - 1 : null, oy: n && ponl > 0 ? onl / ponl - 1 : null };
+  };
+  const today = new Date().toISOString().slice(0, 10);
+  const openPeriod = grain === "quarter" ? today.slice(0, 4) + "Q" + (Math.floor((Number(today.slice(5, 7)) - 1) / 3) + 1) : today.slice(0, 7);
   const chip = (active: boolean) =>
     "px-2 py-0.5 text-xs rounded border transition-colors " +
     (active ? "bg-gray-900 text-white border-gray-900" : "bg-white text-gray-600 border-gray-300 hover:border-gray-400");
@@ -65,29 +79,32 @@ export function InvaluablePanel() {
               <th className="px-2 py-1 text-right font-semibold">Sold lots</th>
               <th className="px-2 py-1 text-right font-semibold" title="Total hammer of the panel's catalogs">Hammer</th>
               <th className="px-2 py-1 text-right font-semibold" title="Hammer of lots inferred as won through the platform">Online-won</th>
-              <th className="px-2 py-1 text-right font-semibold" title="Online-won ÷ hammer (Invaluable's share of gavel)">Share</th>
+              <th className="px-2 py-1 text-right font-semibold" title="Online-won ÷ hammer (Invaluable's share of gavel); strict = top online bid equals the result AND at least one online bid">Share</th>
+              <th className="px-2 py-1 text-right font-semibold" title="Same without the bid-count guard: an upper bound (a floor buyer paying exactly the opening bid also matches)">Loose</th>
               <th className="px-2 py-1 text-right font-semibold" title="Timed (online-only) sales as a share of hammer">Timed</th>
-              <th className="px-2 py-1 text-right font-semibold">Hammer Y/Y</th>
-              <th className="px-2 py-1 text-right font-semibold">Online-won Y/Y</th>
+              <th className="px-2 py-1 text-right font-semibold" title="Like-for-like: only houses with sales in both periods">Hammer Y/Y</th>
+              <th className="px-2 py-1 text-right font-semibold" title="Like-for-like: only houses with sales in both periods">Online-won Y/Y</th>
+              <th className="px-2 py-1 text-right font-semibold" title="Houses in the like-for-like comparison">LFL</th>
             </tr>
           </thead>
           <tbody>
             {rows.map((r) => {
-              const p = byPeriod.get(prior(r.period));
-              const hy = p && p.thv_usd > 0 ? r.thv_usd / p.thv_usd - 1 : null;
-              const oy = p && p.online_usd > 0 ? r.online_usd / p.online_usd - 1 : null;
+              const { n, hy, oy } = lfl(r.period);
+              const open = r.period >= openPeriod;
               const tone = (v: number | null) => (v == null ? "text-gray-300" : v >= 0 ? "text-green-700" : "text-red-700");
               return (
                 <tr key={r.period} className="border-b border-gray-100">
-                  <td className="px-2 py-1 font-medium text-gray-700">{r.period}</td>
+                  <td className="px-2 py-1 font-medium text-gray-700">{r.period}{open && <span className="ml-1 text-[10px] text-gray-400">open</span>}</td>
                   <td className="px-2 py-1 text-right tabular-nums">{r.houses}</td>
                   <td className="px-2 py-1 text-right tabular-nums">{r.sold}</td>
                   <td className="px-2 py-1 text-right tabular-nums">{fmtM(r.thv_usd)}</td>
                   <td className="px-2 py-1 text-right tabular-nums font-semibold">{fmtM(r.online_usd)}</td>
                   <td className="px-2 py-1 text-right tabular-nums">{fmtPct(r.thv_usd > 0 ? r.online_usd / r.thv_usd : null)}</td>
+                  <td className="px-2 py-1 text-right tabular-nums text-gray-500">{fmtPct(r.thv_usd > 0 ? r.online_loose_usd / r.thv_usd : null)}</td>
                   <td className="px-2 py-1 text-right tabular-nums text-gray-500">{fmtPct(r.thv_usd > 0 ? r.timed_usd / r.thv_usd : null)}</td>
                   <td className={"px-2 py-1 text-right tabular-nums " + tone(hy)}>{fmtPct(hy)}</td>
                   <td className={"px-2 py-1 text-right tabular-nums " + tone(oy)}>{fmtPct(oy)}</td>
+                  <td className="px-2 py-1 text-right tabular-nums text-gray-400">{n || "—"}</td>
                 </tr>
               );
             })}

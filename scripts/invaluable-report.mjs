@@ -16,7 +16,7 @@ const periodExpr = grain === "quarter"
 // Rate on the sale day, else the latest earlier rate; USD = native / units-per-USD.
 const q = `
   WITH lots AS (
-    SELECT c.house_key, ${periodExpr} AS period, c.is_timed, l.is_sold, l.online_won, l.hammer, ISNULL(l.currency, 'USD') AS currency, c.event_date_local
+    SELECT c.house_key, ${periodExpr} AS period, c.is_timed, l.is_sold, l.online_won, l.hammer, l.online_hammer, ISNULL(l.currency, 'USD') AS currency, c.event_date_local
     FROM lqdt.inv_catalogs c JOIN lqdt.inv_lots l ON l.catalog_ref = c.catalog_ref
     WHERE c.status IN ('complete','partial') AND c.lots_fetched >= 0.9 * c.nb_lots AND (@h IS NULL OR c.house_key = @h)
   ), fx AS (
@@ -29,6 +29,7 @@ const q = `
     SUM(CASE WHEN is_sold = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS thv_usd,
     SUM(CASE WHEN online_won = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS online_usd,
     SUM(CASE WHEN online_won = 1 THEN 1 ELSE 0 END) AS online_lots,
+    SUM(CASE WHEN is_sold = 1 AND ABS(ISNULL(online_hammer,0) - ISNULL(hammer,0)) <= CASE WHEN hammer * 0.005 > 1 THEN hammer * 0.005 ELSE 1 END THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS online_loose_usd,
     SUM(CASE WHEN is_timed = 1 AND is_sold = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS timed_usd
   FROM fx GROUP BY house_key, period ORDER BY period, house_key`;
 const rows = (await pool.request().input("h", opt("--house")).query(q)).recordset;
@@ -36,18 +37,29 @@ await pool.close();
 
 // Panel total per period + Y/Y where the prior-year period exists.
 const byPeriod = new Map();
+const byHouse = new Map(); // house -> period -> { thv, online }: like-for-like Y/Y uses only houses present in both periods
 for (const r of rows) {
-  const t = byPeriod.get(r.period) ?? { sold: 0, thv: 0, online: 0, timed: 0, houses: new Set() };
-  t.sold += r.sold; t.thv += Number(r.thv_usd); t.online += Number(r.online_usd); t.timed += Number(r.timed_usd); t.houses.add(r.house_key);
+  const h = byHouse.get(r.house_key) ?? new Map();
+  h.set(r.period, { thv: Number(r.thv_usd), online: Number(r.online_usd) });
+  byHouse.set(r.house_key, h);
+  const t = byPeriod.get(r.period) ?? { sold: 0, thv: 0, online: 0, loose: 0, timed: 0, houses: new Set() };
+  t.sold += r.sold; t.thv += Number(r.thv_usd); t.online += Number(r.online_usd); t.loose += Number(r.online_loose_usd); t.timed += Number(r.timed_usd); t.houses.add(r.house_key);
   byPeriod.set(r.period, t);
 }
+const lfl = (p, pp) => {
+  let thv = 0, pthv = 0, onl = 0, ponl = 0, n = 0;
+  for (const [, h] of byHouse) { const a = h.get(p), b = h.get(pp); if (a && b && a.thv > 0 && b.thv > 0) { n++; thv += a.thv; pthv += b.thv; onl += a.online; ponl += b.online; } }
+  return { n, thvYoy: n && pthv > 0 ? thv / pthv - 1 : null, onlYoy: n && ponl > 0 ? onl / ponl - 1 : null };
+};
+const today = new Date().toISOString().slice(0, 10);
+const openPeriod = grain === "quarter" ? today.slice(0, 4) + "Q" + (Math.floor((Number(today.slice(5, 7)) - 1) / 3) + 1) : today.slice(0, 7);
 const prior = (p) => (grain === "quarter" ? String(Number(p.slice(0, 4)) - 1) + p.slice(4) : String(Number(p.slice(0, 4)) - 1) + p.slice(4));
-console.log(`\nPanel GMS proxy by ${grain} (USD; online-won = inferred platform wins; share = online ÷ hammer)`);
-console.log("period    houses  sold       THV   online-won  share  timed%   THV Y/Y  online Y/Y");
+console.log(`\nPanel GMS proxy by ${grain} (USD; online-won = inferred platform wins with >=1 online bid; loose = equality test alone, an upper bound; share = online ÷ hammer)`);
+console.log("period    houses  sold       THV   online-won  share  loose  timed%   THV Y/Y  online Y/Y");
 for (const [p, t] of [...byPeriod].sort()) {
-  const pr = byPeriod.get(prior(p));
-  const thvYoy = pr && pr.thv > 0 ? t.thv / pr.thv - 1 : null, onlYoy = pr && pr.online > 0 ? t.online / pr.online - 1 : null;
-  console.log(`${p.padEnd(9)} ${String(t.houses.size).padStart(5)} ${String(t.sold).padStart(5)} ${fmtM(t.thv).padStart(9)} ${fmtM(t.online).padStart(10)} ${pct(t.thv ? t.online / t.thv : null)} ${pct(t.thv ? t.timed / t.thv : null)}  ${pct(thvYoy)}    ${pct(onlYoy)}`);
+  const y = lfl(p, prior(p)); const thvYoy = y.thvYoy, onlYoy = y.onlYoy; const tag = (y.n ? "  (" + y.n + " lfl)" : "") + (p >= openPeriod ? " *open" : "");
+  console.log(`${p.padEnd(9)} ${String(t.houses.size).padStart(5)} ${String(t.sold).padStart(5)} ${fmtM(t.thv).padStart(9)} ${fmtM(t.online).padStart(10)} ${pct(t.thv ? t.online / t.thv : null)} ${pct(t.thv ? t.loose / t.thv : null)} ${pct(t.thv ? t.timed / t.thv : null)}  ${pct(thvYoy)}    ${pct(onlYoy)}${tag}`);
 }
 console.log(`\nDisclosed reference points (Invaluable + AuctionZip, platform-wide): CY2025 GMS > $500M; Q1 2026 GMS $125M, +17% Y/Y, share of gavel 14.7%; May 2026 net GMS +20% Y/Y.`);
 console.log(`Validation = the panel's online-won Y/Y for the same windows vs those growth rates, and its share vs 14.7%; a level comparison needs the panel's share of the platform, which is unknown.`);
+console.log('* open = current period, incomplete; Y/Y compares only houses with sales in both periods (n in parentheses).');
