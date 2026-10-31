@@ -1,0 +1,22 @@
+{
+  "_doc": "Panel of auction houses for the Invaluable tracker. kind: private_label (house site on Invaluable's platform; its own past-auctions pages link the hosted catalogs) | auctionzip (explicit catalog refs only; house pages are bot-challenged). past_list: the house page that links past sales. catalogs: optional { ref: 'auction-catalog/<slug>_<REF>' } seeds. Collection is permission-based; keep the client identified and polite (lib.mjs).",
+  "houses": [
+    {
+      "key": "grogan",
+      "name": "Grogan & Company",
+      "domain": "www.groganco.com",
+      "kind": "private_label",
+      "past_list": "/auctions/past-auctions/",
+      "sellerId": 30
+    },
+    {
+      "key": "carrolls",
+      "name": "Carroll's Auctioneers & Appraisers",
+      "domain": "www.invaluable.com",
+      "kind": "invaluable",
+      "house_page": "/auction-house/carrolls-auctioneers-appraisers-d1lffw771y",
+      "_note": "No private-label site; catalog refs come from the public Invaluable house page, data from the www.auctionzip.com gateway — which challenges our client until allowlisted. Enable once LQDT has allowlisted the tracker UA/IP.",
+      "enabled": false
+    }
+  ]
+}
