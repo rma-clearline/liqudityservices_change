@@ -66,6 +66,27 @@
       "domain": "www.fontainesauction.com",
       "kind": "private_label",
       "sale_sitemap": "/hksn-preview-sale-sitemap.xml"
+    },
+    {
+      "key": "link",
+      "name": "Link Auction Galleries",
+      "domain": "www.linkauctiongalleries.com",
+      "kind": "private_label",
+      "past_list": "/auctions/past-auctions/"
+    },
+    {
+      "key": "simpson",
+      "name": "Simpson Galleries",
+      "domain": "www.simpsongalleries.com",
+      "kind": "private_label",
+      "past_list": "/auctions/past-auctions/"
+    },
+    {
+      "key": "selkirk",
+      "name": "Selkirk Auctioneers & Appraisers",
+      "domain": "www.selkirkauctions.com",
+      "kind": "private_label",
+      "sale_sitemap": "/hksn-preview-sale-sitemap.xml"
     }
   ],
   "min_event_date": "2022-01-01"
