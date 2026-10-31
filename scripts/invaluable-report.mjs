@@ -49,16 +49,23 @@ for (const r of rows) {
 const lfl = (p, pp) => {
   let thv = 0, pthv = 0, onl = 0, ponl = 0, n = 0;
   for (const [, h] of byHouse) { const a = h.get(p), b = h.get(pp); if (a && b && a.thv > 0 && b.thv > 0) { n++; thv += a.thv; pthv += b.thv; onl += a.online; ponl += b.online; } }
-  return { n, thvYoy: n && pthv > 0 ? thv / pthv - 1 : null, onlYoy: n && ponl > 0 ? onl / ponl - 1 : null };
+  // Equal-weight view: the median of per-house online-won Y/Y. The dollar-weighted
+  // aggregate can be carried by one large house ramping its online channel (John
+  // Moran 2026Q1: +231%); the platform's disclosed growth averages thousands of houses.
+  const per = [];
+  for (const [, h] of byHouse) { const a = h.get(p), b = h.get(pp); if (a && b && a.online > 0 && b.online > 0) per.push(a.online / b.online - 1); }
+  per.sort((x, y) => x - y);
+  const med = per.length ? (per.length % 2 ? per[(per.length - 1) / 2] : (per[per.length / 2 - 1] + per[per.length / 2]) / 2) : null;
+  return { n, thvYoy: n && pthv > 0 ? thv / pthv - 1 : null, onlYoy: n && ponl > 0 ? onl / ponl - 1 : null, medOnlYoy: med, nMed: per.length };
 };
 const today = new Date().toISOString().slice(0, 10);
 const openPeriod = grain === "quarter" ? today.slice(0, 4) + "Q" + (Math.floor((Number(today.slice(5, 7)) - 1) / 3) + 1) : today.slice(0, 7);
 const prior = (p) => (grain === "quarter" ? String(Number(p.slice(0, 4)) - 1) + p.slice(4) : String(Number(p.slice(0, 4)) - 1) + p.slice(4));
 console.log(`\nPanel GMS proxy by ${grain} (USD; online-won = inferred platform wins with >=1 online bid; loose = equality test alone, an upper bound; share = online ÷ hammer)`);
-console.log("period    houses  sold       THV   online-won  share  loose  timed%   THV Y/Y  online Y/Y");
+console.log("period    houses  sold       THV   online-won  share  loose  timed%   THV Y/Y  online Y/Y  median-house online Y/Y");
 for (const [p, t] of [...byPeriod].sort()) {
   const y = lfl(p, prior(p)); const thvYoy = y.thvYoy, onlYoy = y.onlYoy; const tag = (y.n ? "  (" + y.n + " lfl)" : "") + (p >= openPeriod ? " *open" : "");
-  console.log(`${p.padEnd(9)} ${String(t.houses.size).padStart(5)} ${String(t.sold).padStart(5)} ${fmtM(t.thv).padStart(9)} ${fmtM(t.online).padStart(10)} ${pct(t.thv ? t.online / t.thv : null)} ${pct(t.thv ? t.loose / t.thv : null)} ${pct(t.thv ? t.timed / t.thv : null)}  ${pct(thvYoy)}    ${pct(onlYoy)}${tag}`);
+  console.log(`${p.padEnd(9)} ${String(t.houses.size).padStart(5)} ${String(t.sold).padStart(5)} ${fmtM(t.thv).padStart(9)} ${fmtM(t.online).padStart(10)} ${pct(t.thv ? t.online / t.thv : null)} ${pct(t.thv ? t.loose / t.thv : null)} ${pct(t.thv ? t.timed / t.thv : null)}  ${pct(thvYoy)}    ${pct(onlYoy)}    ${pct(y.medOnlYoy)}${y.nMed ? " (" + y.nMed + ")" : ""}${tag}`);
 }
 console.log(`\nDisclosed reference points (Invaluable + AuctionZip, platform-wide): CY2025 GMS > $500M; Q1 2026 GMS $125M, +17% Y/Y, share of gavel 14.7%; May 2026 net GMS +20% Y/Y.`);
 console.log(`Validation = the panel's online-won Y/Y for the same windows vs those growth rates, and its share vs 14.7%; a level comparison needs the panel's share of the platform, which is unknown.`);
