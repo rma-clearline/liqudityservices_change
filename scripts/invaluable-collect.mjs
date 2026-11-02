@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { get, catalogPathsIn, linksUnder, pageOne, schedulePremium, catalogRates, deriveLot, stats } from "./invaluable/lib.mjs";
-import { connect, upsertHouse, upsertCatalog, completeRefs, upsertLots, monthlySummary } from "./invaluable/db.mjs";
+import { connect, upsertHouse, upsertCatalog, completeRefs, upsertLots, monthlySummary, refreshRollup } from "./invaluable/db.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -153,6 +153,13 @@ if (!flag("--summary-only")) {
     }
   }
   console.log(`done: ${catalogsDone} catalogs, ${lotsWritten} lots, ${stats.requests} requests (${stats.retries} retries)`);
+}
+// Refresh the API's pre-aggregated rollup (lqdt.inv_house_month) so /api/invaluable
+// never scans lots. --summary-only refreshes it too, which is how the table is
+// rebuilt without re-collecting. Skip with --no-rollup (e.g. a partial house run).
+if (!flag("--no-rollup")) {
+  const n = await refreshRollup(pool);
+  console.log(`rollup refreshed: ${n} house-months in lqdt.inv_house_month`);
 }
 const rows = await monthlySummary(pool, opt("--house"));
 console.log("\nmonth       house     cats  lots  sold      THV   online  share  timed");

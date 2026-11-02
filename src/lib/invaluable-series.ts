@@ -195,6 +195,23 @@ export type HouseMonthRow = {
   timed_usd: number;
 };
 
+/** Map rows from the lqdt.inv_house_month rollup (DB column names, values possibly
+ *  strings or null) into HouseMonthRow. The rollup already holds the USD aggregate,
+ *  so the API feeds these straight to rollupPeriods without scanning lots. */
+export function rollupRowsFromDb(rows: Record<string, unknown>[]): HouseMonthRow[] {
+  const num = (v: unknown) => Number(v) || 0;
+  return rows.map((x) => ({
+    house: String(x.house_key),
+    month: String(x.month),
+    sold: num(x.sold),
+    thv_usd: num(x.thv_usd),
+    online_usd: num(x.online_usd),
+    online_lots: num(x.online_lots),
+    online_loose_usd: num(x.online_loose_usd),
+    timed_usd: num(x.timed_usd),
+  }));
+}
+
 /** "2026-02" -> "2026Q1" (calendar quarter; Invaluable discloses calendar periods). */
 export function quarterOf(month: string): string {
   return month.slice(0, 4) + "Q" + (Math.floor((Number(month.slice(5, 7)) - 1) / 3) + 1);

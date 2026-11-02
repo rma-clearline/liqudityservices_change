@@ -68,6 +68,58 @@ export async function upsertLots(pool, rows) {
       VALUES (s.lot_ref,s.lot_id,s.catalog_ref,s.lot_number,s.title,s.category,s.subcategory,s.estimate_low,s.estimate_high,s.is_sold,s.is_passed,s.price_result,s.premium_rate,s.hammer,s.online_all_in,s.online_hammer,s.bid_count,s.online_won,s.currency);`);
 }
 
+// The canonical per-house, per-month aggregate in USD: catalogs >= 90% collected,
+// native hammer converted at the sale-day rate (fx_rates stores units per USD). This
+// is the single definition of the panel series; the rollup table and the API both
+// derive from it, so they cannot drift. Kept as a CTE prefix + an aggregate tail so
+// the same text composes two ways: the API runs CTE+tail as one SELECT (via the
+// convenience constant below); refreshRollup splices INSERT between them, because a
+// T-SQL CTE must open its statement and cannot sit inside a derived table.
+const HM_CTE = `
+  WITH lots AS (
+    SELECT c.house_key, CONVERT(char(7), c.event_date_local, 126) AS month, c.is_timed, l.is_sold, l.online_won, l.hammer, l.online_hammer, ISNULL(l.currency, 'USD') AS currency, c.event_date_local
+    FROM lqdt.inv_catalogs c JOIN lqdt.inv_lots l ON l.catalog_ref = c.catalog_ref
+    WHERE c.status IN ('complete','partial') AND c.lots_fetched >= 0.9 * c.nb_lots
+  ), fx AS (
+    SELECT lots.*, CASE WHEN currency = 'USD' THEN 1.0 ELSE (
+      SELECT TOP (1) usd_per_unit FROM lqdt.fx_rates f WHERE f.currency = lots.currency AND f.date <= CONVERT(char(10), lots.event_date_local, 126) ORDER BY f.date DESC) END AS units_per_usd
+    FROM lots
+  )`;
+const HM_SELECT = "SELECT house_key, month";
+const HM_TAIL = `,
+    SUM(CASE WHEN is_sold = 1 THEN 1 ELSE 0 END) AS sold,
+    SUM(CASE WHEN is_sold = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS thv_usd,
+    SUM(CASE WHEN online_won = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS online_usd,
+    SUM(CASE WHEN online_won = 1 THEN 1 ELSE 0 END) AS online_lots,
+    SUM(CASE WHEN is_sold = 1 AND ABS(ISNULL(online_hammer,0) - ISNULL(hammer,0)) <= CASE WHEN hammer * 0.005 > 1 THEN hammer * 0.005 ELSE 1 END THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS online_loose_usd,
+    SUM(CASE WHEN is_timed = 1 AND is_sold = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS timed_usd
+  FROM fx GROUP BY house_key, month`;
+
+/** The aggregate as one standalone SELECT (used by the live-equivalence check). */
+export const HOUSE_MONTH_SELECT = HM_CTE + " " + HM_SELECT + HM_TAIL;
+
+/** Recompute lqdt.inv_house_month from the lots (the heavy scan), in one transaction.
+ *  Called at the end of a collector run so the API never scans lots. Idempotent:
+ *  replaces the whole table (the panel is a few hundred house-months). */
+export async function refreshRollup(pool) {
+  const tx = new sql.Transaction(pool);
+  await tx.begin();
+  try {
+    await new sql.Request(tx).query("DELETE FROM lqdt.inv_house_month");
+    const r = await new sql.Request(tx).query(
+      HM_CTE +
+        " INSERT INTO lqdt.inv_house_month (house_key, month, sold, thv_usd, online_usd, online_lots, online_loose_usd, timed_usd) " +
+        HM_SELECT +
+        HM_TAIL,
+    );
+    await tx.commit();
+    return r.rowsAffected?.[r.rowsAffected.length - 1] ?? 0;
+  } catch (e) {
+    await tx.rollback();
+    throw e;
+  }
+}
+
 /** Monthly panel read (what the view would have been). */
 export async function monthlySummary(pool, houseKey) {
   const r = await pool.request().input("h", sql.NVarChar(40), houseKey ?? null).query(`

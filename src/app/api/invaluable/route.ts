@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getPool, isAzureSqlConfigured } from "@/lib/azure-sql";
 import { ttlCache } from "@/lib/cache";
-import { rollupPeriods, type HouseMonthRow } from "@/lib/invaluable-series";
+import { rollupPeriods, rollupRowsFromDb } from "@/lib/invaluable-series";
 
 export const dynamic = "force-dynamic";
 
@@ -36,46 +36,18 @@ export type InvaluablePayload = {
 
 const cache = ttlCache<InvaluablePayload>(Number(process.env.INVALUABLE_CACHE_MS) || 15 * 60_000);
 
-// One scan, per house and month, with the report script's filter and FX (catalogs
-// >= 90% collected; native hammer at the sale-day rate; fx_rates stores units per
-// USD). Quarters, panel totals and per-house rows are rolled up in code
-// (rollupPeriods), which cut the cold load from four scans to one.
-const HOUSE_MONTH_SQL =
-  "WITH lots AS (" +
-  "  SELECT c.house_key, CONVERT(char(7), c.event_date_local, 126) AS month, c.is_timed, l.is_sold, l.online_won, l.hammer, l.online_hammer, ISNULL(l.currency, 'USD') AS currency, c.event_date_local" +
-  "  FROM lqdt.inv_catalogs c JOIN lqdt.inv_lots l ON l.catalog_ref = c.catalog_ref" +
-  "  WHERE c.status IN ('complete','partial') AND c.lots_fetched >= 0.9 * c.nb_lots" +
-  "), fx AS (" +
-  "  SELECT lots.*, CASE WHEN currency = 'USD' THEN 1.0 ELSE (" +
-  "    SELECT TOP (1) usd_per_unit FROM lqdt.fx_rates f WHERE f.currency = lots.currency AND f.date <= CONVERT(char(10), lots.event_date_local, 126) ORDER BY f.date DESC) END AS units_per_usd" +
-  "  FROM lots" +
-  ") SELECT house_key, month," +
-  "  SUM(CASE WHEN is_sold = 1 THEN 1 ELSE 0 END) AS sold," +
-  "  SUM(CASE WHEN is_sold = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS thv_usd," +
-  "  SUM(CASE WHEN online_won = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS online_usd," +
-  "  SUM(CASE WHEN online_won = 1 THEN 1 ELSE 0 END) AS online_lots," +
-  "  SUM(CASE WHEN is_sold = 1 AND ABS(ISNULL(online_hammer,0) - ISNULL(hammer,0)) <= CASE WHEN hammer * 0.005 > 1 THEN hammer * 0.005 ELSE 1 END THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS online_loose_usd," +
-  "  SUM(CASE WHEN is_timed = 1 AND is_sold = 1 THEN hammer / NULLIF(units_per_usd, 0) ELSE 0 END) AS timed_usd" +
-  " FROM fx GROUP BY house_key, month ORDER BY month, house_key";
+// The per-house, per-month aggregate is pre-computed into lqdt.inv_house_month by the
+// collector (scripts/invaluable/db.mjs refreshRollup) after each run, so the page no
+// longer scans ~240k lots on a cold cache (that saturated the shared S2 DB and timed
+// out). We read the few hundred rollup rows and roll months into quarters in code.
+const ROLLUP_SQL =
+  "SELECT house_key, month, sold, thv_usd, online_usd, online_lots, online_loose_usd, timed_usd FROM lqdt.inv_house_month ORDER BY month, house_key";
 
 async function load(): Promise<InvaluablePayload> {
   const pool = await getPool();
   const num = (v: unknown) => Number(v) || 0;
   const [rows, houseList, metaRow] = await Promise.all([
-    pool.request().query(HOUSE_MONTH_SQL).then((r) =>
-      r.recordset.map(
-        (x: Record<string, unknown>): HouseMonthRow => ({
-          house: String(x.house_key),
-          month: String(x.month),
-          sold: num(x.sold),
-          thv_usd: num(x.thv_usd),
-          online_usd: num(x.online_usd),
-          online_lots: num(x.online_lots),
-          online_loose_usd: num(x.online_loose_usd),
-          timed_usd: num(x.timed_usd),
-        }),
-      ),
-    ),
+    pool.request().query(ROLLUP_SQL).then((r) => rollupRowsFromDb(r.recordset as Record<string, unknown>[])),
     pool.request().query("SELECT house_key, name FROM lqdt.inv_houses ORDER BY house_key").then((r) => r.recordset as { house_key: string; name: string | null }[]),
     pool
       .request()
